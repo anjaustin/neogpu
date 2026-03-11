@@ -12,7 +12,7 @@ HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DI
 HS_OBJ = $(HS_SRC:.c=.o)
 HS_TARGET = neogpu_demo
 
-.PHONY: build clean run all test
+.PHONY: build clean run all test run-test
 
 all: build
 
@@ -31,11 +31,11 @@ clean:
 run: $(HS_TARGET)
 	./$(HS_TARGET)
 
-test: $(HS_OBJ)
+run-test:
 	@if [ -z "$(N)" ]; then \
-		echo "Usage: make test N=XX"; \
+		echo "Usage: make run-test N=XX"; \
 		echo "  where XX = 01, 02, 03, 04, 05, or 06"; \
-		echo "Example: make test N=06"; \
+		echo "Example: make run-test N=06"; \
 		exit 1; \
 	fi
 	$(CC) $(CFLAGS) -c tests/test_$(N)_*.c -o /tmp/test_$(N).o
