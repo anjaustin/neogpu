@@ -350,9 +350,29 @@ typedef struct {
     float m[16];
 } Mat4;
 
-void m4_to_array(mat4 m, float* out);
-mat4 m4_from_array(float* m);
-void m4_print(mat4 m);
+static inline void m4_to_array_inline(mat4 m, float* out) {
+    for (int i = 0; i < 4; i++) {
+        out[i*4+0] = vgetq_lane_f32(m.val[i], 0);
+        out[i*4+1] = vgetq_lane_f32(m.val[i], 1);
+        out[i*4+2] = vgetq_lane_f32(m.val[i], 2);
+        out[i*4+3] = vgetq_lane_f32(m.val[i], 3);
+    }
+}
+static inline mat4 m4_from_array_inline(float* m) {
+    mat4 res;
+    for (int i = 0; i < 4; i++) {
+        float32x4_t col = vdupq_n_f32(0);
+        col = vsetq_lane_f32(m[i*4+0], col, 0);
+        col = vsetq_lane_f32(m[i*4+1], col, 1);
+        col = vsetq_lane_f32(m[i*4+2], col, 2);
+        col = vsetq_lane_f32(m[i*4+3], col, 3);
+        res.val[i] = col;
+    }
+    return res;
+}
+
+#define m4_to_array(m, out) m4_to_array_inline(m, out)
+#define m4_from_array(m) m4_from_array_inline(m)
 
 /* ============================================================
  * Scalar math helpers (ported from PicoApi.hx)

@@ -124,9 +124,6 @@ int main(int argc, char** argv) {
         glClearColor(color[0], color[1], color[2], color[3]);
         glClear(GL_COLOR_BUFFER_BIT);
         
-        glUniform4fv(color_loc, 1, color);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-        
         hs_graphics_present(&gfx);
         
         usleep(500000);  // 0.5 seconds

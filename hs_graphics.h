@@ -30,7 +30,7 @@ typedef struct {
     GLenum format;
     bool   disposed;
     bool   dirty;
-} HSTexture;
+} HSGLTexture;
 
 typedef struct {
     int            drm_fd;
@@ -44,12 +44,14 @@ typedef struct {
     u32           screen_width;
     u32           screen_height;
     
-    HSTexture      textures[HS_MAX_TEXTURES];
+    HSGLTexture    textures[HS_MAX_TEXTURES];
     u8             textures_active;
     
     bool           initialized;
     bool           vsync;
 } HSGraphics;
+
+static int crtc_setup_done = 0;
 
 static inline int hs_graphics_init(HSGraphics* gfx) {
     memset(gfx, 0, sizeof(HSGraphics));
@@ -95,7 +97,7 @@ static inline int hs_graphics_init(HSGraphics* gfx) {
     gfx->gbm_surface = gbm_surface_create(
         gfx->gbm_device,
         gfx->screen_width,
-        gbm->screen_height,
+        gfx->screen_height,
         GBM_FORMAT_XRGB8888,
         GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING
     );
@@ -106,7 +108,15 @@ static inline int hs_graphics_init(HSGraphics* gfx) {
     EGLint egl_major, egl_minor;
     const char* client_extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
     
-    gfx->egl_display = eglGetDisplay((EGLNativeDisplayType)gfx->gbm_device);
+    typedef EGLDisplay (EGLAPIENTRY *PFNEGLGETPLATFORMDISPLAYEXTPROC)(EGLenum, void*, const EGLint*);
+    PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    
+    if (eglGetPlatformDisplayEXT && client_extensions && strstr(client_extensions, "EGL_KHR_platform_gbm")) {
+        gfx->egl_display = eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, gfx->gbm_device, NULL);
+    } else {
+        gfx->egl_display = eglGetDisplay((EGLNativeDisplayType)gfx->gbm_device);
+    }
+    
     if (gfx->egl_display == EGL_NO_DISPLAY) {
         return -1;
     }
@@ -120,10 +130,11 @@ static inline int hs_graphics_init(HSGraphics* gfx) {
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 0,
+        EGL_ALPHA_SIZE, 8,
         EGL_DEPTH_SIZE, 0,
         EGL_STENCIL_SIZE, 0,
         EGL_SAMPLE_BUFFERS, 0,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES_BIT,
         EGL_NONE
     };
     
@@ -193,10 +204,10 @@ static inline void hs_graphics_finish(HSGraphics* gfx) {
     gfx->initialized = 0;
 }
 
-static inline HSTexture* hs_graphics_create_texture(HSGraphics* gfx, u8 slot, u32 width, u32 height, const u8* data) {
+static inline HSGLTexture* hs_graphics_create_texture(HSGraphics* gfx, u8 slot, u32 width, u32 height, const u8* data) {
     if (!gfx->initialized || slot >= HS_MAX_TEXTURES) return NULL;
     
-    HSTexture* tex = &gfx->textures[slot];
+    HSGLTexture* tex = &gfx->textures[slot];
     
     if (tex->gl_texture != 0 && !tex->disposed) {
         glDeleteTextures(1, &tex->gl_texture);
@@ -227,7 +238,7 @@ static inline HSTexture* hs_graphics_create_texture(HSGraphics* gfx, u8 slot, u3
 static inline void hs_graphics_update_texture(HSGraphics* gfx, u8 slot, const u8* data) {
     if (!gfx->initialized || slot >= HS_MAX_TEXTURES) return;
     
-    HSTexture* tex = &gfx->textures[slot];
+    HSGLTexture* tex = &gfx->textures[slot];
     if (tex->gl_texture == 0 || tex->disposed) return;
     
     glBindTexture(GL_TEXTURE_2D, tex->gl_texture);
@@ -243,7 +254,7 @@ static inline bool hs_graphics_texture_disposed(HSGraphics* gfx, u8 slot) {
 static inline void hs_graphics_dispose_texture(HSGraphics* gfx, u8 slot) {
     if (!gfx->initialized || slot >= HS_MAX_TEXTURES) return;
     
-    HSTexture* tex = &gfx->textures[slot];
+    HSGLTexture* tex = &gfx->textures[slot];
     if (tex->gl_texture != 0 && !tex->disposed) {
         glDeleteTextures(1, &tex->gl_texture);
         tex->gl_texture = 0;
@@ -259,21 +270,6 @@ static inline GLuint hs_graphics_get_gl_texture(HSGraphics* gfx, u8 slot) {
 static inline void hs_graphics_swap_buffers(HSGraphics* gfx) {
     if (!gfx->initialized) return;
     eglSwapBuffers(gfx->egl_display, gfx->egl_surface);
-    
-    struct gbm_bo* bo = gbm_surface_lock_front_buffer(gfx->gbm_surface);
-    if (bo) {
-        uint32_t handle = gbm_bo_get_handle(bo).u32;
-        uint32_t stride = gbm_bo_get_stride(bo);
-        
-        drmModeFBCreate(gfx->drm_fd, &handle, 0, 
-                       gfx->screen_width, gfx->screen_height, 24, 32,
-                       stride, handle);
-        
-        drmModeSetCrtc(gfx->drm_fd, handle, 0, 0, 0, 
-                       0, NULL, 0, NULL, 0);
-        
-        gbm_surface_release_buffer(gfx->gbm_surface, bo);
-    }
 }
 
 static inline void hs_graphics_clear(HSGraphics* gfx, float r, float g, float b, float a) {
@@ -284,11 +280,61 @@ static inline void hs_graphics_clear(HSGraphics* gfx, float r, float g, float b,
 
 static inline void hs_graphics_present(HSGraphics* gfx) {
     if (!gfx->initialized) return;
+    
     if (gfx->vsync) {
         eglSwapBuffers(gfx->egl_display, gfx->egl_surface);
     } else {
         eglSwapInterval(gfx->egl_display, 0);
         eglSwapBuffers(gfx->egl_display, gfx->egl_surface);
+    }
+    
+    if (!crtc_setup_done) {
+        drmModeRes* resources = drmModeGetResources(gfx->drm_fd);
+        if (resources) {
+            drmModeConnector* conn = NULL;
+            drmModeEncoder* enc = NULL;
+            int crtc_idx = -1;
+            
+            for (int i = 0; i < resources->count_connectors; i++) {
+                conn = drmModeGetConnector(gfx->drm_fd, resources->connectors[i]);
+                if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
+                    if (conn->encoder_id) {
+                        enc = drmModeGetEncoder(gfx->drm_fd, conn->encoder_id);
+                        if (enc && enc->crtc_id) {
+                            crtc_idx = -1;
+                            for (int j = 0; j < resources->count_crtcs; j++) {
+                                if (resources->crtcs[j] == enc->crtc_id) {
+                                    crtc_idx = j;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                drmModeFreeConnector(conn);
+            }
+            
+            if (conn && crtc_idx >= 0) {
+                struct gbm_bo* bo = gbm_surface_lock_front_buffer(gfx->gbm_surface);
+                if (bo) {
+                    uint32_t handle = gbm_bo_get_handle(bo).u32;
+                    uint32_t stride = gbm_bo_get_stride(bo);
+                    uint32_t fb = 0;
+                    if (drmModeAddFB(gfx->drm_fd, gfx->screen_width, gfx->screen_height, 
+                                   24, 32, stride, handle, &fb) == 0) {
+                        drmModeSetCrtc(gfx->drm_fd, resources->crtcs[crtc_idx], fb, 0, 0, 
+                                      &conn->connector_id, 1, &conn->modes[0]);
+                    }
+                    gbm_surface_release_buffer(gfx->gbm_surface, bo);
+                }
+            }
+            
+            if (conn) drmModeFreeConnector(conn);
+            if (enc) drmModeFreeEncoder(enc);
+            drmModeFreeResources(resources);
+        }
+        crtc_setup_done = 1;
     }
 }
 
@@ -319,7 +365,7 @@ static inline void hs_graphics_present(HSGraphics* gfx) {}
 static inline bool hs_graphics_texture_disposed(HSGraphics* gfx, u8 slot) { return false; }
 static inline void hs_graphics_dispose_texture(HSGraphics* gfx, u8 slot) {}
 static inline GLuint hs_graphics_get_gl_texture(HSGraphics* gfx, u8 slot) { return 0; }
-static inline HSTexture* hs_graphics_create_texture(HSGraphics* gfx, u8 slot, u32 w, u32 h, const u8* d) { return NULL; }
+static inline HSGLTexture* hs_graphics_create_texture(HSGraphics* gfx, u8 slot, u32 w, u32 h, const u8* d) { return NULL; }
 static inline void hs_graphics_update_texture(HSGraphics* gfx, u8 slot, const u8* data) {}
 
 #endif
