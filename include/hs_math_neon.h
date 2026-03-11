@@ -104,6 +104,44 @@ static inline vec4 v4_lerp(vec4 a, vec4 b, f32 t) {
     return v4_add(v4_scale(a, 1.0f - t), v4_scale(b, t));
 }
 
+static inline vec4 v4_bezier2(vec4 p0, vec4 p1, vec4 p2, f32 t) {
+    f32 omt = 1.0f - t;
+    f32 omt2 = omt * omt;
+    f32 t2 = t * t;
+    return v4_add(v4_add(v4_scale(p0, omt2), v4_scale(p1, 2.0f * omt * t)), v4_scale(p2, t2));
+}
+
+static inline vec4 v4_bezier3(vec4 p0, vec4 p1, vec4 p2, vec4 p3, f32 t) {
+    f32 omt = 1.0f - t;
+    f32 omt2 = omt * omt;
+    f32 omt3 = omt2 * omt;
+    f32 t2 = t * t;
+    f32 t3 = t2 * t;
+    return v4_add(v4_add(v4_scale(p0, omt3), v4_scale(p1, 3.0f * omt2 * t)), 
+                  v4_add(v4_scale(p2, 3.0f * omt * t2), v4_scale(p3, t3)));
+}
+
+static inline vec4 v4_catmull_rom(vec4 p0, vec4 p1, vec4 p2, vec4 p3, f32 t) {
+    f32 t2 = t * t;
+    f32 t3 = t2 * t;
+    f32 a = -0.5f * t3 + t2 - 0.5f * t;
+    f32 b = 1.5f * t3 - 2.5f * t2 + 1.0f;
+    f32 c = -1.5f * t3 + 2.0f * t2 + 0.5f * t;
+    f32 d = 0.5f * t3 - 0.5f * t2;
+    return v4_add(v4_add(v4_scale(p0, a), v4_scale(p1, b)), v4_add(v4_scale(p2, c), v4_scale(p3, d)));
+}
+
+static inline vec4 v4_hermite(vec4 p0, vec4 m0, vec4 p1, vec4 m1, f32 t) {
+    f32 t2 = t * t;
+    f32 t3 = t2 * t;
+    f32 h00 = 2.0f * t3 - 3.0f * t2 + 1.0f;
+    f32 h10 = t3 - 2.0f * t2 + t;
+    f32 h01 = -2.0f * t3 + 3.0f * t2;
+    f32 h11 = t3 - t2;
+    return v4_add(v4_add(v4_scale(p0, h00), v4_scale(m0, h10)), 
+                  v4_add(v4_scale(p1, h01), v4_scale(m1, h11)));
+}
+
 static inline vec4 v4_min(vec4 a, vec4 b) {
     return vminq_f32(a, b);
 }
