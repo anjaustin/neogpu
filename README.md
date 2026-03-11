@@ -7,6 +7,7 @@ High-performance message-passing GPU layer with ARM NEON SIMD optimizations.
 - **Message Layer: 1,000,000+ fps** (single-core ARM Cortex-A72)
 - **177x faster** than original HashLink version
 - **73KB binary** (vs 2MB+ HashLink runtime)
+- **270 FPS** on Raspberry Pi 4 (ray casting spheres test)
 
 ## New Features (vs Original)
 
@@ -17,42 +18,52 @@ High-performance message-passing GPU layer with ARM NEON SIMD optimizations.
 
 ```bash
 # Build
-make hs-build
+make build
 
-# Run tests
-./hs_gpu_demo
-
-# Run benchmarks
-./bench_full        # Full output
-./bench_full q     # Quiet mode
+# Run demo
+make run
 ```
 
 ## Building for Different Targets
 
 ### Native ARM (Cortex-A72)
 ```bash
-make CC=gcc hs-build
+make build
 ```
 
 ### Cross-compile for Raspberry Pi
 ```bash
-make CC=aarch64-linux-gnu-gcc STRIP=aarch64-linux-gnu-strip hs-build
+make CC=aarch64-linux-gnu-gcc STRIP=aarch64-linux-gnu-strip build
 ```
 
 ## Project Structure
 
 ```
-hs_core.h/c       - Message queue, OpCodes, system core
-hs_nodes.h/c      - Node message handlers (Shader, Buffer, Texture, Output, Sound)
-hs_gpu.h/c        - High-level GPU API
-hs_math_neon.h/c - NEON-optimized vec4/mat4 math
-hs_buffer.h       - Buffer/Texture data types
-hs_input.h        - Input/controls system
-hs_audio.h        - 4-channel audio system (48KHz)
-hs_storage.h      - Persistent storage (16 slots × 256B)
-hs_graphics.h     - GBM/EGL/GLES graphics backend
-main.c            - Test suite (28 tests)
-bench_full.c       - Comprehensive benchmarks
+src/
+  hs_core.c       - Message queue, OpCodes, system core
+  hs_nodes.c      - Node message handlers (Shader, Buffer, Texture, Output, Sound)
+  hs_gpu.c        - High-level GPU API
+  main.c          - Demo/test suite
+  benchmark.c     - Benchmarks
+
+include/
+  hs_core.h       - Core header
+  hs_nodes.h      - Node headers
+  hs_gpu.h        - GPU API header
+  hs_math_neon.h  - NEON-optimized vec4/mat4 math
+  hs_buffer.h     - Buffer/Texture data types
+  hs_input.h      - Input/controls system
+  hs_audio.h      - 4-channel audio system (48KHz)
+  hs_storage.h    - Persistent storage (16 slots × 256B)
+  hs_graphics.h   - GBM/EGL/GLES graphics backend
+
+tests/
+  test_01_clear.c     - Clear screen test
+  test_02_triangle.c   - Single triangle
+  test_03_instancing.c - Hardware instancing
+  test_04_blending.c   - Alpha blending
+  test_05_cube3d.c     - 3D rotating cube
+  test_06_raycast.c    - Ray casting spheres (270 FPS on Pi)
 ```
 
 ## API Reference
@@ -219,22 +230,28 @@ mat4 inv = m4_invert(m3);
 Enable verbose debug output:
 
 ```bash
-gcc -DHS_DEBUG=1 -O3 ... -o hs_gpu_demo
-./hs_gpu_demo
+gcc -DHS_DEBUG=1 -O3 -Iinclude -c src/main.c -o main.o
+...
 ```
 
-## Benchmarking
+## Testing
+
+Graphics tests run on Raspberry Pi with DRM/GBM/EGL/GLES:
 
 ```bash
-# Full benchmark suite
-./bench_full
+# Compile a test
+gcc -O3 -march=armv8.2-a+fp16+simd -mtune=cortex-a72 -Iinclude \
+    -c tests/test_06_raycast.c -o test_06_raycast.o
+gcc src/hs_core.o src/hs_gpu.o src/hs_nodes.o test_06_raycast.o \
+    -o test_06_raycast -lm -lGLESv2 -lgbm -ldrm -lEGL
 
-# Quiet mode (for scripts)
-./bench_full q
-
-# Individual benchmarks
-./benchmark
+# Run on Pi (requires display)
+./test_06_raycast
 ```
+
+Test results on Raspberry Pi 4:
+- test_01-05: All working
+- test_06 (raycast): **270 FPS**
 
 ## Features
 
@@ -249,9 +266,10 @@ gcc -DHS_DEBUG=1 -O3 ... -o hs_gpu_demo
 | Alpha blending | ✅ |
 | Render targets + depth | ✅ |
 | Texture filter/wrap | ✅ |
-| **Audio system** (4 channels, 48KHz) | ✅ |
-| **Storage** (16 slots × 256B, file I/O) | ✅ |
-| **Graphics** (GBM/EGL/GLES for Pi display) | ✅ |
+| Audio system (4 channels, 48KHz) | ✅ |
+| Storage (16 slots × 256B, file I/O) | ✅ |
+| Graphics (GBM/EGL/GLES for Pi display) | ✅ |
+| **Test suite** (6 graphics tests) | ✅ |
 
 ## Memory Usage
 

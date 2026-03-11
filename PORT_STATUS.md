@@ -105,17 +105,13 @@ Port of PicoGPU from Haxe/HashLink to ARM NEON-optimized C for maximum performan
 
 ```bash
 # Normal build (no debug output)
-make hs-build
+make build
 
 # Debug build (verbose output)
-gcc -DHS_DEBUG=1 -O3 ... -o hs_gpu_demo
+gcc -DHS_DEBUG=1 -O3 -Iinclude -c src/main.c -o main.o
 
-# Run tests
-./hs_gpu_demo
-
-# Run benchmarks
-./bench_full        # Full benchmark suite
-./bench_full q      # Quiet mode
+# Run demo
+make run
 ```
 
 ---
@@ -123,16 +119,17 @@ gcc -DHS_DEBUG=1 -O3 ... -o hs_gpu_demo
 ## Files
 
 ### Core Implementation
-- `hs_core.h/c` - Message system, OpCodes, structs
-- `hs_nodes.h/c` - Node message handlers
-- `hs_gpu.h/c` - High-level GPU API
-- `hs_math_neon.h/c` - NEON math library
-- `hs_input.h` - Input/controls system
-- `hs_buffer.h` - Buffer/Texture data types
-- `hs_audio.h` - 4-channel audio system (48KHz)
-- `hs_storage.h` - Persistent storage (16 slots × 256B)
-- `hs_graphics.h` - GBM/EGL/GLES graphics backend
+- `src/hs_core.c` / `include/hs_core.h` - Message system, OpCodes, structs
+- `src/hs_nodes.c` / `include/hs_nodes.h` - Node message handlers
+- `src/hs_gpu.c` / `include/hs_gpu.h` - High-level GPU API
+- `include/hs_math_neon.h` - NEON math library
+- `include/hs_input.h` - Input/controls system
+- `include/hs_buffer.h` - Buffer/Texture data types
+- `include/hs_audio.h` - 4-channel audio system (48KHz)
+- `include/hs_storage.h` - Persistent storage (16 slots × 256B)
+- `include/hs_graphics.h` - GBM/EGL/GLES graphics backend
 
 ### Tests & Benchmarks
-- `main.c` - Test suite (28 tests)
-- `bench_full.c` - Comprehensive benchmarks
+- `src/main.c` - Test suite (28 core tests)
+- `src/benchmark.c` - Benchmarks
+- `tests/test_01-06_*.c` - Graphics tests (run on Pi)
