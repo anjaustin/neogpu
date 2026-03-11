@@ -58,7 +58,6 @@ static void test_math(void) {
 
     /* Rotation: rotating (1,0,0,0) by 90 degrees around Z should give (0,1,0,0) */
     mat4 rz = m4_rotation_z(PI * 0.5f);
-    vec4 rx = v4_make(1, 0, 0, 0);
     /* Apply column-major transform: result = M * v (columns are basis vectors) */
     TEST("m4_rotation_z", fabsf(v4_y(rz.val[0])) > 0.9f);
 

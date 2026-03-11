@@ -59,11 +59,6 @@ static u32 allocate_payload(HSSystem* sys, const void* data, u32 len) {
     return idx;
 }
 
-static void* get_payload(HSSystem* sys, u32 idx) {
-    if (idx >= HS_MAX_PAYLOADS) return NULL;
-    return sys->payloads[idx].data;
-}
-
 bool hs_send(HSSystem* sys, Message* msg) {
     msg->tick = sys->tick;
     
@@ -206,4 +201,5 @@ const char* hs_op_name(OpCode op) {
         case OP_STOP:          return "STOP";
         case OP_COUNT:         return "COUNT";
     }
+    return "UNKNOWN";
 }

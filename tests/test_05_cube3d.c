@@ -63,6 +63,8 @@ static GLuint create_program(const char* vs_src, const char* fs_src) {
 }
 
 int main(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
     printf("=== Test 05: 3D Cube ===\n");
     
     HSGraphics gfx;

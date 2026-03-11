@@ -82,6 +82,7 @@ static inline void hs_buffer_set_i32(HSBuffer* buf, u32 index, s32 val) {
 
 /* Read 32-bit float at float-index */
 static inline f32 hs_buffer_get_f32(const HSBuffer* buf, u32 index) {
+    if (!buf || !buf->data) return 0.0f;
     u32 offset = index * 4;
     if (offset + 4 > buf->length) return 0.0f;
     f32 val;
@@ -89,8 +90,12 @@ static inline f32 hs_buffer_get_f32(const HSBuffer* buf, u32 index) {
     return val;
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+
 /* Write 32-bit float at float-index */
 static inline void hs_buffer_set_f32(HSBuffer* buf, u32 index, f32 val) {
+    if (!buf || !buf->data) return;
     u32 offset = index * 4;
     if (offset + 4 > buf->length) return;
     memcpy(buf->data + offset, &val, 4);
@@ -99,6 +104,7 @@ static inline void hs_buffer_set_f32(HSBuffer* buf, u32 index, f32 val) {
 
 /* Write vec4 (4 floats) starting at float-index */
 static inline void hs_buffer_set_vec4(HSBuffer* buf, u32 index, vec4 v) {
+    if (!buf || !buf->data) return;
     u32 offset = index * 4;
     if (offset + 16 > buf->length) return;
     f32 arr[4];
@@ -209,6 +215,7 @@ static inline void hs_buffer_dispose(HSBuffer* buf) {
 }
 
 static inline HSTexture* hs_buffer_get_texture(HSBuffer* buf, u8 slot) {
+    (void)slot;
     if (hs_buffer_is_disposed(buf)) return NULL;
     
     u32 size = buf->length >> 2;
@@ -258,5 +265,7 @@ static inline void hs_memory_free(HSMemory* mem) {
     }
     memset(mem, 0, sizeof(HSMemory));
 }
+
+#pragma GCC diagnostic pop
 
 #endif

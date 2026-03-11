@@ -246,6 +246,9 @@ int buffer_node_process(Node* node) {
                     u8 buffer_idx = vals[0];
                     u8 inst_buf = vals[1];
                     u32 count = (u32)vals[2] | ((u32)vals[3] << 8);
+                    (void)buffer_idx;
+                    (void)inst_buf;
+                    (void)count;
                     DBG_PRINT("[%s] Draw instance: buffer=%d, inst_buffer=%d, count=%d\n", 
                            node_name(node->id), buffer_idx, inst_buf, count);
                 }
@@ -256,6 +259,7 @@ int buffer_node_process(Node* node) {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {
                     char* text = (char*)data;
+                    (void)text;
                     /* Payload is null-terminated, max HS_PAYLOAD_SIZE chars */
                     DBG_PRINT("[%s] Draw text: \"%.*s\"\n", node_name(node->id), 
                            (int)msg.payload_len, text);
