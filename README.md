@@ -243,35 +243,26 @@ make build && ./neogpu_demo
 
 ### Graphics Tests (Raspberry Pi with DRM/GBM/EGL/GLES)
 
-One-liner to compile and run any test:
+One-liner to compile and run any test (replace XX with 01-06):
 ```bash
-# Build lib first
-make build
-
-# Then run any test (e.g., test_06_raycast)
-gcc -O3 -march=armv8.2-a+fp16+simd -mtune=cortex-a72 -Iinclude -c tests/test_06_raycast.c -o /tmp/test.o && gcc src/hs_core.o src/hs_gpu.o src/hs_nodes.o /tmp/test.o -o /tmp/test -lm -lGLESv2 -lgbm -ldrm -lEGL && sudo /tmp/test
-```
-
-Or step-by-step:
-```bash
-# Compile
-gcc -O3 -march=armv8.2-a+fp16+simd -mtune=cortex-a72 -Iinclude \
-    -c tests/test_06_raycast.c -o test_06_raycast.o
-gcc src/hs_core.o src/hs_gpu.o src/hs_nodes.o test_06_raycast.o \
-    -o test_06_raycast -lm -lGLESv2 -lgbm -ldrm -lEGL
-strip test_06_raycast
-
-# Run on Pi console (tty - no X needed)
-sudo ./test_06_raycast
+make build && gcc -O3 -march=armv8.2-a+fp16+simd -mtune=cortex-a72 -Iinclude -c tests/test_XX_raycast.c -o /tmp/test.o && gcc src/hs_core.o src/hs_gpu.o src/hs_nodes.o /tmp/test.o -o /tmp/test -lm -lGLESv2 -lgbm -ldrm -lEGL && sudo /tmp/test
 ```
 
 **Available tests:**
-- `test_01_clear` - Clear screen
-- `test_02_triangle` - Single triangle
-- `test_03_instancing` - Hardware instancing
-- `test_04_blending` - Alpha blending
-- `test_05_cube3d` - 3D rotating cube
-- `test_06_raycast` - Ray casting spheres (**270 FPS**)
+| Test | Description |
+|------|-------------|
+| test_01_clear | Clear screen |
+| test_02_triangle | Single triangle |
+| test_03_instancing | Hardware instancing |
+| test_04_blending | Alpha blending |
+| test_05_cube3d | 3D rotating cube |
+| test_06_raycast | Ray casting spheres (**270 FPS**) |
+
+Run specific test:
+```bash
+# Test 06 (raycast)
+make build && gcc -O3 -march=armv8.2-a+fp16+simd -mtune=cortex-a72 -Iinclude -c tests/test_06_raycast.c -o /tmp/test.o && gcc src/hs_core.o src/hs_gpu.o src/hs_nodes.o /tmp/test.o -o /tmp/test -lm -lGLESv2 -lgbm -ldrm -lEGL && sudo /tmp/test
+```
 
 Test results on Raspberry Pi 4:
 - test_01-05: All working
