@@ -17,10 +17,8 @@ package-lock.json
 pico/
 *.o
 *.a
-hs_gpu_demo
-bench_*
-benchmark
-docs/
+neogpu_demo
+test_*
 index.html
 fmt.hdll
 mysql.hdll
