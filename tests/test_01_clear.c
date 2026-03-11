@@ -86,7 +86,9 @@ int main(int argc, char** argv) {
     }
     
     GLint pos_loc = glGetAttribLocation(program, "a_position");
+    (void)pos_loc;
     GLint color_loc = glGetUniformLocation(program, "u_color");
+    (void)color_loc;
     
     // Full-screen quad vertices
     float vertices[] = {

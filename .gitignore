@@ -19,6 +19,7 @@ pico/
 *.a
 neogpu_demo
 test_*
+tests/test_
 index.html
 fmt.hdll
 mysql.hdll

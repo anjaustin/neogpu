@@ -12,9 +12,11 @@ HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DI
 HS_OBJ = $(HS_SRC:.c=.o)
 HS_TARGET = neogpu_demo
 
-.PHONY: build clean run all test run-test
+TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast
 
-all: build
+.PHONY: build clean run all test run-test build-tests
+
+all: build build-tests
 
 build: $(HS_TARGET)
 
@@ -26,10 +28,31 @@ $(HS_TARGET): $(HS_OBJ)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(HS_OBJ) $(HS_TARGET)
+	rm -f $(HS_OBJ) $(HS_TARGET) tests/test_
 
 run: $(HS_TARGET)
 	./$(HS_TARGET)
+
+build-tests: $(HS_OBJ)
+	@echo "Building graphics tests..."
+	$(CC) $(CFLAGS) -c tests/test_01_clear.c -o tests/test_01_clear.o
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_01_clear.o $(LDFLAGS) -o tests/test_01_clear
+	$(STRIP) tests/test_01_clear
+	$(CC) $(CFLAGS) -c tests/test_02_triangle.c -o tests/test_02_triangle.o
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_02_triangle.o $(LDFLAGS) -o tests/test_02_triangle
+	$(STRIP) tests/test_02_triangle
+	$(CC) $(CFLAGS) -c tests/test_03_instancing.c -o tests/test_03_instancing.o
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_03_instancing.o $(LDFLAGS) -o tests/test_03_instancing
+	$(STRIP) tests/test_03_instancing
+	$(CC) $(CFLAGS) -c tests/test_04_blending.c -o tests/test_04_blending.o
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_04_blending.o $(LDFLAGS) -o tests/test_04_blending
+	$(STRIP) tests/test_04_blending
+	$(CC) $(CFLAGS) -c tests/test_05_cube3d.c -o tests/test_05_cube3d.o
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_05_cube3d.o $(LDFLAGS) -o tests/test_05_cube3d
+	$(STRIP) tests/test_05_cube3d
+	$(CC) $(CFLAGS) -c tests/test_06_raycast.c -o tests/test_06_raycast.o
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_06_raycast.o $(LDFLAGS) -o tests/test_06_raycast
+	$(STRIP) tests/test_06_raycast
 
 run-test:
 	@if [ -z "$(N)" ]; then \
