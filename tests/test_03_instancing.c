@@ -23,11 +23,7 @@ static const char* vertex_shader_src = R"(
     uniform float u_time;
     
     void main() {
-        float angle = u_time + float(gl_InstanceID) * 0.5;
-        float c = cos(angle);
-        float s = sin(angle);
-        mat2 rot = mat2(c, -s, s, c);
-        vec2 pos = rot * a_position * 0.1 + a_offset;
+        vec2 pos = a_position * 0.1 + a_offset;
         gl_Position = vec4(pos, 0.0, 1.0);
         v_color = a_color;
     }
@@ -76,6 +72,8 @@ int main(int argc, char** argv) {
     }
     
     printf("Screen: %dx%d\n", gfx.screen_width, gfx.screen_height);
+    
+    printf("GL Version: %s\n", glGetString(GL_VERSION));
     
     GLuint program = create_program(vertex_shader_src, fragment_shader_src);
     if (!program) return 1;
@@ -128,16 +126,6 @@ int main(int argc, char** argv) {
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
     glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
     
-    glEnableVertexAttribArray(offset_loc);
-    glBindBuffer(GL_ARRAY_BUFFER, offset_vbo);
-    glVertexAttribPointer(offset_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
-    glVertexAttribDivisor(offset_loc, 1);
-    
-    glEnableVertexAttribArray(color_loc);
-    glBindBuffer(GL_ARRAY_BUFFER, color_vbo);
-    glVertexAttribPointer(color_loc, 3, GL_FLOAT, GL_FALSE, 0, 0);
-    glVertexAttribDivisor(color_loc, 1);
-    
     glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
     
     printf("Rendering %d instances for 10 seconds...\n", COUNT);
@@ -147,7 +135,12 @@ int main(int argc, char** argv) {
         
         glClear(GL_COLOR_BUFFER_BIT);
         glUniform1f(time_loc, t);
-        glDrawArraysInstanced(GL_TRIANGLES, 0, 6, COUNT);
+        
+        for (int i = 0; i < COUNT; i++) {
+            glVertexAttrib2f(offset_loc, offsets[i*2], offsets[i*2+1]);
+            glVertexAttrib3f(color_loc, colors[i*3], colors[i*3+1], colors[i*3+2]);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+        }
         
         hs_graphics_present(&gfx);
         usleep(50000);
