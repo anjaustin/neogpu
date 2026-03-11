@@ -31,19 +31,13 @@ clean:
 run: $(HS_TARGET)
 	./$(HS_TARGET)
 
-test:
-	@echo "Usage: make test N=XX"
-	@echo "  where XX = 01, 02, 03, 04, 05, or 06"
-	@echo ""
-	@echo "Example: make test N=06"
-	@echo "  Compiles and runs test_06_raycast on Pi"
-
 test: $(HS_OBJ)
 	@if [ -z "$(N)" ]; then \
 		echo "Usage: make test N=XX"; \
-		echo "Try: make test N=06"; \
+		echo "  where XX = 01, 02, 03, 04, 05, or 06"; \
+		echo "Example: make test N=06"; \
 		exit 1; \
 	fi
 	$(CC) $(CFLAGS) -c tests/test_$(N)_*.c -o /tmp/test_$(N).o
-	$(CC) $(HS_OBJ) /tmp/test_$(N).o $(LDFLAGS) -o /tmp/test_$(N)
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o /tmp/test_$(N).o $(LDFLAGS) -o /tmp/test_$(N)
 	sudo /tmp/test_$(N)
