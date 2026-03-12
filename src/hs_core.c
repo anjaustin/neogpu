@@ -45,20 +45,12 @@ typedef enum {
     HS_ERR_STAGE_REPLAY = 2,
 } HSErrorStage;
 
-static Node* hs_node_by_id(HSSystem* sys, u8 id) {
-    if (!sys) return NULL;
-    for (u8 i = 0; i < sys->node_count; i++) {
-        if (sys->nodes[i] && sys->nodes[i]->id == id) return sys->nodes[i];
-    }
-    return NULL;
+static inline Node* hs_node_by_id(HSSystem* sys, u8 id) {
+    return sys ? sys->node_map[id] : NULL;
 }
 
-static bool hs_system_has_node(const HSSystem* sys, u8 id) {
-    if (!sys) return false;
-    for (u8 i = 0; i < sys->node_count; i++) {
-        if (sys->nodes[i] && sys->nodes[i]->id == id) return true;
-    }
-    return false;
+static inline bool hs_system_has_node(const HSSystem* sys, u8 id) {
+    return sys ? (sys->node_map[id] != NULL) : false;
 }
 
 static void hs_report_error_ex(HSSystem* sys, const Message* bad_msg, u32 code, u8 stage, const char* detail) {
@@ -567,7 +559,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->log_overflow = false;
     sys->dropped_error_ex = 0;
     sys->dropped_queue_full = 0;
-    sys->submit_full = 0;
+    atomic_init(&sys->submit_full, 0);
 
     atomic_init(&sys->submit.enqueue_pos, 0);
     atomic_init(&sys->submit.dequeue_pos, 0);
@@ -592,6 +584,7 @@ void hs_register(HSSystem* sys, Node* node) {
     if (sys->node_count >= HS_MAX_NODES) return;
     node->next = NULL;
     sys->nodes[sys->node_count++] = node;
+    sys->node_map[node->id] = node;
 }
 
 void hs_capture_init(HSCapture* cap, Message* msg_buf, Payload* payload_buf, u32 capacity) {
@@ -684,17 +677,11 @@ bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Pa
 }
 
 bool hs_send(HSSystem* sys, Message* msg) {
-    hs_lock(sys);
-    bool ok = hs_submit_enqueue(sys, msg, NULL, 0);
-    hs_unlock(sys);
-    return ok;
+    return hs_submit_enqueue(sys, msg, NULL, 0);
 }
 
 bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len) {
-    hs_lock(sys);
-    bool ok = hs_submit_enqueue(sys, msg, data, len);
-    hs_unlock(sys);
-    return ok;
+    return hs_submit_enqueue(sys, msg, data, len);
 }
 
 u32 hs_step(HSSystem* sys) {

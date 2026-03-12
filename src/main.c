@@ -471,7 +471,7 @@ static void test_async_atomic_running(void) {
  * ============================================================ */
 typedef struct {
     HSSystem* sys;
-    volatile bool* stop;
+    atomic_bool* stop;
     u32 sent;
     u32 failed;
 } SenderArgs;
@@ -479,7 +479,7 @@ typedef struct {
 static void* sender_thread(void* arg) {
     SenderArgs* a = (SenderArgs*)arg;
     u32 i = 0;
-    while (!*a->stop) {
+    while (!atomic_load_explicit(a->stop, memory_order_acquire)) {
         Message m = {
             .to = NODE_SHADER,
             .from = NODE_CPU,
@@ -506,10 +506,11 @@ static void test_thread_safety(void) {
     gpu.system.validate_on_send = true;
     gpu.system.recording = false;
 
-    volatile bool stop = false;
+    atomic_bool stop_atomic;
+    atomic_init(&stop_atomic, false);
     SenderArgs args = {
         .sys = &gpu.system,
-        .stop = &stop,
+        .stop = &stop_atomic,
         .sent = 0,
         .failed = 0,
     };
@@ -524,7 +525,7 @@ static void test_thread_safety(void) {
         usleep(1000);
     }
 
-    stop = true;
+    atomic_store_explicit(&stop_atomic, true, memory_order_release);
     pthread_join(th, NULL);
 
     SystemState* st = (SystemState*)gpu.system_node.state;

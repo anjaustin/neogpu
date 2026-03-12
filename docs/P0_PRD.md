@@ -16,6 +16,12 @@ Make the messaging layer safe and predictable when used from multiple threads, o
 - The step thread calls `hs_step()`, which drains the submit queue and routes messages into node inboxes, and only then processes nodes.
 - Validation/logging/render-recording happen at route time (on the step thread).
 
+Concurrency constraints:
+
+- `hs_send()` / `hs_send_with_payload()` are thread-safe.
+- `hs_step()` is single-threaded (one step thread).
+- Destructive lifecycle operations (`hs_clear`, `hs_replay`, `hs_init`) must not run concurrently with producer threads.
+
 ## Current Snapshot (Quick-Glance Table)
 
 | Area | Current Mechanism | Atomic/Thread-Safe? | Assumption Today | What Breaks If Violated | P0 Fix |

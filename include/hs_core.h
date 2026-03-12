@@ -131,6 +131,7 @@ struct Node {
 
 typedef struct {
     Node*       nodes[HS_MAX_NODES];
+    Node*       node_map[256];
     u8          node_count;
     u32         tick;
     Message*    log;
@@ -152,7 +153,7 @@ typedef struct {
     u32 dropped_queue_full;
 
     HSSubmitQueue submit;
-    u32 submit_full;
+    atomic_uint submit_full;
 } HSSystem;
 
 void hs_lock(HSSystem* sys);
