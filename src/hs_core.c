@@ -45,6 +45,9 @@ static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
     [OP_TEXTURE_FILTER]= {NODE_TEXTURE, HS_PAYLOAD_NONE,  0, 0},
     [OP_TEXTURE_WRAP]  = {NODE_TEXTURE, HS_PAYLOAD_NONE,  0, 0},
 
+    [OP_ACK]           = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
+    [OP_RESULT]        = {NODE_SYSTEM, HS_PAYLOAD_RANGE,  0, HS_PAYLOAD_SIZE},
+
     [OP_CLEAR]         = {NODE_OUTPUT, HS_PAYLOAD_FIXED, 16, 16},
     [OP_CLEAR_DS]      = {NODE_OUTPUT, HS_PAYLOAD_FIXED,  8,  8},
 
@@ -405,6 +408,8 @@ const char* hs_op_name(OpCode op) {
         case OP_SHOW_TEXTURE:  return "SHOW_TEXTURE";
         case OP_TEXTURE_FILTER: return "TEXTURE_FILTER";
         case OP_TEXTURE_WRAP:  return "TEXTURE_WRAP";
+        case OP_ACK:           return "ACK";
+        case OP_RESULT:        return "RESULT";
         case OP_ERROR:         return "ERROR";
         case OP_TRACE:         return "TRACE";
         case OP_STOP:          return "STOP";

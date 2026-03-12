@@ -55,6 +55,8 @@ typedef enum {
     OP_SHOW_TEXTURE,
     OP_TEXTURE_FILTER,
     OP_TEXTURE_WRAP,
+    OP_ACK,
+    OP_RESULT,
     OP_ERROR,
     OP_TRACE,
     OP_STOP,
@@ -66,6 +68,7 @@ typedef struct {
     u8    from;
     u8    op;
     u8    flags;
+    u32   cid;         /* correlation id (0 = none) */
     u16   tick;
     u16   payload_idx;
     u32   payload_len;
@@ -116,6 +119,9 @@ typedef struct {
     u32         payload_head;
     bool        log_overflow;
 } HSSystem;
+
+/* Message flags (Message.flags) */
+#define HS_MSGF_ACK   (1u << 0)  /* request OP_ACK after apply */
 
 void mq_init(MessageQueue* q);
 bool mq_push(MessageQueue* q, Message* msg);

@@ -69,6 +69,17 @@ typedef struct {
 
 typedef struct {
     u8 stopped;
+    u32 ack_count;
+    u32 last_ack_cid;
+    u8  last_ack_from;
+    u8  last_ack_op;
+    u8  last_ack_status;
+    u8  pad0;
+    u32 result_count;
+    u32 last_result_cid;
+    u8  last_result_from;
+    u8  last_result_op;
+    u16 last_result_len;
 } SystemState;
 
 int shader_node_process(Node* node);

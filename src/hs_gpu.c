@@ -35,6 +35,7 @@ static void hs_gpu_send_simple(HSGpu* gpu, u8 to, OpCode op, u32 payload_idx, u3
         .from = NODE_CPU,
         .op = op,
         .flags = 0,
+        .cid = 0,
         .tick = 0,
         .payload_idx = (u16)payload_idx,
         .payload_len = payload_len
@@ -54,6 +55,7 @@ bool hs_gpu_send_with_payload(HSGpu* gpu, u8 to, OpCode op, const void* data, u3
         .from = NODE_CPU,
         .op = op,
         .flags = 0,
+        .cid = 0,
         .tick = 0,
         .payload_idx = idx,
         .payload_len = copy_len
@@ -91,6 +93,7 @@ void hs_gpu_set_global(HSGpu* gpu, u8 idx, mat4 value) {
         .from = NODE_CPU,
         .op = OP_SET_GLOBAL,
         .flags = idx,          /* Use flags field for the global index */
+        .cid = 0,
         .tick = 0,
         .payload_idx = pidx,
         .payload_len = copy_len

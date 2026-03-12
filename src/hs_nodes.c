@@ -22,6 +22,23 @@ static SystemState system_state;
 
 static HSSystem* g_sys = NULL;
 
+static void emit_ack(u8 from, const Message* req, u8 status) {
+    if (!g_sys || !req) return;
+    if ((req->flags & HS_MSGF_ACK) == 0) return;
+
+    Message ack = {
+        .to = NODE_SYSTEM,
+        .from = from,
+        .op = OP_ACK,
+        .flags = status,
+        .cid = req->cid,
+        .tick = 0,
+        .payload_idx = (u16)req->op,
+        .payload_len = 0,
+    };
+    (void)hs_send(g_sys, &ack);
+}
+
 void hs_nodes_set_system(HSSystem* sys) {
     g_sys = sys;
 }
@@ -61,6 +78,7 @@ int shader_node_process(Node* node) {
     Message msg;
     
     while (mq_pop(&node->inbox, &msg)) {
+        u8 handled = 1;
         switch (msg.op) {
             case OP_SET_SHADER:
                 shader_state.current_shader = msg.payload_idx;
@@ -211,8 +229,10 @@ int shader_node_process(Node* node) {
             }
                 
             default:
+                handled = 0;
                 break;
         }
+        emit_ack(node->id, &msg, handled ? 0 : 1);
         processed++;
     }
     
@@ -236,6 +256,7 @@ int buffer_node_process(Node* node) {
     Message msg;
     
     while (mq_pop(&node->inbox, &msg)) {
+        u8 handled = 1;
         switch (msg.op) {
             case OP_LOAD_BUFFER:
                 buffer_state.buffer_handles[msg.payload_idx & 0xF] = msg.payload_idx;
@@ -276,8 +297,10 @@ int buffer_node_process(Node* node) {
             }
                 
             default:
+                handled = 0;
                 break;
         }
+        emit_ack(node->id, &msg, handled ? 0 : 1);
         processed++;
     }
     
@@ -301,6 +324,7 @@ int texture_node_process(Node* node) {
     Message msg;
     
     while (mq_pop(&node->inbox, &msg)) {
+        u8 handled = 1;
         switch (msg.op) {
             case OP_LOAD_TEXTURE:
                 texture_state.texture_handles[msg.payload_idx & 0xF] = msg.payload_idx;
@@ -347,8 +371,10 @@ int texture_node_process(Node* node) {
             }
                  
             default:
+                handled = 0;
                 break;
         }
+        emit_ack(node->id, &msg, handled ? 0 : 1);
         processed++;
     }
     
@@ -382,6 +408,7 @@ int output_node_process(Node* node) {
     Message msg;
     
     while (mq_pop(&node->inbox, &msg)) {
+        u8 handled = 1;
         switch (msg.op) {
             case OP_CLEAR: {
                 void* data = get_payload(msg.payload_idx);
@@ -413,8 +440,10 @@ int output_node_process(Node* node) {
             }
                 
             default:
+                handled = 0;
                 break;
         }
+        emit_ack(node->id, &msg, handled ? 0 : 1);
         processed++;
     }
     
@@ -438,6 +467,7 @@ int sound_node_process(Node* node) {
     Message msg;
     
     while (mq_pop(&node->inbox, &msg)) {
+        u8 handled = 1;
         switch (msg.op) {
             case OP_SET_CHANNEL: {
                 void* data = get_payload(msg.payload_idx);
@@ -454,8 +484,10 @@ int sound_node_process(Node* node) {
             }
                 
             default:
+                handled = 0;
                 break;
         }
+        emit_ack(node->id, &msg, handled ? 0 : 1);
         processed++;
     }
     
@@ -480,6 +512,22 @@ int system_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         switch (msg.op) {
+            case OP_ACK:
+                system_state.ack_count++;
+                system_state.last_ack_cid = msg.cid;
+                system_state.last_ack_from = msg.from;
+                system_state.last_ack_op = (u8)msg.payload_idx;
+                system_state.last_ack_status = msg.flags;
+                break;
+
+            case OP_RESULT:
+                system_state.result_count++;
+                system_state.last_result_cid = msg.cid;
+                system_state.last_result_from = msg.from;
+                system_state.last_result_op = msg.flags;
+                system_state.last_result_len = (u16)msg.payload_len;
+                break;
+
             case OP_ERROR: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {

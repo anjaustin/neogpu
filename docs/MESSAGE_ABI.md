@@ -11,6 +11,7 @@ The goal is to make the existing implicit ABI explicit so it can be validated, c
 - `to` / `from`: node ids
 - `op`: opcode (`OpCode`)
 - `flags`: opcode-specific small field
+- `cid`: correlation id for request/response-style messages (0 means "none")
 - `tick`: assigned by the system at send time
 - `payload_idx`: either an immediate value (for some ops) OR an index into the payload ring (for payload-bearing ops)
 - `payload_len`: payload length in bytes (0 for immediate-only ops)
@@ -113,6 +114,13 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
   - Payload layout: `[u8 channel][u8 shader]`
 
 ### System ops (`to = NODE_SYSTEM`)
+
+- `OP_ACK` (Immediate)
+  - Header: `cid = request cid`, `from = node that applied the request`
+  - Header: `payload_idx = original opcode`, `flags = status (0=ok, 1=unhandled)`
+- `OP_RESULT` (Payload, 0..64B)
+  - Header: `cid = request cid`, `from = node producing the result`
+  - Payload: opcode-specific small result blob
 
 - `OP_ERROR` (Payload, 1..64B)
   - Payload layout: C string, null-terminated

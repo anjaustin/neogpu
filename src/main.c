@@ -149,6 +149,7 @@ static void test_message_validation(void) {
         .from = NODE_CPU,
         .op = OP_SET_SHADER,
         .flags = 0,
+        .cid = 0,
         .tick = 0,
         .payload_idx = 0,
         .payload_len = 0
@@ -161,6 +162,7 @@ static void test_message_validation(void) {
         .from = NODE_CPU,
         .op = OP_SET_PARAM,
         .flags = 0,
+        .cid = 0,
         .tick = 0,
         .payload_idx = 0,
         .payload_len = 19
@@ -177,6 +179,7 @@ static void test_message_validation(void) {
         .from = NODE_CPU,
         .op = OP_TRACE,
         .flags = 0,
+        .cid = 0,
         .tick = 0,
         .payload_idx = 0,
         .payload_len = 4
@@ -189,6 +192,7 @@ static void test_message_validation(void) {
         .from = NODE_CPU,
         .op = OP_BLEND,
         .flags = 0,
+        .cid = 0,
         .tick = 0,
         .payload_idx = (u16)gpu.system.payload_capacity,
         .payload_len = 2
@@ -203,11 +207,30 @@ static void test_message_validation(void) {
         .from = NODE_CPU,
         .op = OP_BLEND,
         .flags = 0,
+        .cid = 0,
         .tick = 0,
         .payload_idx = 0,
         .payload_len = 2
     };
     TEST("validate_ok", hs_validate_message(&gpu.system, &m5, &err));
+
+    /* Ack request */
+    Message m6 = {
+        .to = NODE_SHADER,
+        .from = NODE_CPU,
+        .op = OP_SET_SHADER,
+        .flags = HS_MSGF_ACK,
+        .cid = 123,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0
+    };
+    bool send_ok = hs_send(&gpu.system, &m6);
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    SystemState* st = (SystemState*)gpu.system_node.state;
+    TEST("ack_send_ok", send_ok);
+    TEST("ack_received", st->ack_count > 0 && st->last_ack_cid == 123 && st->last_ack_op == OP_SET_SHADER);
 }
 
 /* ============================================================
