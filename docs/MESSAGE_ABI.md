@@ -13,9 +13,10 @@ The goal is to make the existing implicit ABI explicit so it can be validated, c
 - `flags`: opcode-specific small field
 - `flags`: opcode-specific small field (MSB is reserved for `HS_MSGF_ACK`)
 - `cid`: correlation id for request/response-style messages (0 means "none")
-- `tick`: assigned by the system at send time
+- `tick`: assigned when routed/applied (step thread)
 - `payload_idx`: either an immediate value (for some ops) OR an index into the payload ring (for payload-bearing ops)
 - `payload_len`: payload length in bytes (0 for immediate-only ops)
+- `channel`: fabric channel (0 means "use default mapping")
 
 ## Payload Storage
 

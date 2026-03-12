@@ -71,6 +71,14 @@ typedef enum {
     OP_COUNT
 } OpCode;
 
+typedef enum {
+    CHAN_DEFAULT = 0,
+    CHAN_RT = 1,
+    CHAN_RENDER = 2,
+    CHAN_TELEM = 3,
+    CHAN_COUNT
+} HSChannel;
+
 typedef struct {
     u8    to;
     u8    from;
@@ -80,6 +88,9 @@ typedef struct {
     u16   tick;
     u16   payload_idx;
     u32   payload_len;
+    u8    channel;     /* HSChannel (0 = default mapping) */
+    u8    pad0;
+    u16   pad1;
 } Message;
 
 #define HS_SUBMIT_SIZE     1024

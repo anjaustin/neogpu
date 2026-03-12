@@ -19,7 +19,7 @@ static void hs_capture_header_init(HSCaptureHeader* h, u32 count) {
     memset(h, 0, sizeof(*h));
     memcpy(h->magic, "HSCAP1\0", 7);
     h->endian = 0x01020304u;
-    h->version = 1u;
+    h->version = 2u;
     h->msg_size = (u32)sizeof(Message);
     h->payload_size = (u32)sizeof(Payload);
     h->count = count;
@@ -29,7 +29,7 @@ static bool hs_capture_header_valid(const HSCaptureHeader* h) {
     if (!h) return false;
     if (memcmp(h->magic, "HSCAP1\0", 7) != 0) return false;
     if (h->endian != 0x01020304u) return false;
-    if (h->version != 1u) return false;
+    if (h->version != 2u) return false;
     if (h->msg_size != (u32)sizeof(Message)) return false;
     if (h->payload_size != (u32)sizeof(Payload)) return false;
     return true;
@@ -45,6 +45,8 @@ typedef enum {
     HS_ERR_STAGE_SEND = 1,
     HS_ERR_STAGE_REPLAY = 2,
 } HSErrorStage;
+
+static HSChannel hs_default_channel_for_op(OpCode op);
 
 static inline Node* hs_node_by_id(HSSystem* sys, u8 id) {
     return sys ? sys->node_map[id] : NULL;
@@ -89,6 +91,7 @@ static void hs_report_error_ex(HSSystem* sys, const Message* bad_msg, u32 code, 
         .tick = (u16)sys->tick,
         .payload_idx = idx,
         .payload_len = copy_len,
+        .channel = CHAN_TELEM,
     };
 
     if (!mq_push(&sys_node->inbox, &emsg)) {
@@ -110,6 +113,7 @@ static void hs_report_queue_full(HSSystem* sys, const Message* msg, u8 dest_node
         .tick = (u16)sys->tick,
         .payload_idx = (u16)(msg ? msg->op : 0),
         .payload_len = 0,
+        .channel = CHAN_TELEM,
     };
     if (!mq_push(&sys_node->inbox, &q)) {
         sys->dropped_queue_full++;
@@ -332,6 +336,10 @@ static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload,
     /* Called by the step thread only. */
     if (!sys || !msg) return false;
 
+    if (msg->channel == CHAN_DEFAULT) {
+        msg->channel = (u8)hs_default_channel_for_op((OpCode)msg->op);
+    }
+
     msg->tick = sys->tick;
 
     /* If message carries a payload in-band, allocate it into system payload ring now. */
@@ -430,6 +438,10 @@ void hs_wake_senders(HSSystem* sys) {
 static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u32 len) {
     if (!sys || !msg) return false;
 
+    if (msg->channel == CHAN_DEFAULT) {
+        msg->channel = (u8)hs_default_channel_for_op((OpCode)msg->op);
+    }
+
     if (g_tls_in_step == sys) {
         return hs_route_immediate(sys, msg, payload, len);
     }
@@ -462,6 +474,28 @@ typedef struct {
     u16          min_len;
     u16          max_len;
 } HSOpSpec;
+
+static HSChannel hs_default_channel_for_op(OpCode op) {
+    switch (op) {
+        /* telemetry */
+        case OP_ERROR_EX:
+        case OP_ERROR:
+        case OP_TRACE:
+        case OP_QUEUE_FULL:
+            return CHAN_TELEM;
+
+        /* rt/control */
+        case OP_ACK:
+        case OP_RESULT:
+        case OP_ASYNC_DONE:
+        case OP_STOP:
+            return CHAN_RT;
+
+        /* default render */
+        default:
+            return CHAN_RENDER;
+    }
+}
 
 static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
     [OP_NOOP]          = {0xFF,        HS_PAYLOAD_NONE,   0, 0},
