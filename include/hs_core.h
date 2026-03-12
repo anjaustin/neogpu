@@ -14,6 +14,7 @@
 #include <arm_neon.h>
 
 #include <pthread.h>
+#include <stdatomic.h>
 
 typedef struct HSRenderList HSRenderList;
 
@@ -81,6 +82,21 @@ typedef struct {
     u32   payload_len;
 } Message;
 
+#define HS_SUBMIT_SIZE     1024
+
+typedef struct {
+    atomic_uint seq;
+    Message msg;
+    u32 payload_len;
+    u8 payload[HS_PAYLOAD_SIZE];
+} __attribute__((aligned(64))) HSSubmitSlot;
+
+typedef struct {
+    atomic_uint enqueue_pos;
+    atomic_uint dequeue_pos;
+    HSSubmitSlot slots[HS_SUBMIT_SIZE];
+} HSSubmitQueue;
+
 /* Removed static_assert - on some ABIs struct is 12 bytes, not 16 */
 
 typedef struct __attribute__((aligned(64))) {
@@ -134,6 +150,9 @@ typedef struct {
     /* Telemetry about dropped best-effort system events */
     u32 dropped_error_ex;
     u32 dropped_queue_full;
+
+    HSSubmitQueue submit;
+    u32 submit_full;
 } HSSystem;
 
 void hs_lock(HSSystem* sys);

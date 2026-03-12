@@ -9,6 +9,13 @@
 
 Make the messaging layer safe and predictable when used from multiple threads, or fail fast with explicit rules. This P0 focuses on correctness first; performance tuning comes after.
 
+## Current Model (After P0)
+
+- Producers call `hs_send()` / `hs_send_with_payload()` from any thread.
+- Messages are enqueued into an MPSC submit queue (`HSSystem.submit`).
+- The step thread calls `hs_step()`, which drains the submit queue and routes messages into node inboxes, and only then processes nodes.
+- Validation/logging/render-recording happen at route time (on the step thread).
+
 ## Current Snapshot (Quick-Glance Table)
 
 | Area | Current Mechanism | Atomic/Thread-Safe? | Assumption Today | What Breaks If Violated | P0 Fix |
@@ -47,3 +54,4 @@ Make the messaging layer safe and predictable when used from multiple threads, o
 - Multi-thread falsification test lives in `src/main.c` ("Thread Safety Tests").
 - Dropped-telemetry counters live in `HSSystem` (`dropped_error_ex`, `dropped_queue_full`).
 - `HSAsync.running` is implemented as `atomic_bool`.
+- MPSC submit queue lives in `HSSystem.submit` and backpressure is tracked in `HSSystem.submit_full`.

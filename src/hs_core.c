@@ -53,6 +53,14 @@ static Node* hs_node_by_id(HSSystem* sys, u8 id) {
     return NULL;
 }
 
+static bool hs_system_has_node(const HSSystem* sys, u8 id) {
+    if (!sys) return false;
+    for (u8 i = 0; i < sys->node_count; i++) {
+        if (sys->nodes[i] && sys->nodes[i]->id == id) return true;
+    }
+    return false;
+}
+
 static void hs_report_error_ex(HSSystem* sys, const Message* bad_msg, u32 code, u8 stage, const char* detail) {
     if (!sys) return;
     Node* sys_node = hs_node_by_id(sys, NODE_SYSTEM);
@@ -244,6 +252,118 @@ static void hs_render_record(HSSystem* sys, const Message* msg) {
     (void)hs_render_push(sys->render_list, &cmd);
 }
 
+static bool hs_submit_enqueue(HSSystem* sys, const Message* msg, const void* payload, u32 payload_len) {
+    if (!sys || !msg) return false;
+
+    /* fast reject invalid destination/op */
+    if (msg->op >= OP_COUNT) return false;
+    if (!hs_system_has_node(sys, msg->to)) return false;
+
+    u32 len = payload_len;
+    if (len > HS_PAYLOAD_SIZE) len = HS_PAYLOAD_SIZE;
+
+    u32 pos = atomic_load_explicit(&sys->submit.enqueue_pos, memory_order_relaxed);
+    for (;;) {
+        HSSubmitSlot* slot = &sys->submit.slots[pos % HS_SUBMIT_SIZE];
+        u32 seq = atomic_load_explicit(&slot->seq, memory_order_acquire);
+        intptr_t dif = (intptr_t)seq - (intptr_t)pos;
+        if (dif == 0) {
+            if (atomic_compare_exchange_weak_explicit(
+                    &sys->submit.enqueue_pos, &pos, pos + 1,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                /* claimed */
+                slot->msg = *msg;
+                slot->payload_len = len;
+                if (len && payload) memcpy(slot->payload, payload, len);
+                atomic_store_explicit(&slot->seq, pos + 1, memory_order_release);
+                return true;
+            }
+            continue;
+        }
+        if (dif < 0) {
+            sys->submit_full++;
+            return false;
+        }
+        pos = atomic_load_explicit(&sys->submit.enqueue_pos, memory_order_relaxed);
+    }
+}
+
+static bool hs_submit_dequeue(HSSystem* sys, Message* out_msg, u8 out_payload[HS_PAYLOAD_SIZE], u32* out_payload_len) {
+    if (!sys || !out_msg || !out_payload_len) return false;
+
+    u32 pos = atomic_load_explicit(&sys->submit.dequeue_pos, memory_order_relaxed);
+    for (;;) {
+        HSSubmitSlot* slot = &sys->submit.slots[pos % HS_SUBMIT_SIZE];
+        u32 seq = atomic_load_explicit(&slot->seq, memory_order_acquire);
+        intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
+        if (dif == 0) {
+            if (atomic_compare_exchange_weak_explicit(
+                    &sys->submit.dequeue_pos, &pos, pos + 1,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                *out_msg = slot->msg;
+                *out_payload_len = slot->payload_len;
+                if (out_payload && slot->payload_len) {
+                    memcpy(out_payload, slot->payload, slot->payload_len);
+                }
+                atomic_store_explicit(&slot->seq, pos + HS_SUBMIT_SIZE, memory_order_release);
+                return true;
+            }
+            continue;
+        }
+        if (dif < 0) {
+            return false; /* empty */
+        }
+        pos = atomic_load_explicit(&sys->submit.dequeue_pos, memory_order_relaxed);
+    }
+}
+
+static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload, u32 payload_len) {
+    /* Called by the step thread only. */
+    if (!sys || !msg) return false;
+
+    msg->tick = sys->tick;
+
+    /* If message carries a payload in-band, allocate it into system payload ring now. */
+    if (payload_len) {
+        u16 idx = 0;
+        u32 copy_len = 0;
+        if (!hs_payload_alloc_and_copy(sys, payload, payload_len, &idx, &copy_len)) return false;
+        msg->payload_idx = idx;
+        msg->payload_len = copy_len;
+    }
+
+    if (sys->validate_on_send) {
+        const char* err = NULL;
+        if (!hs_validate_message(sys, msg, &err)) {
+            hs_report_error_ex(sys, msg, HS_ERR_VALIDATE, HS_ERR_STAGE_SEND, err ? err : "validate failed");
+            return false;
+        }
+    }
+
+    if (sys->recording && sys->log_head >= sys->log_capacity) {
+        sys->log_overflow = true;
+        sys->recording = false;
+    }
+
+    Node* dest = hs_node_by_id(sys, msg->to);
+    if (!dest) {
+        hs_report_error_ex(sys, msg, HS_ERR_ROUTE, HS_ERR_STAGE_SEND, "invalid destination node");
+        return false;
+    }
+
+    if (!mq_push(&dest->inbox, msg)) {
+        hs_report_queue_full(sys, msg, msg->to);
+        return false;
+    }
+
+    if (sys->recording) {
+        sys->log[sys->log_head++] = *msg;
+    }
+
+    hs_render_record(sys, msg);
+    return true;
+}
+
 typedef enum {
     HS_PAYLOAD_NONE = 0,
     HS_PAYLOAD_FIXED,
@@ -303,19 +423,9 @@ static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
     [OP_STOP]          = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
 };
 
-static bool hs_system_has_node(const HSSystem* sys, u8 id) {
-    if (!sys) return false;
-    for (u8 i = 0; i < sys->node_count; i++) {
-        if (sys->nodes[i] && sys->nodes[i]->id == id) return true;
-    }
-    return false;
-}
-
 bool hs_payload_alloc_and_copy(HSSystem* sys, const void* data, u32 len, u16* out_idx, u32* out_len) {
     if (!sys) return false;
-    hs_lock(sys);
     if (!sys->payloads || sys->payload_capacity == 0) {
-        hs_unlock(sys);
         return false;
     }
 
@@ -332,7 +442,6 @@ bool hs_payload_alloc_and_copy(HSSystem* sys, const void* data, u32 len, u16* ou
 
     if (out_idx) *out_idx = (u16)idx;
     if (out_len) *out_len = copy_len;
-    hs_unlock(sys);
     return true;
 }
 
@@ -458,6 +567,16 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->log_overflow = false;
     sys->dropped_error_ex = 0;
     sys->dropped_queue_full = 0;
+    sys->submit_full = 0;
+
+    atomic_init(&sys->submit.enqueue_pos, 0);
+    atomic_init(&sys->submit.dequeue_pos, 0);
+    for (u32 i = 0; i < HS_SUBMIT_SIZE; i++) {
+        atomic_init(&sys->submit.slots[i].seq, i);
+        memset(&sys->submit.slots[i].msg, 0, sizeof(Message));
+        sys->submit.slots[i].payload_len = 0;
+        memset(sys->submit.slots[i].payload, 0, HS_PAYLOAD_SIZE);
+    }
 
     {
         pthread_mutexattr_t attr;
@@ -566,56 +685,35 @@ bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Pa
 
 bool hs_send(HSSystem* sys, Message* msg) {
     hs_lock(sys);
-    msg->tick = sys->tick;
-
-    if (sys->validate_on_send) {
-        const char* err = NULL;
-        if (!hs_validate_message(sys, msg, &err)) {
-            hs_report_error_ex(sys, msg, HS_ERR_VALIDATE, HS_ERR_STAGE_SEND, err ? err : "validate failed");
-            hs_unlock(sys);
-            return false;
-        }
-    }
-    
-    if (sys->recording && sys->log_head >= sys->log_capacity) {
-        sys->log_overflow = true;
-        sys->recording = false;
-    }
-
-    for (u8 i = 0; i < sys->node_count; i++) {
-        if (sys->nodes[i]->id == msg->to) {
-            bool pushed = mq_push(&sys->nodes[i]->inbox, msg);
-            if (!pushed) {
-                hs_report_queue_full(sys, msg, msg->to);
-                hs_unlock(sys);
-                return false;
-            }
-            if (sys->recording) {
-                sys->log[sys->log_head++] = *msg;
-            }
-            hs_render_record(sys, msg);
-            hs_unlock(sys);
-            return true;
-        }
-    }
-
-    hs_report_error_ex(sys, msg, HS_ERR_ROUTE, HS_ERR_STAGE_SEND, "invalid destination node");
+    bool ok = hs_submit_enqueue(sys, msg, NULL, 0);
     hs_unlock(sys);
-    return false;
+    return ok;
 }
 
 bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len) {
-    u16 idx = 0;
-    u32 copy_len = 0;
-    if (!hs_payload_alloc_and_copy(sys, data, len, &idx, &copy_len)) return false;
-    msg->payload_idx = idx;
-    msg->payload_len = copy_len;
-    return hs_send(sys, msg);
+    hs_lock(sys);
+    bool ok = hs_submit_enqueue(sys, msg, data, len);
+    hs_unlock(sys);
+    return ok;
 }
 
 u32 hs_step(HSSystem* sys) {
     hs_lock(sys);
     u32 processed = 0;
+
+    /* Drain submit queue into node inboxes */
+    for (;;) {
+        Message m;
+        u8 payload[HS_PAYLOAD_SIZE];
+        u32 payload_len = 0;
+        if (!hs_submit_dequeue(sys, &m, payload, &payload_len)) break;
+        if (payload_len) {
+            (void)hs_route_immediate(sys, &m, payload, payload_len);
+        } else {
+            (void)hs_route_immediate(sys, &m, NULL, 0);
+        }
+        processed++;
+    }
     
     for (u8 i = 0; i < sys->node_count; i++) {
         Node* node = sys->nodes[i];
@@ -629,7 +727,7 @@ u32 hs_step(HSSystem* sys) {
         while (!mq_empty(&node->outbox)) {
             Message msg;
             mq_pop(&node->outbox, &msg);
-            hs_send(sys, &msg);
+            (void)hs_route_immediate(sys, &msg, NULL, 0);
         }
     }
     

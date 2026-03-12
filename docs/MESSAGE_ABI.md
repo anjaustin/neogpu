@@ -140,6 +140,8 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
 ## Notes
 
 - The ABI as described here is the "as implemented" behavior.
+
+Note: with the multi-producer submit queue enabled, `tick` is assigned when the step thread routes the message into a node inbox (i.e. when it is applied), not when the producer enqueues it.
 - The preferred direction is to evolve this into a "Message ABI v1" with explicit validation rules and stable capture/replay.
 
 ## Render Recording

@@ -365,7 +365,7 @@ static void test_message_validation(void) {
     TEST("ack_send_ok", send_ok);
     TEST("ack_received", st->ack_count > 0 && st->last_ack_cid == 123 && st->last_ack_op == OP_SET_SHADER);
 
-    /* Structured error emitted on send-time validation failure */
+    /* Structured error emitted on route-time validation failure */
     Message bad = {
         .to = NODE_BUFFER,
         .from = NODE_CPU,
@@ -378,13 +378,13 @@ static void test_message_validation(void) {
     };
     bool bad_ok = hs_send(&gpu.system, &bad);
     hs_step(&gpu.system);
-    TEST("send_rejected", !bad_ok);
+    TEST("send_queued", bad_ok);
     TEST("error_ex_emitted", st->error_count > 0 && st->last_error_op == OP_SET_SHADER && st->last_error_to == NODE_BUFFER);
 
-    /* Backpressure: overflow a node inbox */
+    /* Backpressure: overflow submit queue without stepping */
     gpu.system.recording = false;
     u32 ok_count = 0;
-    for (u32 i = 0; i < (HS_QUEUE_SIZE + 8); i++) {
+    for (u32 i = 0; i < (HS_SUBMIT_SIZE + 64); i++) {
         Message spam = {
             .to = NODE_SHADER,
             .from = NODE_CPU,
@@ -398,7 +398,7 @@ static void test_message_validation(void) {
         if (hs_send(&gpu.system, &spam)) ok_count++;
     }
     hs_step(&gpu.system);
-    TEST("queue_full_triggered", ok_count < (HS_QUEUE_SIZE + 8) && st->queue_full_count > 0);
+    TEST("queue_full_triggered", ok_count < (HS_SUBMIT_SIZE + 64) && gpu.system.submit_full > 0);
 }
 
 /* ============================================================

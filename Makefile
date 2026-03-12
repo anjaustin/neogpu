@@ -1,6 +1,6 @@
 # NeoGPU build (native aarch64)
 CC = gcc
-CFLAGS = -O3 -march=armv8.2-a+fp16+simd -mtune=cortex-a72 \
+CFLAGS = -O3 -march=armv8-a+simd -mtune=cortex-a72 \
          -ffast-math -funroll-loops -Wall -Wextra -DNDEBUG -Iinclude \
          -MMD -MP
 LDFLAGS = -lm -lGLESv2 -lgbm -ldrm -lEGL -lpthread
