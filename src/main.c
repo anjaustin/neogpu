@@ -133,6 +133,84 @@ static void test_input(void) {
 }
 
 /* ============================================================
+ * Message validation tests
+ * ============================================================ */
+static void test_message_validation(void) {
+    printf("\n--- Message Validation Tests ---\n");
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+
+    const char* err = NULL;
+
+    /* Wrong destination */
+    Message m1 = {
+        .to = NODE_BUFFER,
+        .from = NODE_CPU,
+        .op = OP_SET_SHADER,
+        .flags = 0,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0
+    };
+    TEST("validate_bad_destination", !hs_validate_message(&gpu.system, &m1, &err));
+
+    /* Bad payload length */
+    Message m2 = {
+        .to = NODE_SHADER,
+        .from = NODE_CPU,
+        .op = OP_SET_PARAM,
+        .flags = 0,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 19
+    };
+    TEST("validate_bad_payload_len", !hs_validate_message(&gpu.system, &m2, &err));
+
+    /* String not terminated */
+    gpu.system.payloads[0].data[0] = 'A';
+    gpu.system.payloads[0].data[1] = 'B';
+    gpu.system.payloads[0].data[2] = 'C';
+    gpu.system.payloads[0].data[3] = 'D';
+    Message m3 = {
+        .to = NODE_SYSTEM,
+        .from = NODE_CPU,
+        .op = OP_TRACE,
+        .flags = 0,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 4
+    };
+    TEST("validate_string_nul", !hs_validate_message(&gpu.system, &m3, &err));
+
+    /* Invalid payload index */
+    Message m4 = {
+        .to = NODE_SHADER,
+        .from = NODE_CPU,
+        .op = OP_BLEND,
+        .flags = 0,
+        .tick = 0,
+        .payload_idx = (u16)gpu.system.payload_capacity,
+        .payload_len = 2
+    };
+    TEST("validate_payload_idx", !hs_validate_message(&gpu.system, &m4, &err));
+
+    /* Valid payload-bearing op */
+    gpu.system.payloads[0].data[0] = 1;
+    gpu.system.payloads[0].data[1] = 0;
+    Message m5 = {
+        .to = NODE_SHADER,
+        .from = NODE_CPU,
+        .op = OP_BLEND,
+        .flags = 0,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 2
+    };
+    TEST("validate_ok", hs_validate_message(&gpu.system, &m5, &err));
+}
+
+/* ============================================================
  * GPU message system demo (original + new ops)
  * ============================================================ */
 static void test_gpu(void) {
@@ -350,6 +428,7 @@ int main(void) {
     test_math();
     test_buffer();
     test_input();
+    test_message_validation();
     test_gpu();
 
     printf("\n=== Results: %d passed, %d failed ===\n",

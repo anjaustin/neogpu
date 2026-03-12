@@ -3,6 +3,58 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+typedef enum {
+    HS_PAYLOAD_NONE = 0,
+    HS_PAYLOAD_FIXED,
+    HS_PAYLOAD_RANGE,
+    HS_PAYLOAD_STRING
+} HSPayloadKind;
+
+typedef struct {
+    u8           expected_to; /* 0xFF means any registered node */
+    HSPayloadKind kind;
+    u16          min_len;
+    u16          max_len;
+} HSOpSpec;
+
+static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
+    [OP_NOOP]          = {0xFF,        HS_PAYLOAD_NONE,   0, 0},
+
+    [OP_SET_SHADER]    = {NODE_SHADER, HS_PAYLOAD_NONE,   0, 0},
+    [OP_SET_PARAM]     = {NODE_SHADER, HS_PAYLOAD_FIXED, 20, 20},
+    [OP_SET_GLOBAL]    = {NODE_SHADER, HS_PAYLOAD_FIXED, 64, 64},
+    [OP_SET_CAMERA]    = {NODE_SHADER, HS_PAYLOAD_FIXED, 64, 64},
+    [OP_CULL]          = {NODE_SHADER, HS_PAYLOAD_NONE,   0, 0},
+    [OP_BLEND]         = {NODE_SHADER, HS_PAYLOAD_FIXED,  2,  2},
+    [OP_ALPHA]         = {NODE_SHADER, HS_PAYLOAD_NONE,   0, 0},
+    [OP_DEPTH]         = {NODE_SHADER, HS_PAYLOAD_NONE,   0, 0},
+    [OP_COLOR_MASK]    = {NODE_SHADER, HS_PAYLOAD_NONE,   0, 0},
+    [OP_CLIP]          = {NODE_SHADER, HS_PAYLOAD_FIXED,  8,  8},
+    [OP_STENCIL]       = {NODE_SHADER, HS_PAYLOAD_FIXED,  4,  4},
+    [OP_STENCIL_FUNC]  = {NODE_SHADER, HS_PAYLOAD_FIXED,  4,  4},
+    [OP_DEPTH_COMPARE] = {NODE_SHADER, HS_PAYLOAD_FIXED,  2,  2},
+
+    [OP_LOAD_BUFFER]   = {NODE_BUFFER, HS_PAYLOAD_NONE,   0, 0},
+    [OP_DRAW]          = {NODE_BUFFER, HS_PAYLOAD_NONE,   0, 0},
+    [OP_DRAW_INSTANCE] = {NODE_BUFFER, HS_PAYLOAD_FIXED,  4,  4},
+    [OP_DRAW_TEXT]     = {NODE_BUFFER, HS_PAYLOAD_STRING, 1, HS_PAYLOAD_SIZE},
+
+    [OP_LOAD_TEXTURE]  = {NODE_TEXTURE, HS_PAYLOAD_NONE,  0, 0},
+    [OP_SET_TARGET]    = {NODE_TEXTURE, HS_PAYLOAD_FIXED, 2, 2},
+    [OP_SHOW_TEXTURE]  = {NODE_TEXTURE, HS_PAYLOAD_NONE,  0, 0},
+    [OP_TEXTURE_FILTER]= {NODE_TEXTURE, HS_PAYLOAD_NONE,  0, 0},
+    [OP_TEXTURE_WRAP]  = {NODE_TEXTURE, HS_PAYLOAD_NONE,  0, 0},
+
+    [OP_CLEAR]         = {NODE_OUTPUT, HS_PAYLOAD_FIXED, 16, 16},
+    [OP_CLEAR_DS]      = {NODE_OUTPUT, HS_PAYLOAD_FIXED,  8,  8},
+
+    [OP_SET_CHANNEL]   = {NODE_SOUND,  HS_PAYLOAD_FIXED,  2,  2},
+
+    [OP_ERROR]         = {NODE_SYSTEM, HS_PAYLOAD_STRING, 1, HS_PAYLOAD_SIZE},
+    [OP_TRACE]         = {NODE_SYSTEM, HS_PAYLOAD_STRING, 1, HS_PAYLOAD_SIZE},
+    [OP_STOP]          = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
+};
+
 static bool hs_system_has_node(const HSSystem* sys, u8 id) {
     if (!sys) return false;
     for (u8 i = 0; i < sys->node_count; i++) {
@@ -50,143 +102,23 @@ bool hs_validate_message(const HSSystem* sys, const Message* msg, const char** o
         return false;
     }
 
-    /* Per-op routing (current ABI). */
-    {
-        u8 expected_to = 0xFF;
-        switch ((OpCode)msg->op) {
-            case OP_NOOP:
-                expected_to = 0xFF;
-                break;
-            case OP_SET_SHADER:
-            case OP_SET_PARAM:
-            case OP_SET_GLOBAL:
-            case OP_SET_CAMERA:
-            case OP_CULL:
-            case OP_BLEND:
-            case OP_ALPHA:
-            case OP_DEPTH:
-            case OP_COLOR_MASK:
-            case OP_CLIP:
-            case OP_STENCIL:
-            case OP_STENCIL_FUNC:
-            case OP_DEPTH_COMPARE:
-                expected_to = NODE_SHADER;
-                break;
-            case OP_LOAD_BUFFER:
-            case OP_DRAW:
-            case OP_DRAW_INSTANCE:
-            case OP_DRAW_TEXT:
-                expected_to = NODE_BUFFER;
-                break;
-            case OP_LOAD_TEXTURE:
-            case OP_SET_TARGET:
-            case OP_SHOW_TEXTURE:
-            case OP_TEXTURE_FILTER:
-            case OP_TEXTURE_WRAP:
-                expected_to = NODE_TEXTURE;
-                break;
-            case OP_CLEAR:
-            case OP_CLEAR_DS:
-                expected_to = NODE_OUTPUT;
-                break;
-            case OP_SET_CHANNEL:
-                expected_to = NODE_SOUND;
-                break;
-            case OP_ERROR:
-            case OP_TRACE:
-            case OP_STOP:
-                expected_to = NODE_SYSTEM;
-                break;
-            default:
-                break;
-        }
-
-        if (expected_to != 0xFF && msg->to != expected_to) {
-            err = "bad destination";
-            if (out_err) *out_err = err;
-            return false;
-        }
+    const HSOpSpec* spec = &hs_op_spec_table[(u32)msg->op];
+    if (spec->expected_to != 0xFF && msg->to != spec->expected_to) {
+        err = "bad destination";
+        if (out_err) *out_err = err;
+        return false;
     }
 
-    /* Per-op payload length checks based on current ABI. */
-    switch ((OpCode)msg->op) {
-        case OP_NOOP:
-        case OP_SET_SHADER:
-        case OP_CULL:
-        case OP_ALPHA:
-        case OP_DEPTH:
-        case OP_COLOR_MASK:
-        case OP_LOAD_BUFFER:
-        case OP_DRAW:
-        case OP_LOAD_TEXTURE:
-        case OP_SHOW_TEXTURE:
-        case OP_TEXTURE_FILTER:
-        case OP_TEXTURE_WRAP:
-        case OP_STOP:
-            if (msg->payload_len != 0) {
-                err = "unexpected payload";
-                break;
-            }
+    switch (spec->kind) {
+        case HS_PAYLOAD_NONE:
+            if (msg->payload_len != 0) err = "unexpected payload";
             break;
-
-        case OP_SET_PARAM:
-            if (msg->payload_len != 20) err = "bad payload len";
+        case HS_PAYLOAD_FIXED:
+            if (msg->payload_len != spec->min_len) err = "bad payload len";
             break;
-
-        case OP_SET_GLOBAL:
-        case OP_SET_CAMERA:
-            if (msg->payload_len != 64) err = "bad payload len";
-            break;
-
-        case OP_BLEND:
-        case OP_SET_TARGET:
-        case OP_SET_CHANNEL:
-        case OP_DEPTH_COMPARE:
-            if (msg->payload_len != 2) err = "bad payload len";
-            break;
-
-        case OP_CLIP:
-            if (msg->payload_len != 8) err = "bad payload len";
-            break;
-
-        case OP_STENCIL:
-        case OP_STENCIL_FUNC:
-        case OP_DRAW_INSTANCE:
-            if (msg->payload_len != 4) err = "bad payload len";
-            break;
-
-        case OP_CLEAR:
-            if (msg->payload_len != 16) err = "bad payload len";
-            break;
-
-        case OP_CLEAR_DS:
-            if (msg->payload_len != 8) err = "bad payload len";
-            break;
-
-        case OP_DRAW_TEXT:
-        case OP_ERROR:
-        case OP_TRACE:
-            if (msg->payload_len == 0 || msg->payload_len > HS_PAYLOAD_SIZE) {
-                err = "bad payload len";
-                break;
-            }
-            /* Expect a null-terminated string (best-effort check). */
-            if (!sys->payloads) {
-                err = "null payload buffer";
-                break;
-            }
-            if (msg->payload_idx >= sys->payload_capacity) {
-                err = "invalid payload index";
-                break;
-            }
-            if (sys->payloads[msg->payload_idx].data[msg->payload_len - 1] != 0) {
-                err = "string not terminated";
-                break;
-            }
-            break;
-
-        case OP_COUNT:
-            err = "invalid opcode";
+        case HS_PAYLOAD_RANGE:
+        case HS_PAYLOAD_STRING:
+            if (msg->payload_len < spec->min_len || msg->payload_len > spec->max_len) err = "bad payload len";
             break;
     }
 
@@ -204,6 +136,13 @@ bool hs_validate_message(const HSSystem* sys, const Message* msg, const char** o
         if (msg->payload_idx >= sys->payload_capacity) {
             if (out_err) *out_err = "invalid payload index";
             return false;
+        }
+
+        if (spec->kind == HS_PAYLOAD_STRING) {
+            if (sys->payloads[msg->payload_idx].data[msg->payload_len - 1] != 0) {
+                if (out_err) *out_err = "string not terminated";
+                return false;
+            }
         }
     }
 

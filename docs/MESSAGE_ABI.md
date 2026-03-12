@@ -125,3 +125,12 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
 
 - The ABI as described here is the "as implemented" behavior.
 - The preferred direction is to evolve this into a "Message ABI v1" with explicit validation rules and stable capture/replay.
+
+## Validation
+
+`hs_validate_message()` (see `include/hs_core.h`, implemented in `src/hs_core.c`) enforces:
+
+- Destination routing: each opcode has an expected `to` node (except `OP_NOOP`, which may target any registered node).
+- Payload length rules: `none`, `fixed`, or `string/range`.
+- Payload index range checks for payload-bearing ops.
+- Null termination for string payload ops (`OP_DRAW_TEXT`, `OP_ERROR`, `OP_TRACE`).
