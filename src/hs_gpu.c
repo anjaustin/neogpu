@@ -8,6 +8,8 @@ void hs_gpu_init(HSGpu* gpu) {
     hs_init(&gpu->system, gpu->log_buffer, HS_MAX_MSG_LOG, gpu->payload_buffer);
     hs_nodes_set_system(&gpu->system);
     gpu->system.render_list = &gpu->render;
+
+    hs_memory_init(&gpu->memory);
     
     gpu->shader_node.id = NODE_SHADER;
     gpu->buffer_node.id = NODE_BUFFER;
@@ -31,6 +33,10 @@ void hs_gpu_init(HSGpu* gpu) {
     hs_register(&gpu->system, &gpu->system_node);
 }
 
+HSBuffer* hs_gpu_get_buffer(HSGpu* gpu, u8 bank) {
+    return hs_memory_get_buffer(&gpu->memory, bank);
+}
+
 void hs_gpu_attach_backend(HSGpu* gpu, HSBackend* backend) {
     gpu->backend = backend;
     if (gpu->backend && gpu->backend->ops && gpu->backend->ops->init) {
@@ -40,6 +46,7 @@ void hs_gpu_attach_backend(HSGpu* gpu, HSBackend* backend) {
 
 static void hs_gpu_build_frame(const HSGpu* gpu, HSFrameContext* out) {
     memset(out, 0, sizeof(*out));
+    out->gpu = gpu;
     out->tick = gpu->system.tick;
     out->sys = &gpu->system;
     out->shader_state = gpu->shader_node.state;

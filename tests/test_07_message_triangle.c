@@ -20,6 +20,32 @@ int main(int argc, char** argv) {
     static HSGpu gpu;
     hs_gpu_init(&gpu);
 
+    /* Provide a CPU-side vertex buffer in bank 0: x,y,r,g,b per vertex */
+    HSBuffer* buf = hs_gpu_get_buffer(&gpu, 0);
+    if (!hs_buffer_init(buf, 0, 256)) {
+        fprintf(stderr, "Failed to init buffer bank 0\n");
+        return 1;
+    }
+    /* v0 */
+    hs_buffer_set_f32(buf, 0,  0.0f);
+    hs_buffer_set_f32(buf, 1,  0.6f);
+    hs_buffer_set_f32(buf, 2,  1.0f);
+    hs_buffer_set_f32(buf, 3,  0.0f);
+    hs_buffer_set_f32(buf, 4,  0.0f);
+    /* v1 */
+    hs_buffer_set_f32(buf, 5, -0.6f);
+    hs_buffer_set_f32(buf, 6, -0.6f);
+    hs_buffer_set_f32(buf, 7,  0.0f);
+    hs_buffer_set_f32(buf, 8,  1.0f);
+    hs_buffer_set_f32(buf, 9,  0.0f);
+    /* v2 */
+    hs_buffer_set_f32(buf, 10, 0.6f);
+    hs_buffer_set_f32(buf, 11, -0.6f);
+    hs_buffer_set_f32(buf, 12, 0.0f);
+    hs_buffer_set_f32(buf, 13, 0.0f);
+    hs_buffer_set_f32(buf, 14, 1.0f);
+    buf->length = 15 * 4;
+
     HSBackend backend = hs_backend_gles_create();
     hs_gpu_attach_backend(&gpu, &backend);
 

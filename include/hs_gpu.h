@@ -6,8 +6,10 @@
 #include "hs_math_neon.h"
 #include "hs_backend.h"
 #include "hs_render.h"
+#include "hs_buffer.h"
 
 typedef struct HSFrameContext {
+    const HSGpu* gpu;
     u32 tick;
     const HSSystem* sys;
     const void* shader_state;
@@ -33,11 +35,15 @@ typedef struct HSGpu {
     HSBackend*   backend;
 
     HSRenderList render;
+
+    HSMemory     memory;
 } HSGpu;
 
 void hs_gpu_init(HSGpu* gpu);
 
 void hs_gpu_attach_backend(HSGpu* gpu, HSBackend* backend);
+
+HSBuffer* hs_gpu_get_buffer(HSGpu* gpu, u8 bank);
 
 void hs_gpu_set_shader(HSGpu* gpu, u8 shader);
 void hs_gpu_set_param(HSGpu* gpu, u8 idx, vec4 value);

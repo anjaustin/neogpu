@@ -148,6 +148,13 @@ When `HSSystem.render_list` is set (by `hs_gpu_init`), `hs_send()` records rende
 
 The minimal GLES executor is implemented in `src/hs_backend_gles.c`.
 
+## Message-Driven Buffers (Current)
+
+The GLES backend can optionally source vertex data from `HSGpu.memory` buffer banks. The current minimal convention is:
+
+- buffer bank `N` contains interleaved floats: `x, y, r, g, b` per vertex
+- vertex count is derived from `HSBuffer.length / (5 * 4)`
+
 ## Validation
 
 `hs_validate_message()` (see `include/hs_core.h`, implemented in `src/hs_core.c`) enforces:

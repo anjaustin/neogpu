@@ -241,6 +241,9 @@ Execution Path:
 Backend Implementation:
 - `src/hs_backend_gles.c` provides a minimal GLES backend that executes `HSRenderList`.
 
+Buffer Wiring:
+- `HSGpu.memory` provides CPU-side buffer banks that the GLES backend can upload to VBOs for message-driven draws.
+
 ### Milestone 1: Mesh Renderer
 - [ ] Add `hs_mesh.h` with mesh structures
 - [ ] Add built-in vertex shader (MVP)

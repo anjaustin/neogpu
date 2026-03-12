@@ -1,12 +1,15 @@
 #include "hs_backend_gles.h"
 #include "hs_gpu.h"
 #include "hs_graphics.h"
+#include "hs_nodes.h"
 
 typedef struct {
     HSGraphics gfx;
     bool gfx_ok;
     GLuint program;
-    GLuint vbo;
+    GLuint fallback_vbo;
+    GLuint vbos[16];
+    u32    vbo_sizes[16];
     GLint pos_loc;
     GLint color_loc;
 } HSGLESBackend;
@@ -79,8 +82,8 @@ static bool gles_init(void* ctx, HSGpu* gpu) {
         -0.6f, -0.6f,  0.0f, 1.0f, 0.0f,
          0.6f, -0.6f,  0.0f, 0.0f, 1.0f,
     };
-    glGenBuffers(1, &b->vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
+    glGenBuffers(1, &b->fallback_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, b->fallback_vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
 
     glViewport(0, 0, (GLsizei)b->gfx.screen_width, (GLsizei)b->gfx.screen_height);
@@ -91,10 +94,37 @@ static bool gles_init(void* ctx, HSGpu* gpu) {
 static void gles_shutdown(void* ctx, HSGpu* gpu) {
     (void)gpu;
     HSGLESBackend* b = (HSGLESBackend*)ctx;
-    if (b->vbo) glDeleteBuffers(1, &b->vbo);
+    if (b->fallback_vbo) glDeleteBuffers(1, &b->fallback_vbo);
+    for (int i = 0; i < 16; i++) {
+        if (b->vbos[i]) glDeleteBuffers(1, &b->vbos[i]);
+    }
     if (b->program) glDeleteProgram(b->program);
     if (b->gfx_ok) hs_graphics_finish(&b->gfx);
     memset(b, 0, sizeof(*b));
+}
+
+static GLuint gles_get_vbo_for_buffer(HSGLESBackend* b, HSBuffer* buf, u8 idx) {
+    if (!b) return 0;
+    if (!buf || !buf->data || buf->length == 0) return b->fallback_vbo;
+
+    /* Expect 5 floats per vertex: x,y,r,g,b */
+    u32 stride = 5 * 4;
+    u32 byte_len = buf->length;
+    if (byte_len < 3 * stride) return b->fallback_vbo;
+
+    if (!b->vbos[idx]) {
+        glGenBuffers(1, &b->vbos[idx]);
+        b->vbo_sizes[idx] = 0;
+    }
+
+    if (buf->dirty || b->vbo_sizes[idx] != byte_len) {
+        glBindBuffer(GL_ARRAY_BUFFER, b->vbos[idx]);
+        glBufferData(GL_ARRAY_BUFFER, byte_len, buf->data, GL_STATIC_DRAW);
+        b->vbo_sizes[idx] = byte_len;
+        buf->dirty = false;
+    }
+
+    return b->vbos[idx];
 }
 
 static void gles_execute(void* ctx, const HSFrameContext* frame) {
@@ -111,14 +141,22 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
 
             case HS_RC_DRAW:
             case HS_RC_DRAW_INSTANCE:
+            {
+                u8 buf_idx = c->a & 0xF;
+                HSBuffer* cpu_buf = NULL;
+                if (frame->gpu) {
+                    cpu_buf = hs_gpu_get_buffer((HSGpu*)frame->gpu, buf_idx);
+                }
+                GLuint vbo = gles_get_vbo_for_buffer(b, cpu_buf, buf_idx);
                 glUseProgram(b->program);
-                glBindBuffer(GL_ARRAY_BUFFER, b->vbo);
+                glBindBuffer(GL_ARRAY_BUFFER, vbo);
                 glEnableVertexAttribArray(b->pos_loc);
                 glVertexAttribPointer(b->pos_loc, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
                 glEnableVertexAttribArray(b->color_loc);
                 glVertexAttribPointer(b->color_loc, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(2 * sizeof(float)));
                 glDrawArrays(GL_TRIANGLES, 0, 3);
                 break;
+            }
 
             case HS_RC_CLEAR_DS:
             case HS_RC_DRAW_TEXT:
