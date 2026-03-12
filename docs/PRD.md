@@ -232,6 +232,9 @@ void hs_window_poll(HSWindow* win);
 - [ ] Resolve routing for `OP_ERROR`, `OP_TRACE`, `OP_STOP`
 - [ ] Add tests: pack/unpack round-trip + replay determinism + validator rejection
 
+Related PRDs:
+- `docs/PRD_COMM_FABRIC.md` (acks/results, structured errors, capture I/O, async completions, backpressure, introspection)
+
 ### Milestone 1: Mesh Renderer
 - [ ] Add `hs_mesh.h` with mesh structures
 - [ ] Add built-in vertex shader (MVP)
