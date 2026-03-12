@@ -170,6 +170,18 @@ static void hs_render_record(HSSystem* sys, const Message* msg) {
             break;
         }
 
+        case OP_TEXTURE_FILTER:
+            cmd.op = HS_RC_SET_TEX_FILTER;
+            cmd.a = (u8)(msg->payload_idx & 0x0F);
+            cmd.b = (u8)((msg->payload_idx >> 4) & 1);
+            break;
+
+        case OP_TEXTURE_WRAP:
+            cmd.op = HS_RC_SET_TEX_WRAP;
+            cmd.a = (u8)(msg->payload_idx & 0x0F);
+            cmd.b = (u8)((msg->payload_idx >> 4) & 1);
+            break;
+
         case OP_CLEAR: {
             if (msg->payload_len != 16 || msg->payload_idx >= sys->payload_capacity) return;
             f32 rgba[4];

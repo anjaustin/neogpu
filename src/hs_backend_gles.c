@@ -12,6 +12,12 @@ typedef struct {
     u32    vbo_sizes[16];
     GLint pos_loc;
     GLint color_loc;
+
+    GLuint tex_program;
+    GLuint quad_vbo;
+    GLint quad_pos_loc;
+    GLint quad_uv_loc;
+    GLint quad_tex_loc;
 } HSGLESBackend;
 
 static inline GLenum hs_gles_blend_factor(u8 v) {
@@ -112,6 +118,54 @@ static bool gles_init(void* ctx, HSGpu* gpu) {
 
     glViewport(0, 0, (GLsizei)b->gfx.screen_width, (GLsizei)b->gfx.screen_height);
 
+    /* Simple texture program for SHOW_TEXTURE */
+    static const char* qvs =
+        "attribute vec2 a_position;\n"
+        "attribute vec2 a_uv;\n"
+        "varying vec2 v_uv;\n"
+        "void main(){ v_uv=a_uv; gl_Position=vec4(a_position,0.0,1.0); }\n";
+
+    static const char* qfs =
+        "precision mediump float;\n"
+        "varying vec2 v_uv;\n"
+        "uniform sampler2D u_tex;\n"
+        "void main(){ gl_FragColor = texture2D(u_tex, v_uv); }\n";
+
+    b->tex_program = hs_create_program(qvs, qfs);
+    if (!b->tex_program) return false;
+    b->quad_pos_loc = glGetAttribLocation(b->tex_program, "a_position");
+    b->quad_uv_loc = glGetAttribLocation(b->tex_program, "a_uv");
+    b->quad_tex_loc = glGetUniformLocation(b->tex_program, "u_tex");
+
+    float quad[] = {
+        /* x, y, u, v */
+        -1, -1, 0, 0,
+         1, -1, 1, 0,
+        -1,  1, 0, 1,
+         1, -1, 1, 0,
+         1,  1, 1, 1,
+        -1,  1, 0, 1,
+    };
+    glGenBuffers(1, &b->quad_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, b->quad_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+
+    /* Create a simple checker texture in slot 0 (for debugging). */
+    {
+        u8 pixels[16 * 16 * 4];
+        for (int y = 0; y < 16; y++) {
+            for (int x = 0; x < 16; x++) {
+                int on = ((x >> 2) ^ (y >> 2)) & 1;
+                int i = (y * 16 + x) * 4;
+                pixels[i + 0] = on ? 255 : 40;
+                pixels[i + 1] = on ? 255 : 40;
+                pixels[i + 2] = on ? 255 : 40;
+                pixels[i + 3] = 255;
+            }
+        }
+        hs_graphics_create_texture(&b->gfx, 0, 16, 16, pixels);
+    }
+
     return true;
 }
 
@@ -119,10 +173,12 @@ static void gles_shutdown(void* ctx, HSGpu* gpu) {
     (void)gpu;
     HSGLESBackend* b = (HSGLESBackend*)ctx;
     if (b->fallback_vbo) glDeleteBuffers(1, &b->fallback_vbo);
+    if (b->quad_vbo) glDeleteBuffers(1, &b->quad_vbo);
     for (int i = 0; i < 16; i++) {
         if (b->vbos[i]) glDeleteBuffers(1, &b->vbos[i]);
     }
     if (b->program) glDeleteProgram(b->program);
+    if (b->tex_program) glDeleteProgram(b->tex_program);
     if (b->gfx_ok) hs_graphics_finish(&b->gfx);
     memset(b, 0, sizeof(*b));
 }
@@ -214,6 +270,32 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
                 break;
             }
 
+            case HS_RC_SET_TEX_FILTER: {
+                u8 slot = c->a & 0x0F;
+                u8 linear = c->b & 1;
+                GLuint tex = hs_graphics_get_gl_texture(&b->gfx, slot);
+                if (tex) {
+                    glBindTexture(GL_TEXTURE_2D, tex);
+                    GLint f = linear ? GL_LINEAR : GL_NEAREST;
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
+                }
+                break;
+            }
+
+            case HS_RC_SET_TEX_WRAP: {
+                u8 slot = c->a & 0x0F;
+                u8 repeat = c->b & 1;
+                GLuint tex = hs_graphics_get_gl_texture(&b->gfx, slot);
+                if (tex) {
+                    glBindTexture(GL_TEXTURE_2D, tex);
+                    GLint w = repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE;
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, w);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, w);
+                }
+                break;
+            }
+
             case HS_RC_CLEAR:
                 glClearColor(c->f0, c->f1, c->f2, c->f3);
                 glClear(GL_COLOR_BUFFER_BIT);
@@ -244,7 +326,23 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
                 glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
                 break;
             case HS_RC_DRAW_TEXT:
-            case HS_RC_SHOW_TEXTURE:
+            case HS_RC_SHOW_TEXTURE: {
+                u8 slot = c->a & 0x0F;
+                GLuint tex = hs_graphics_get_gl_texture(&b->gfx, slot);
+                if (!tex) tex = hs_graphics_get_gl_texture(&b->gfx, 0);
+
+                glUseProgram(b->tex_program);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glUniform1i(b->quad_tex_loc, 0);
+                glBindBuffer(GL_ARRAY_BUFFER, b->quad_vbo);
+                glEnableVertexAttribArray(b->quad_pos_loc);
+                glVertexAttribPointer(b->quad_pos_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+                glEnableVertexAttribArray(b->quad_uv_loc);
+                glVertexAttribPointer(b->quad_uv_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+                break;
+            }
             default:
                 break;
         }

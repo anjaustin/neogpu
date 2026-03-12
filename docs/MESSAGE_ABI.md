@@ -148,7 +148,7 @@ When `HSSystem.render_list` is set (by `hs_gpu_init`), `hs_send()` records rende
 
 Currently recorded ops include:
 
-- state: `OP_CULL`, `OP_BLEND`, `OP_ALPHA`, `OP_DEPTH`, `OP_DEPTH_COMPARE`, `OP_COLOR_MASK`, `OP_CLIP`
+- state: `OP_CULL`, `OP_BLEND`, `OP_ALPHA`, `OP_DEPTH`, `OP_DEPTH_COMPARE`, `OP_COLOR_MASK`, `OP_CLIP`, `OP_TEXTURE_FILTER`, `OP_TEXTURE_WRAP`
 - commands: `OP_CLEAR`, `OP_CLEAR_DS`, `OP_DRAW`, `OP_DRAW_INSTANCE`, `OP_DRAW_TEXT`, `OP_SHOW_TEXTURE`
 
 The minimal GLES executor is implemented in `src/hs_backend_gles.c`.

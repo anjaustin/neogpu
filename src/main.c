@@ -190,20 +190,26 @@ static void test_render_commands(void) {
     hs_gpu_color_mask(&gpu, 0x0F);
     hs_gpu_alpha(&gpu, false);
     hs_gpu_clip(&gpu, 0, 0, 640, 480);
+    hs_gpu_texture_filter(&gpu, 0, true);
+    hs_gpu_texture_wrap(&gpu, 0, false);
 
     vec4 clear_color = v4_make(0.2f, 0.3f, 0.4f, 1.0f);
     hs_gpu_clear(&gpu, clear_color);
+    hs_gpu_show_texture(&gpu, 0);
     hs_gpu_draw_text(&gpu, "hi");
     hs_gpu_draw(&gpu, 0);
     hs_gpu_process(&gpu);
 
     hs_gpu_end_frame(&gpu);
 
-    TEST("render_cmd_count", st.cmd_count >= 6);
+    TEST("render_cmd_count", st.cmd_count >= 9);
     TEST("render_cmd_mask", st.ops[0] == HS_RC_SET_COLOR_MASK);
     TEST("render_cmd_alpha", st.ops[1] == HS_RC_SET_ALPHA);
     TEST("render_cmd_clip", st.ops[2] == HS_RC_SET_CLIP);
-    TEST("render_cmd_clear", st.ops[3] == HS_RC_CLEAR);
+    TEST("render_cmd_tex_filter", st.ops[3] == HS_RC_SET_TEX_FILTER);
+    TEST("render_cmd_tex_wrap", st.ops[4] == HS_RC_SET_TEX_WRAP);
+    TEST("render_cmd_clear", st.ops[5] == HS_RC_CLEAR);
+    TEST("render_cmd_show_tex", st.ops[6] == HS_RC_SHOW_TEXTURE);
 }
 
 /* ============================================================

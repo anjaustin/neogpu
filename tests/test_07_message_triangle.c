@@ -53,6 +53,9 @@ int main(int argc, char** argv) {
         hs_gpu_begin_frame(&gpu);
 
         hs_gpu_clear(&gpu, v4_make(0.08f, 0.08f, 0.10f, 1.0f));
+        if (f == 60) {
+            hs_gpu_show_texture(&gpu, 0);
+        }
         hs_gpu_draw(&gpu, 0);
         hs_gpu_process(&gpu);
 
