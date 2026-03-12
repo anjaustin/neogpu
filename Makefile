@@ -9,12 +9,12 @@ STRIP = strip
 SRC_DIR = src
 OBJ_DIR = src
 
-HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/main.c
+HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/hs_backend_gles.c $(SRC_DIR)/main.c
 HS_OBJ = $(HS_SRC:.c=.o)
 HS_DEPS = $(HS_OBJ:.o=.d)
 HS_TARGET = neogpu_demo
 
-TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast
+TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast test_07_message_triangle
 
 .PHONY: build clean run all test run-test build-tests
 
@@ -57,6 +57,9 @@ build-tests: $(HS_OBJ)
 	$(CC) $(CFLAGS) -c tests/test_06_raycast.c -o tests/test_06_raycast.o
 	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o tests/test_06_raycast.o $(LDFLAGS) -o tests/test_06_raycast
 	$(STRIP) tests/test_06_raycast
+	$(CC) $(CFLAGS) -c tests/test_07_message_triangle.c -o tests/test_07_message_triangle.o
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_07_message_triangle.o $(LDFLAGS) -o tests/test_07_message_triangle
+	$(STRIP) tests/test_07_message_triangle
 
 run-test:
 	@if [ -z "$(N)" ]; then \

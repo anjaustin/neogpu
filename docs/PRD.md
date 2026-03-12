@@ -238,6 +238,9 @@ Related PRDs:
 Execution Path:
 - `include/hs_backend.h` defines the backend interface; the next major evolution is connecting the message-driven state + render commands to an execution backend (GLES).
 
+Backend Implementation:
+- `src/hs_backend_gles.c` provides a minimal GLES backend that executes `HSRenderList`.
+
 ### Milestone 1: Mesh Renderer
 - [ ] Add `hs_mesh.h` with mesh structures
 - [ ] Add built-in vertex shader (MVP)

@@ -146,6 +146,8 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
 
 When `HSSystem.render_list` is set (by `hs_gpu_init`), `hs_send()` records render-relevant ops into an `HSRenderList` in send order (clear/draw/text/show_texture). This is the bridge that allows a backend to execute pixels from the message stream.
 
+The minimal GLES executor is implemented in `src/hs_backend_gles.c`.
+
 ## Validation
 
 `hs_validate_message()` (see `include/hs_core.h`, implemented in `src/hs_core.c`) enforces:
