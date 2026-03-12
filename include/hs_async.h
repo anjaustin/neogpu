@@ -12,6 +12,7 @@
 #include "hs_graphics.h"
 #include <pthread.h>
 #include <semaphore.h>
+#include <stdatomic.h>
 
 #define HS_ASYNC_MAX_PENDING 32
 #define HS_ASYNC_STACK_SIZE 8192
@@ -45,7 +46,7 @@ typedef struct {
     sem_t        sem;
     pthread_t    thread;
     pthread_mutex_t mutex;
-    volatile bool running;
+    atomic_bool   running;
     HSGraphics*  gfx;
     HSSystem*    sys;
     u8           notify_to;

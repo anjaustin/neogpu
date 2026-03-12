@@ -24,10 +24,10 @@
 static void* async_worker(void* arg) {
     HSAsync* async = (HSAsync*)arg;
     
-    while (async->running) {
+    while (atomic_load_explicit(&async->running, memory_order_acquire)) {
         sem_wait(&async->sem);
         
-        if (!async->running) break;
+        if (!atomic_load_explicit(&async->running, memory_order_acquire)) break;
         
         pthread_mutex_lock(&async->mutex);
         
@@ -93,7 +93,7 @@ static void* async_worker(void* arg) {
 void hs_async_init(HSAsync* async, HSGraphics* gfx) {
     memset(async, 0, sizeof(HSAsync));
     async->gfx = gfx;
-    async->running = false;
+    atomic_init(&async->running, false);
     async->notify_to = NODE_SYSTEM;
     
     sem_init(&async->sem, 0, 0);
@@ -107,9 +107,9 @@ void hs_async_attach_system(HSAsync* async, HSSystem* sys, u8 notify_to) {
 }
 
 void hs_async_shutdown(HSAsync* async) {
-    if (!async->running) return;
+    if (!atomic_load_explicit(&async->running, memory_order_acquire)) return;
     
-    async->running = false;
+    atomic_store_explicit(&async->running, false, memory_order_release);
     sem_post(&async->sem);
     
     pthread_join(async->thread, NULL);
@@ -143,8 +143,8 @@ bool hs_async_load_texture(HSAsync* async, u8 slot, const char* path) {
     
     pthread_mutex_unlock(&async->mutex);
     
-    if (!async->running) {
-        async->running = true;
+    if (!atomic_load_explicit(&async->running, memory_order_acquire)) {
+        atomic_store_explicit(&async->running, true, memory_order_release);
         pthread_create(&async->thread, NULL, async_worker, async);
     }
     
@@ -181,8 +181,8 @@ bool hs_async_save_file(HSAsync* async, const char* path, const void* data, u32 
     
     pthread_mutex_unlock(&async->mutex);
     
-    if (!async->running) {
-        async->running = true;
+    if (!atomic_load_explicit(&async->running, memory_order_acquire)) {
+        atomic_store_explicit(&async->running, true, memory_order_release);
         pthread_create(&async->thread, NULL, async_worker, async);
     }
     

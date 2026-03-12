@@ -451,6 +451,21 @@ static void test_async_done(void) {
     hs_async_shutdown(&async);
 }
 
+static void test_async_atomic_running(void) {
+    printf("\n--- Async Atomic Tests ---\n");
+
+    HSAsync async;
+    hs_async_init(&async, NULL);
+
+    /* start */
+    bool ok = hs_async_save_file(&async, "/tmp/neogpu_async_atomic.bin", "x", 1);
+    TEST("async_start", ok);
+
+    /* stop */
+    hs_async_shutdown(&async);
+    TEST("async_stop", true);
+}
+
 /* ============================================================
  * Multi-thread messaging falsification
  * ============================================================ */
@@ -754,6 +769,7 @@ int main(void) {
     test_input();
     test_message_validation();
     test_async_done();
+    test_async_atomic_running();
     test_thread_safety();
     test_gpu();
 
