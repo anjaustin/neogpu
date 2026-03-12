@@ -180,6 +180,10 @@ typedef struct {
     atomic_uint spsc_full;
     atomic_uint spsc_full_by_prod[HS_MAX_PRODUCERS];
 
+    atomic_uint spsc_ok;
+    atomic_uint spsc_ok_by_prod[HS_MAX_PRODUCERS];
+    atomic_uint mpsc_ok;
+
     atomic_uint producer_count;
     HSSpscQueue producers[HS_MAX_PRODUCERS];
 } HSSystem;

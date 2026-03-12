@@ -268,6 +268,7 @@ static bool hs_submit_enqueue(HSSystem* sys, const Message* msg, const void* pay
                 slot->payload_len = len;
                 if (len && payload) memcpy(slot->payload, payload, len);
                 atomic_store_explicit(&slot->seq, pos + 1, memory_order_release);
+                atomic_fetch_add_explicit(&sys->mpsc_ok, 1, memory_order_relaxed);
                 return true;
             }
             continue;
@@ -386,7 +387,8 @@ static int hs_get_producer_id(HSSystem* sys) {
         g_tls_prod.sys = sys;
         g_tls_prod.id = -1;
     }
-    if (g_tls_prod.id >= 0) return g_tls_prod.id;
+    /* Cache both real producer ids (>=0) and fallback (-2). */
+    if (g_tls_prod.id != -1) return g_tls_prod.id;
 
     u32 id = atomic_fetch_add_explicit(&sys->producer_count, 1, memory_order_relaxed);
     if (id >= HS_MAX_PRODUCERS) {
@@ -602,8 +604,11 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->dropped_queue_full = 0;
     atomic_init(&sys->submit_full, 0);
     atomic_init(&sys->spsc_full, 0);
+    atomic_init(&sys->spsc_ok, 0);
+    atomic_init(&sys->mpsc_ok, 0);
     for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
         atomic_init(&sys->spsc_full_by_prod[i], 0);
+        atomic_init(&sys->spsc_ok_by_prod[i], 0);
     }
 
     atomic_init(&sys->submit.enqueue_pos, 0);
@@ -742,7 +747,11 @@ bool hs_send(HSSystem* sys, Message* msg) {
 
     int pid = hs_get_producer_id(sys);
     if (pid >= 0) {
-        if (hs_spsc_push(&sys->producers[pid], msg, NULL, 0)) return true;
+        if (hs_spsc_push(&sys->producers[pid], msg, NULL, 0)) {
+            atomic_fetch_add_explicit(&sys->spsc_ok, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&sys->spsc_ok_by_prod[pid], 1, memory_order_relaxed);
+            return true;
+        }
         atomic_fetch_add_explicit(&sys->spsc_full, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&sys->spsc_full_by_prod[pid], 1, memory_order_relaxed);
         /* fallback to MPSC */
@@ -760,7 +769,11 @@ bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len
 
     int pid = hs_get_producer_id(sys);
     if (pid >= 0) {
-        if (hs_spsc_push(&sys->producers[pid], msg, data, len)) return true;
+        if (hs_spsc_push(&sys->producers[pid], msg, data, len)) {
+            atomic_fetch_add_explicit(&sys->spsc_ok, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&sys->spsc_ok_by_prod[pid], 1, memory_order_relaxed);
+            return true;
+        }
         atomic_fetch_add_explicit(&sys->spsc_full, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&sys->spsc_full_by_prod[pid], 1, memory_order_relaxed);
     }

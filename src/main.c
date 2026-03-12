@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 #include "hs_gpu.h"
 #include "hs_math_neon.h"
 #include "hs_input.h"
@@ -695,6 +696,105 @@ static void test_redteam_overproducers(void) {
 }
 
 /* ============================================================
+ * Producer throughput benchmark (SPSC lanes + MPSC fallback)
+ * ============================================================ */
+typedef struct {
+    HSSystem* sys;
+    atomic_bool* stop;
+    u32 ok;
+    u32 fail;
+} BenchArgs;
+
+static void* bench_sender(void* arg) {
+    BenchArgs* a = (BenchArgs*)arg;
+    u32 i = 0;
+    while (!atomic_load_explicit(a->stop, memory_order_acquire)) {
+        Message m = {
+            .to = NODE_SHADER,
+            .from = NODE_CPU,
+            .op = OP_SET_SHADER,
+            .flags = 0,
+            .cid = i,
+            .tick = 0,
+            .payload_idx = (u16)(i & 0xFF),
+            .payload_len = 0,
+        };
+        if (hs_send(a->sys, &m)) a->ok++;
+        else a->fail++;
+        i++;
+    }
+    return NULL;
+}
+
+static u64 ns_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+
+static void bench_producers(int threads, int ms) {
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = false;
+    gpu.system.recording = false;
+    gpu.system.render_list = NULL;
+
+    atomic_bool stop;
+    atomic_init(&stop, false);
+
+    pthread_t th[32];
+    BenchArgs args[32];
+    if (threads > 32) threads = 32;
+
+    for (int i = 0; i < threads; i++) {
+        args[i].sys = &gpu.system;
+        args[i].stop = &stop;
+        args[i].ok = 0;
+        args[i].fail = 0;
+        pthread_create(&th[i], NULL, bench_sender, &args[i]);
+    }
+
+    u64 end = ns_now() + (u64)ms * 1000000ull;
+    while (ns_now() < end) {
+        hs_step(&gpu.system);
+    }
+
+    atomic_store_explicit(&stop, true, memory_order_release);
+    for (int i = 0; i < threads; i++) pthread_join(th[i], NULL);
+
+    /* Drain remaining */
+    for (int i = 0; i < 1000; i++) hs_step(&gpu.system);
+
+    u64 ok = 0, fail = 0;
+    for (int i = 0; i < threads; i++) {
+        ok += args[i].ok;
+        fail += args[i].fail;
+    }
+
+    u32 spsc_ok = atomic_load_explicit(&gpu.system.spsc_ok, memory_order_relaxed);
+    u32 mpsc_ok = atomic_load_explicit(&gpu.system.mpsc_ok, memory_order_relaxed);
+    u32 spsc_full = atomic_load_explicit(&gpu.system.spsc_full, memory_order_relaxed);
+    u32 submit_full = atomic_load_explicit(&gpu.system.submit_full, memory_order_relaxed);
+    u32 prod_count = atomic_load_explicit(&gpu.system.producer_count, memory_order_relaxed);
+
+    double sec = (double)ms / 1000.0;
+    double mps = sec > 0.0 ? (double)ok / sec : 0.0;
+
+    printf("  %2d thr, %4d ms: %.0f msg/s (ok=%llu fail=%llu) spsc_ok=%u mpsc_ok=%u spsc_full=%u submit_full=%u prod=%u\n",
+           threads, ms, mps, (unsigned long long)ok, (unsigned long long)fail,
+           (unsigned)spsc_ok, (unsigned)mpsc_ok, (unsigned)spsc_full, (unsigned)submit_full, (unsigned)prod_count);
+}
+
+static void bench_comm_layer(void) {
+    printf("\n--- Comms Producer Benchmark ---\n");
+    bench_producers(1, 500);
+    bench_producers(2, 500);
+    bench_producers(4, 500);
+    bench_producers(8, 500);
+    bench_producers(16, 500);
+}
+
+/* ============================================================
  * GPU message system demo (original + new ops)
  * ============================================================ */
 static void test_gpu(void) {
@@ -937,6 +1037,8 @@ int main(void) {
     test_thread_safety_payloads();
     test_redteam_overproducers();
     test_gpu();
+
+    bench_comm_layer();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);
