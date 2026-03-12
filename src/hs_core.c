@@ -585,6 +585,11 @@ static HSChannel hs_default_channel_for_op(OpCode op) {
         case OP_ASYNC_DONE:
         case OP_STOP:
         case OP_FENCE:
+        case OP_QUERY_STATS:
+        case OP_QUERY_FABRIC:
+        case OP_SET_RECORD_MASK:
+        case OP_SET_CHAN_BUDGET:
+        case OP_SET_BLOCK_POLICY:
             return CHAN_RT;
 
         /* render/frame */
@@ -647,6 +652,12 @@ static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
     [OP_FRAME_END]     = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
     [OP_PRESENT]       = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
     [OP_FENCE]         = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
+
+    [OP_QUERY_STATS]     = {NODE_SYSTEM, HS_PAYLOAD_NONE,  0, 0},
+    [OP_QUERY_FABRIC]    = {NODE_SYSTEM, HS_PAYLOAD_NONE,  0, 0},
+    [OP_SET_RECORD_MASK] = {NODE_SYSTEM, HS_PAYLOAD_FIXED, 4, 4},
+    [OP_SET_CHAN_BUDGET] = {NODE_SYSTEM, HS_PAYLOAD_FIXED, 8, 8},
+    [OP_SET_BLOCK_POLICY]= {NODE_SYSTEM, HS_PAYLOAD_FIXED, 2, 2},
 };
 
 bool hs_payload_alloc_and_copy(HSSystem* sys, const void* data, u32 len, u16* out_idx, u32* out_len) {
@@ -1220,6 +1231,11 @@ const char* hs_op_name(OpCode op) {
         case OP_FRAME_END:     return "FRAME_END";
         case OP_PRESENT:       return "PRESENT";
         case OP_FENCE:         return "FENCE";
+        case OP_QUERY_STATS:   return "QUERY_STATS";
+        case OP_QUERY_FABRIC:  return "QUERY_FABRIC";
+        case OP_SET_RECORD_MASK: return "SET_RECORD_MASK";
+        case OP_SET_CHAN_BUDGET: return "SET_CHAN_BUDGET";
+        case OP_SET_BLOCK_POLICY: return "SET_BLOCK_POLICY";
         case OP_COUNT:         return "COUNT";
     }
     return "UNKNOWN";

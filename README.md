@@ -120,6 +120,7 @@ Notes:
 
 - Recording is channel-filtered by default (P0: render channel only). See `HSSystem.record_mask` and `hs_set_record_mask()`.
 - Use `hs_gpu_fence(&gpu, CHAN_RENDER, cid)` to request an apply-time fence result via `OP_RESULT`.
+- Use `OP_QUERY_STATS` / `OP_QUERY_FABRIC` to retrieve runtime fabric stats via `OP_RESULT`.
 
 ### Input
 ```c

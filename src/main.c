@@ -514,6 +514,117 @@ static void test_frame_qos(void) {
 }
 
 /* ============================================================
+ * System query/control tests
+ * ============================================================ */
+static void test_system_queries(void) {
+    printf("\n--- System Query Tests ---\n");
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
+    gpu.system.recording = false;
+
+    SystemState* st = (SystemState*)gpu.system_node.state;
+    u32 start_results = st->result_count;
+
+    /* Query stats */
+    Message q = {
+        .to = NODE_SYSTEM,
+        .from = NODE_CPU,
+        .op = OP_QUERY_STATS,
+        .flags = 0,
+        .cid = 100,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0,
+        .channel = CHAN_DEFAULT,
+    };
+    bool ok = hs_send(&gpu.system, &q);
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    TEST("query_stats_send", ok);
+    TEST("query_stats_result", st->result_count > start_results && st->last_result_op == OP_QUERY_STATS && st->last_result_cid == 100 && st->last_result_len == 64);
+    {
+        u32 tick = 0, log_head = 0, record_mask = 0, prod = 0, flags = 0;
+        u32 budgets[3] = {0}, dropped[4] = {0};
+        bool uok = hs_unpack_result_system_stats(gpu.system.payloads[st->last_result_payload_idx].data, st->last_result_len,
+                                                 &tick, &log_head, &record_mask, budgets, dropped, &prod, &flags);
+        TEST("query_stats_unpack", uok && budgets[0] == gpu.system.chan_budget[CHAN_RT] && budgets[1] == gpu.system.chan_budget[CHAN_RENDER]);
+    }
+
+    /* Set record mask */
+    u8 set_mask_payload[4];
+    u32 new_mask = hs_channel_bit(CHAN_RENDER) | hs_channel_bit(CHAN_RT);
+    hs_pack_set_record_mask(set_mask_payload, new_mask);
+    Message setm = {
+        .to = NODE_SYSTEM,
+        .from = NODE_CPU,
+        .op = OP_SET_RECORD_MASK,
+        .flags = 0,
+        .cid = 200,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0,
+        .channel = CHAN_RT,
+    };
+    ok = hs_send_with_payload(&gpu.system, &setm, set_mask_payload, sizeof(set_mask_payload));
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    TEST("set_record_mask_send", ok);
+    TEST("set_record_mask_result", st->last_result_op == OP_SET_RECORD_MASK && st->last_result_cid == 200 && st->last_result_len == 8);
+    {
+        u32 oldv = 0, newv = 0;
+        bool uok = hs_unpack_u32x2(gpu.system.payloads[st->last_result_payload_idx].data, st->last_result_len, &oldv, &newv);
+        TEST("set_record_mask_unpack", uok && newv == new_mask);
+    }
+
+    /* Set render budget */
+    u8 set_bud_payload[8];
+    hs_pack_set_chan_budget(set_bud_payload, (u8)CHAN_RENDER, 1234);
+    Message setb = {
+        .to = NODE_SYSTEM,
+        .from = NODE_CPU,
+        .op = OP_SET_CHAN_BUDGET,
+        .flags = 0,
+        .cid = 300,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0,
+        .channel = CHAN_RT,
+    };
+    ok = hs_send_with_payload(&gpu.system, &setb, set_bud_payload, sizeof(set_bud_payload));
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    TEST("set_budget_send", ok);
+    TEST("set_budget_applied", gpu.system.chan_budget[CHAN_RENDER] == 1234);
+
+    /* Query fabric counters */
+    Message fq = {
+        .to = NODE_SYSTEM,
+        .from = NODE_CPU,
+        .op = OP_QUERY_FABRIC,
+        .flags = 0,
+        .cid = 400,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0,
+        .channel = CHAN_DEFAULT,
+    };
+    ok = hs_send(&gpu.system, &fq);
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    TEST("query_fabric_send", ok);
+    TEST("query_fabric_result", st->last_result_op == OP_QUERY_FABRIC && st->last_result_cid == 400 && st->last_result_len == 64);
+    {
+        u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0};
+        u32 prod = 0, waiters = 0;
+        bool uok = hs_unpack_result_fabric(gpu.system.payloads[st->last_result_payload_idx].data, st->last_result_len,
+                                           spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, &prod, &waiters);
+        TEST("query_fabric_unpack", uok && prod == atomic_load_explicit(&gpu.system.producer_count, memory_order_relaxed));
+    }
+}
+
+/* ============================================================
  * Async completion tests
  * ============================================================ */
 static void test_async_done(void) {
@@ -1156,6 +1267,7 @@ int main(void) {
     test_input();
     test_message_validation();
     test_frame_qos();
+    test_system_queries();
     test_async_done();
     test_async_atomic_running();
     test_thread_safety();

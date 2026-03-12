@@ -100,6 +100,7 @@ Default channel assignment by opcode:
 - Frame markers: `OP_FRAME_BEGIN`, `OP_FRAME_END`, `OP_PRESENT` -> `CHAN_RENDER`
 - RT/control path: `OP_ACK`, `OP_RESULT`, `OP_ASYNC_DONE`, and other control/interactive ops -> `CHAN_RT`
 - Fences: `OP_FENCE` -> `CHAN_RT` (emits `OP_RESULT`)
+- System introspection/control: `OP_QUERY_STATS`, `OP_QUERY_FABRIC`, `OP_SET_RECORD_MASK`, `OP_SET_CHAN_BUDGET`, `OP_SET_BLOCK_POLICY` -> `CHAN_RT`
 - Telemetry: `OP_ERROR_EX`, `OP_ERROR`, `OP_TRACE`, `OP_QUEUE_FULL` -> `CHAN_TELEM`
 
 ## 6.1) System Inbox Pristinity (P0)

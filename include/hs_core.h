@@ -74,6 +74,13 @@ typedef enum {
     OP_FRAME_END,
     OP_PRESENT,
     OP_FENCE,
+
+    /* System queries / control */
+    OP_QUERY_STATS,
+    OP_QUERY_FABRIC,
+    OP_SET_RECORD_MASK,
+    OP_SET_CHAN_BUDGET,
+    OP_SET_BLOCK_POLICY,
     OP_COUNT
 } OpCode;
 

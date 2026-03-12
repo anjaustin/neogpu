@@ -184,4 +184,148 @@ static inline bool hs_unpack_result_fence(const void* data, u32 len, u32* out_ti
     return true;
 }
 
+/* Generic u32x2 result payload: [u32 a][u32 b] */
+static inline void hs_pack_u32x2(u8 out[8], u32 a, u32 b) {
+    memcpy(&out[0], &a, 4);
+    memcpy(&out[4], &b, 4);
+}
+
+static inline bool hs_unpack_u32x2(const void* data, u32 len, u32* out_a, u32* out_b) {
+    if (!data || len < 8) return false;
+    const u8* b = (const u8*)data;
+    if (out_a) memcpy(out_a, &b[0], 4);
+    if (out_b) memcpy(out_b, &b[4], 4);
+    return true;
+}
+
+/* OP_SET_RECORD_MASK payload: [u32 mask] */
+static inline void hs_pack_set_record_mask(u8 out[4], u32 mask) {
+    memcpy(&out[0], &mask, 4);
+}
+
+static inline bool hs_unpack_set_record_mask(const void* data, u32 len, u32* out_mask) {
+    if (!data || len < 4) return false;
+    if (out_mask) memcpy(out_mask, data, 4);
+    return true;
+}
+
+/* OP_SET_CHAN_BUDGET payload: [u8 channel][u8 rsv0][u8 rsv1][u8 rsv2][u32 budget] */
+static inline void hs_pack_set_chan_budget(u8 out[8], u8 channel, u32 budget) {
+    out[0] = channel;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+    memcpy(&out[4], &budget, 4);
+}
+
+static inline bool hs_unpack_set_chan_budget(const void* data, u32 len, u8* out_channel, u32* out_budget) {
+    if (!data || len < 8) return false;
+    const u8* b = (const u8*)data;
+    if (out_channel) *out_channel = b[0];
+    if (out_budget) memcpy(out_budget, &b[4], 4);
+    return true;
+}
+
+/* OP_SET_BLOCK_POLICY payload: [u8 channel][u8 block] */
+static inline void hs_pack_set_block_policy(u8 out[2], u8 channel, u8 block) {
+    out[0] = channel;
+    out[1] = block;
+}
+
+static inline bool hs_unpack_set_block_policy(const void* data, u32 len, u8* out_channel, u8* out_block) {
+    if (!data || len < 2) return false;
+    const u8* b = (const u8*)data;
+    if (out_channel) *out_channel = b[0];
+    if (out_block) *out_block = b[1];
+    return true;
+}
+
+/* OP_QUERY_STATS result payload (64B)
+ * Offsets:
+ *  0 tick(u32)
+ *  4 log_head(u32)
+ *  8 record_mask(u32)
+ * 12 budget_rt(u32)
+ * 16 budget_render(u32)
+ * 20 budget_telem(u32)
+ * 24 dropped_error_ex(u32)
+ * 28 dropped_queue_full(u32)
+ * 32 dropped_system_nonrt(u32)
+ * 36 dropped_result(u32)
+ * 40 producer_count(u32)
+ * 44 flags(u32): bit0 recording, bit1 validate_on_send, bit2 block_rt, bit3 block_render, bit4 block_telem
+ */
+static inline void hs_pack_result_system_stats(u8 out[64], u32 tick, u32 log_head, u32 record_mask,
+                                              u32 bud_rt, u32 bud_render, u32 bud_telem,
+                                              u32 dropped_error_ex, u32 dropped_queue_full, u32 dropped_system_nonrt, u32 dropped_result,
+                                              u32 producer_count, u32 flags) {
+    memset(out, 0, 64);
+    memcpy(&out[0], &tick, 4);
+    memcpy(&out[4], &log_head, 4);
+    memcpy(&out[8], &record_mask, 4);
+    memcpy(&out[12], &bud_rt, 4);
+    memcpy(&out[16], &bud_render, 4);
+    memcpy(&out[20], &bud_telem, 4);
+    memcpy(&out[24], &dropped_error_ex, 4);
+    memcpy(&out[28], &dropped_queue_full, 4);
+    memcpy(&out[32], &dropped_system_nonrt, 4);
+    memcpy(&out[36], &dropped_result, 4);
+    memcpy(&out[40], &producer_count, 4);
+    memcpy(&out[44], &flags, 4);
+}
+
+static inline bool hs_unpack_result_system_stats(const void* data, u32 len,
+                                                u32* out_tick, u32* out_log_head, u32* out_record_mask,
+                                                u32 out_budgets3[3], u32 out_dropped4[4], u32* out_producer_count, u32* out_flags) {
+    if (!data || len < 64) return false;
+    const u8* b = (const u8*)data;
+    if (out_tick) memcpy(out_tick, &b[0], 4);
+    if (out_log_head) memcpy(out_log_head, &b[4], 4);
+    if (out_record_mask) memcpy(out_record_mask, &b[8], 4);
+    if (out_budgets3) {
+        memcpy(&out_budgets3[0], &b[12], 4);
+        memcpy(&out_budgets3[1], &b[16], 4);
+        memcpy(&out_budgets3[2], &b[20], 4);
+    }
+    if (out_dropped4) {
+        memcpy(&out_dropped4[0], &b[24], 4);
+        memcpy(&out_dropped4[1], &b[28], 4);
+        memcpy(&out_dropped4[2], &b[32], 4);
+        memcpy(&out_dropped4[3], &b[36], 4);
+    }
+    if (out_producer_count) memcpy(out_producer_count, &b[40], 4);
+    if (out_flags) memcpy(out_flags, &b[44], 4);
+    return true;
+}
+
+/* OP_QUERY_FABRIC result payload (64B)
+ * Layout: u32 arrays per channel (RT, RENDER, TELEM):
+ *  0..11  spsc_ok[3], spsc_full[3], mpsc_ok[3], submit_full[3]
+ * 48 producer_count(u32)
+ * 52 bp_waiters(u32)
+ */
+static inline void hs_pack_result_fabric(u8 out[64], const u32 spsc_ok3[3], const u32 spsc_full3[3],
+                                        const u32 mpsc_ok3[3], const u32 submit_full3[3], u32 producer_count, u32 bp_waiters) {
+    memset(out, 0, 64);
+    memcpy(&out[0], spsc_ok3, 12);
+    memcpy(&out[12], spsc_full3, 12);
+    memcpy(&out[24], mpsc_ok3, 12);
+    memcpy(&out[36], submit_full3, 12);
+    memcpy(&out[48], &producer_count, 4);
+    memcpy(&out[52], &bp_waiters, 4);
+}
+
+static inline bool hs_unpack_result_fabric(const void* data, u32 len, u32 spsc_ok3[3], u32 spsc_full3[3],
+                                          u32 mpsc_ok3[3], u32 submit_full3[3], u32* out_producer_count, u32* out_bp_waiters) {
+    if (!data || len < 64) return false;
+    const u8* b = (const u8*)data;
+    if (spsc_ok3) memcpy(spsc_ok3, &b[0], 12);
+    if (spsc_full3) memcpy(spsc_full3, &b[12], 12);
+    if (mpsc_ok3) memcpy(mpsc_ok3, &b[24], 12);
+    if (submit_full3) memcpy(submit_full3, &b[36], 12);
+    if (out_producer_count) memcpy(out_producer_count, &b[48], 4);
+    if (out_bp_waiters) memcpy(out_bp_waiters, &b[52], 4);
+    return true;
+}
+
 #endif

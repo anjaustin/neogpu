@@ -125,6 +125,11 @@ See also: `docs/lmm/channel_fabric_synthesize.md` (LMM synthesis for channelized
   - queue counts, node stats, last error, tick, capture status.
 - Provide a stable small result payload format.
 
+P0 implementation now includes:
+
+- `OP_QUERY_STATS` and `OP_QUERY_FABRIC` (both emit `OP_RESULT` with fixed 64B payloads).
+- `OP_SET_RECORD_MASK`, `OP_SET_CHAN_BUDGET`, `OP_SET_BLOCK_POLICY` control ops for safe runtime tuning.
+
 ## 5. Milestones
 
 ### Milestone A: Results + Errors

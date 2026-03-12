@@ -39,6 +39,35 @@ static void emit_ack(u8 from, const Message* req, u8 status) {
     (void)hs_send(g_sys, &ack);
 }
 
+static void emit_result(Node* node, const Message* req, u8 result_op, const void* payload, u32 payload_len) {
+    if (!node || !g_sys || !req) return;
+
+    u16 idx = 0;
+    u32 copy_len = 0;
+    if (payload_len) {
+        if (!hs_payload_alloc_and_copy(g_sys, payload, payload_len, &idx, &copy_len)) {
+            g_sys->dropped_result++;
+            return;
+        }
+    }
+
+    Message res = {
+        .to = NODE_SYSTEM,
+        .from = NODE_SYSTEM,
+        .op = OP_RESULT,
+        .flags = result_op,
+        .cid = req->cid,
+        .tick = 0,
+        .payload_idx = idx,
+        .payload_len = copy_len,
+        .channel = CHAN_RT,
+    };
+
+    if (!mq_push(&node->outbox, &res)) {
+        g_sys->dropped_result++;
+    }
+}
+
 void hs_nodes_set_system(HSSystem* sys) {
     g_sys = sys;
 }
@@ -596,6 +625,110 @@ int system_node_process(Node* node) {
                 system_state.stopped = 1;
                 DBG_PRINT("[%s] STOP command received\n", node_name(node->id));
                 break;
+
+            case OP_QUERY_STATS: {
+                u8 out[64];
+                u32 flags = 0;
+                if (g_sys) {
+                    if (g_sys->recording) flags |= 1u << 0;
+                    if (g_sys->validate_on_send) flags |= 1u << 1;
+                    if (g_sys->block_on_full_chan[CHAN_RT]) flags |= 1u << 2;
+                    if (g_sys->block_on_full_chan[CHAN_RENDER]) flags |= 1u << 3;
+                    if (g_sys->block_on_full_chan[CHAN_TELEM]) flags |= 1u << 4;
+                }
+                hs_pack_result_system_stats(out,
+                                           g_sys ? g_sys->tick : 0,
+                                           g_sys ? g_sys->log_head : 0,
+                                           g_sys ? g_sys->record_mask : 0,
+                                           g_sys ? g_sys->chan_budget[CHAN_RT] : 0,
+                                           g_sys ? g_sys->chan_budget[CHAN_RENDER] : 0,
+                                           g_sys ? g_sys->chan_budget[CHAN_TELEM] : 0,
+                                           g_sys ? g_sys->dropped_error_ex : 0,
+                                           g_sys ? g_sys->dropped_queue_full : 0,
+                                           g_sys ? g_sys->dropped_system_nonrt : 0,
+                                           g_sys ? g_sys->dropped_result : 0,
+                                           g_sys ? atomic_load_explicit(&g_sys->producer_count, memory_order_relaxed) : 0,
+                                           flags);
+                emit_result(node, &msg, OP_QUERY_STATS, out, sizeof(out));
+                break;
+            }
+
+            case OP_QUERY_FABRIC: {
+                u8 out[64];
+                u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0};
+                if (g_sys) {
+                    spsc_ok3[0] = atomic_load_explicit(&g_sys->spsc_ok[CHAN_RT], memory_order_relaxed);
+                    spsc_ok3[1] = atomic_load_explicit(&g_sys->spsc_ok[CHAN_RENDER], memory_order_relaxed);
+                    spsc_ok3[2] = atomic_load_explicit(&g_sys->spsc_ok[CHAN_TELEM], memory_order_relaxed);
+
+                    spsc_full3[0] = atomic_load_explicit(&g_sys->spsc_full[CHAN_RT], memory_order_relaxed);
+                    spsc_full3[1] = atomic_load_explicit(&g_sys->spsc_full[CHAN_RENDER], memory_order_relaxed);
+                    spsc_full3[2] = atomic_load_explicit(&g_sys->spsc_full[CHAN_TELEM], memory_order_relaxed);
+
+                    mpsc_ok3[0] = atomic_load_explicit(&g_sys->mpsc_ok[CHAN_RT], memory_order_relaxed);
+                    mpsc_ok3[1] = atomic_load_explicit(&g_sys->mpsc_ok[CHAN_RENDER], memory_order_relaxed);
+                    mpsc_ok3[2] = atomic_load_explicit(&g_sys->mpsc_ok[CHAN_TELEM], memory_order_relaxed);
+
+                    submit_full3[0] = atomic_load_explicit(&g_sys->submit_full[CHAN_RT], memory_order_relaxed);
+                    submit_full3[1] = atomic_load_explicit(&g_sys->submit_full[CHAN_RENDER], memory_order_relaxed);
+                    submit_full3[2] = atomic_load_explicit(&g_sys->submit_full[CHAN_TELEM], memory_order_relaxed);
+                }
+
+                hs_pack_result_fabric(out, spsc_ok3, spsc_full3, mpsc_ok3, submit_full3,
+                                      g_sys ? atomic_load_explicit(&g_sys->producer_count, memory_order_relaxed) : 0,
+                                      g_sys ? atomic_load_explicit(&g_sys->bp_waiters, memory_order_relaxed) : 0);
+                emit_result(node, &msg, OP_QUERY_FABRIC, out, sizeof(out));
+                break;
+            }
+
+            case OP_SET_RECORD_MASK: {
+                void* data = get_payload(msg.payload_idx);
+                u32 new_mask = 0;
+                u32 old_mask = g_sys ? g_sys->record_mask : 0;
+                if (data && g_sys && hs_unpack_set_record_mask(data, msg.payload_len, &new_mask)) {
+                    g_sys->record_mask = new_mask;
+                }
+                u8 out[8];
+                hs_pack_u32x2(out, old_mask, g_sys ? g_sys->record_mask : old_mask);
+                emit_result(node, &msg, OP_SET_RECORD_MASK, out, sizeof(out));
+                break;
+            }
+
+            case OP_SET_CHAN_BUDGET: {
+                void* data = get_payload(msg.payload_idx);
+                u8 ch = 0;
+                u32 budget = 0;
+                u32 old = 0;
+                if (g_sys) {
+                    if (data && hs_unpack_set_chan_budget(data, msg.payload_len, &ch, &budget) && ch < CHAN_COUNT && ch != CHAN_DEFAULT) {
+                        old = g_sys->chan_budget[ch];
+                        g_sys->chan_budget[ch] = budget;
+                    } else {
+                        old = 0xFFFFFFFFu;
+                        budget = 0xFFFFFFFFu;
+                    }
+                }
+                u8 out[8];
+                hs_pack_u32x2(out, old, budget);
+                emit_result(node, &msg, OP_SET_CHAN_BUDGET, out, sizeof(out));
+                break;
+            }
+
+            case OP_SET_BLOCK_POLICY: {
+                void* data = get_payload(msg.payload_idx);
+                u8 ch = 0, block = 0;
+                u32 old = 0xFFFFFFFFu;
+                u32 now = 0xFFFFFFFFu;
+                if (g_sys && data && hs_unpack_set_block_policy(data, msg.payload_len, &ch, &block) && ch < CHAN_COUNT && ch != CHAN_DEFAULT) {
+                    old = g_sys->block_on_full_chan[ch] ? 1u : 0u;
+                    g_sys->block_on_full_chan[ch] = (block != 0);
+                    now = g_sys->block_on_full_chan[ch] ? 1u : 0u;
+                }
+                u8 out[8];
+                hs_pack_u32x2(out, old, now);
+                emit_result(node, &msg, OP_SET_BLOCK_POLICY, out, sizeof(out));
+                break;
+            }
 
             default:
                 break;
