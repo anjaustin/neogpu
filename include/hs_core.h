@@ -180,7 +180,7 @@ void hs_lock(HSSystem* sys);
 void hs_unlock(HSSystem* sys);
 
 /* Message flags (Message.flags) */
-#define HS_MSGF_ACK   (1u << 0)  /* request OP_ACK after apply */
+#define HS_MSGF_ACK   (1u << 7)  /* request OP_ACK after apply (must not collide with opcode-specific flags) */
 
 void mq_init(MessageQueue* q);
 bool mq_push(MessageQueue* q, Message* msg);

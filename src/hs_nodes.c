@@ -112,7 +112,7 @@ int shader_node_process(Node* node) {
                 void* data = get_payload(msg.payload_idx);
                 if (data && msg.payload_len >= 16 * sizeof(f32)) {
                     f32* global_data = (f32*)data;
-                    u8 global_idx = msg.flags;
+                    u8 global_idx = msg.flags & 0x7F;
                     if (global_idx == 0) {
                         /* Global 0 = camera view-projection matrix */
                         for (int i = 0; i < 16; i++) {

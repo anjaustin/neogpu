@@ -574,6 +574,69 @@ static void test_thread_safety_many(void) {
     TEST("many_ack_progress", st->ack_count > 0);
 }
 
+static void* sender_payload_thread(void* arg) {
+    SenderArgs* a = (SenderArgs*)arg;
+    u32 i = 0;
+    while (!atomic_load_explicit(a->stop, memory_order_acquire)) {
+        u8 data[2];
+        data[0] = (i & 1) ? 1 : 0;
+        data[1] = (i & 1) ? 0 : 1;
+        Message m = {
+            .to = NODE_SHADER,
+            .from = NODE_CPU,
+            .op = OP_BLEND,
+            .flags = HS_MSGF_ACK,
+            .cid = 1000000u + i,
+            .tick = 0,
+            .payload_idx = 0,
+            .payload_len = 0,
+        };
+        if (hs_send_with_payload(a->sys, &m, data, sizeof(data))) a->sent++;
+        else a->failed++;
+        i++;
+        usleep(50);
+    }
+    return NULL;
+}
+
+static void test_thread_safety_payloads(void) {
+    printf("\n--- Thread Safety (Payload Producers) ---\n");
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
+    gpu.system.recording = false;
+
+    enum { N = 4 };
+    pthread_t th[N];
+    SenderArgs args[N];
+    atomic_bool stop;
+    atomic_init(&stop, false);
+
+    for (int i = 0; i < N; i++) {
+        args[i].sys = &gpu.system;
+        args[i].stop = &stop;
+        args[i].sent = 0;
+        args[i].failed = 0;
+        int rc = pthread_create(&th[i], NULL, sender_payload_thread, &args[i]);
+        TEST("thread_spawn_payload", rc == 0);
+    }
+
+    for (int i = 0; i < 2000; i++) {
+        hs_step(&gpu.system);
+        usleep(500);
+    }
+
+    atomic_store_explicit(&stop, true, memory_order_release);
+    for (int i = 0; i < N; i++) pthread_join(th[i], NULL);
+
+    u32 total_sent = 0;
+    for (int i = 0; i < N; i++) total_sent += args[i].sent;
+    SystemState* st = (SystemState*)gpu.system_node.state;
+    TEST("payload_sent", total_sent > 0);
+    TEST("payload_ack", st->ack_count > 0);
+}
+
 /* ============================================================
  * GPU message system demo (original + new ops)
  * ============================================================ */
@@ -814,6 +877,7 @@ int main(void) {
     test_async_atomic_running();
     test_thread_safety();
     test_thread_safety_many();
+    test_thread_safety_payloads();
     test_gpu();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
