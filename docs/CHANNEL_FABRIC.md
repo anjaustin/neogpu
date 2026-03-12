@@ -47,6 +47,8 @@ Add a `channel` field to `Message`.
 - `channel` is the channel the producer is submitting to.
 - If `channel` is 0 and the opcode has a default, it may be auto-assigned by the sender helper.
 
+Implementation note (P0): some opcodes clamp the requested channel to preserve QoS semantics (e.g. system query/control ops are forced to `CHAN_RT`, and frame markers are forced to `CHAN_RENDER`).
+
 ### 3.2 Ordering
 
 - FIFO ordering is guaranteed per producer lane within a channel.

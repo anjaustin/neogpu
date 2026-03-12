@@ -143,25 +143,30 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
 - `OP_QUERY_STATS` (Immediate)
   - Emits `OP_RESULT` with `flags = OP_QUERY_STATS`
   - Payload (64B): packed system snapshot; see `hs_pack_result_system_stats()` / `hs_unpack_result_system_stats()` in `include/hs_msg.h`
+  - Channel: treated as `CHAN_RT` (forced) to keep tooling QoS stable
 
 - `OP_QUERY_FABRIC` (Immediate)
   - Emits `OP_RESULT` with `flags = OP_QUERY_FABRIC`
   - Payload (64B): packed fabric counters; see `hs_pack_result_fabric()` / `hs_unpack_result_fabric()` in `include/hs_msg.h`
+  - Channel: treated as `CHAN_RT` (forced)
 
 - `OP_SET_RECORD_MASK` (Payload, 4B)
   - Payload layout: `[u32 record_mask]` (`1u << HSChannel`)
   - Emits `OP_RESULT` with `flags = OP_SET_RECORD_MASK`
   - Result payload (8B): `[u32 old_mask][u32 new_mask]`
+  - Channel: treated as `CHAN_RT` (forced)
 
 - `OP_SET_CHAN_BUDGET` (Payload, 8B)
   - Payload layout: `[u8 channel][u8 rsv0][u8 rsv1][u8 rsv2][u32 budget]`
   - Emits `OP_RESULT` with `flags = OP_SET_CHAN_BUDGET`
   - Result payload (8B): `[u32 old_budget][u32 new_budget]` (or `0xFFFFFFFF` on invalid channel)
+  - Channel: treated as `CHAN_RT` (forced)
 
 - `OP_SET_BLOCK_POLICY` (Payload, 2B)
   - Payload layout: `[u8 channel][u8 block]`
   - Emits `OP_RESULT` with `flags = OP_SET_BLOCK_POLICY`
   - Result payload (8B): `[u32 old][u32 new]` (0/1, or `0xFFFFFFFF` on invalid channel)
+  - Channel: treated as `CHAN_RT` (forced)
 
 - `OP_FRAME_BEGIN` (Immediate)
   - Frame marker for render recording; resets the render list when applied

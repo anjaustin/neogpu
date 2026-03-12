@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
@@ -622,6 +623,107 @@ static void test_system_queries(void) {
                                            spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, &prod, &waiters);
         TEST("query_fabric_unpack", uok && prod == atomic_load_explicit(&gpu.system.producer_count, memory_order_relaxed));
     }
+}
+
+/* ============================================================
+ * Red-team: System queries under TELEM spam
+ * ============================================================ */
+typedef struct {
+    HSSystem* sys;
+    atomic_bool* stop;
+    u32 sent;
+    u32 failed;
+} TelemSpamArgs;
+
+static void* telem_spam_thread(void* arg) {
+    TelemSpamArgs* a = (TelemSpamArgs*)arg;
+    u32 i = 0;
+    while (!atomic_load_explicit(a->stop, memory_order_acquire)) {
+        Message m = {
+            .to = NODE_SYSTEM,
+            .from = NODE_CPU,
+            .op = OP_QUEUE_FULL,
+            .flags = NODE_SYSTEM,
+            .cid = i,
+            .tick = 0,
+            .payload_idx = (u16)OP_TRACE,
+            .payload_len = 0,
+            .channel = CHAN_TELEM,
+        };
+
+        if (hs_send(a->sys, &m)) a->sent++;
+        else a->failed++;
+        i++;
+    }
+    return NULL;
+}
+
+static void test_redteam_system_queries(void) {
+    printf("\n--- Red-Team: System Queries Under TELEM Spam ---\n");
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
+    gpu.system.recording = false;
+
+    /* TELEM must never block; leave defaults for RT blocking */
+    gpu.system.block_on_full_chan[CHAN_TELEM] = false;
+    gpu.system.block_on_full_chan[CHAN_RT] = true;
+
+    atomic_bool stop;
+    atomic_init(&stop, false);
+
+    const int N = 6;
+    pthread_t th[N];
+    TelemSpamArgs args[N];
+    for (int i = 0; i < N; i++) {
+        args[i].sys = &gpu.system;
+        args[i].stop = &stop;
+        args[i].sent = 0;
+        args[i].failed = 0;
+        int rc = pthread_create(&th[i], NULL, telem_spam_thread, &args[i]);
+        TEST("telem_spawn", rc == 0);
+    }
+
+    SystemState* st = (SystemState*)gpu.system_node.state;
+    u32 start_results = st->result_count;
+    bool ok_all = true;
+
+    /* Issue repeated queries while step drains under spam. */
+    for (u32 k = 0; k < 200; k++) {
+        Message q = {
+            .to = NODE_SYSTEM,
+            .from = NODE_CPU,
+            .op = OP_QUERY_STATS,
+            .flags = 0,
+            .cid = 1000 + k,
+            .tick = 0,
+            .payload_idx = 0,
+            .payload_len = 0,
+            .channel = CHAN_TELEM, /* intentionally wrong; must be clamped to RT */
+        };
+        bool ok = hs_send(&gpu.system, &q);
+        if (!ok || q.channel != CHAN_RT) {
+            ok_all = false;
+            break;
+        }
+
+        /* step a bit to ensure the system processes and emits a result */
+        hs_step(&gpu.system);
+        hs_step(&gpu.system);
+
+        if (st->result_count <= start_results) {
+            ok_all = false;
+            break;
+        }
+        start_results = st->result_count;
+    }
+
+    atomic_store_explicit(&stop, true, memory_order_release);
+    hs_wake_senders(&gpu.system);
+    for (int i = 0; i < N; i++) pthread_join(th[i], NULL);
+
+    TEST("telem_query_progress", ok_all);
 }
 
 /* ============================================================
@@ -1268,6 +1370,7 @@ int main(void) {
     test_message_validation();
     test_frame_qos();
     test_system_queries();
+    test_redteam_system_queries();
     test_async_done();
     test_async_atomic_running();
     test_thread_safety();

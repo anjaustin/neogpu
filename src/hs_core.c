@@ -527,6 +527,27 @@ void hs_wake_senders(HSSystem* sys) {
 static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u32 len) {
     if (!sys || !msg) return false;
 
+    /* Enforce channel semantics for critical system ops (producer mistakes should not downgrade QoS). */
+    switch ((OpCode)msg->op) {
+        case OP_FENCE:
+        case OP_QUERY_STATS:
+        case OP_QUERY_FABRIC:
+        case OP_SET_RECORD_MASK:
+        case OP_SET_CHAN_BUDGET:
+        case OP_SET_BLOCK_POLICY:
+            msg->channel = CHAN_RT;
+            break;
+
+        case OP_FRAME_BEGIN:
+        case OP_FRAME_END:
+        case OP_PRESENT:
+            msg->channel = CHAN_RENDER;
+            break;
+
+        default:
+            break;
+    }
+
     if (msg->channel == CHAN_DEFAULT) {
         msg->channel = (u8)hs_default_channel_for_op((OpCode)msg->op);
     }
