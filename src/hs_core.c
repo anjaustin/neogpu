@@ -97,7 +97,7 @@ bool hs_validate_message(const HSSystem* sys, const Message* msg, const char** o
                 err = "null payload buffer";
                 break;
             }
-            if (msg->payload_idx >= HS_MAX_PAYLOADS) {
+            if (msg->payload_idx >= sys->payload_capacity) {
                 err = "invalid payload index";
                 break;
             }
@@ -123,7 +123,7 @@ bool hs_validate_message(const HSSystem* sys, const Message* msg, const char** o
             if (out_err) *out_err = "null payload buffer";
             return false;
         }
-        if (msg->payload_idx >= HS_MAX_PAYLOADS) {
+        if (msg->payload_idx >= sys->payload_capacity) {
             if (out_err) *out_err = "invalid payload index";
             return false;
         }
@@ -169,6 +169,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->log = log_buffer;
     sys->log_capacity = log_capacity;
     sys->payloads = payload_buffer;
+    sys->payload_capacity = HS_MAX_PAYLOADS;
     sys->payload_head = 0;
     sys->recording = true;
     sys->log_overflow = false;
@@ -185,9 +186,55 @@ static u32 allocate_payload(HSSystem* sys, const void* data, u32 len) {
         len = HS_PAYLOAD_SIZE;
     }
     u32 idx = sys->payload_head;
-    sys->payload_head = (sys->payload_head + 1) % HS_MAX_PAYLOADS;
+    u32 cap = sys->payload_capacity ? sys->payload_capacity : (u32)HS_MAX_PAYLOADS;
+    sys->payload_head = (sys->payload_head + 1) % cap;
     memcpy(sys->payloads[idx].data, data, len);
     return idx;
+}
+
+void hs_capture_init(HSCapture* cap, Message* msg_buf, Payload* payload_buf, u32 capacity) {
+    if (!cap) return;
+    cap->msgs = msg_buf;
+    cap->payloads = payload_buf;
+    cap->capacity = capacity;
+    cap->count = 0;
+}
+
+bool hs_capture_from_log(const HSSystem* sys, const Message* msgs, u32 count, HSCapture* out) {
+    if (!sys || !msgs || !out || !out->msgs || !out->payloads) return false;
+    if (count > out->capacity) return false;
+    if (!sys->payloads || sys->payload_capacity == 0) return false;
+
+    for (u32 i = 0; i < count; i++) {
+        Message m = msgs[i];
+        if (m.payload_len != 0) {
+            if (m.payload_idx >= sys->payload_capacity) return false;
+            memcpy(out->payloads[i].data, sys->payloads[m.payload_idx].data, HS_PAYLOAD_SIZE);
+            m.payload_idx = (u16)i;
+        }
+        out->msgs[i] = m;
+    }
+
+    out->count = count;
+    return true;
+}
+
+bool hs_capture_replay(HSSystem* sys, const HSCapture* cap) {
+    if (!sys || !cap || !cap->msgs || !cap->payloads) return false;
+    if (cap->count > cap->capacity) return false;
+
+    Payload* saved_payloads = sys->payloads;
+    u32 saved_cap = sys->payload_capacity;
+
+    sys->payloads = cap->payloads;
+    sys->payload_capacity = cap->capacity;
+
+    bool ok = hs_replay(sys, cap->msgs, cap->count);
+
+    sys->payloads = saved_payloads;
+    sys->payload_capacity = saved_cap;
+
+    return ok;
 }
 
 bool hs_send(HSSystem* sys, Message* msg) {

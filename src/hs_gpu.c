@@ -44,10 +44,11 @@ static void hs_gpu_send_simple(HSGpu* gpu, u8 to, OpCode op, u32 payload_idx, u3
 
 bool hs_gpu_send_with_payload(HSGpu* gpu, u8 to, OpCode op, const void* data, u32 len) {
     u32 idx = gpu->system.payload_head;
-    gpu->system.payload_head = (gpu->system.payload_head + 1) % HS_MAX_PAYLOADS;
+    u32 cap = gpu->system.payload_capacity ? gpu->system.payload_capacity : (u32)HS_MAX_PAYLOADS;
+    gpu->system.payload_head = (gpu->system.payload_head + 1) % cap;
     
     u32 copy_len = len < HS_PAYLOAD_SIZE ? len : HS_PAYLOAD_SIZE;
-    memcpy(gpu->payload_buffer[idx].data, data, copy_len);
+    memcpy(gpu->system.payloads[idx].data, data, copy_len);
     
     Message msg = {
         .to = to,
@@ -82,9 +83,10 @@ void hs_gpu_set_global(HSGpu* gpu, u8 idx, mat4 value) {
     
     /* Allocate payload manually so we can set payload_idx for the index. */
     u32 pidx = gpu->system.payload_head;
-    gpu->system.payload_head = (gpu->system.payload_head + 1) % HS_MAX_PAYLOADS;
+    u32 cap = gpu->system.payload_capacity ? gpu->system.payload_capacity : (u32)HS_MAX_PAYLOADS;
+    gpu->system.payload_head = (gpu->system.payload_head + 1) % cap;
     u32 copy_len = sizeof(arr) < HS_PAYLOAD_SIZE ? sizeof(arr) : HS_PAYLOAD_SIZE;
-    memcpy(gpu->payload_buffer[pidx].data, arr, copy_len);
+    memcpy(gpu->system.payloads[pidx].data, arr, copy_len);
     
     Message msg = {
         .to = NODE_SHADER,

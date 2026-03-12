@@ -112,6 +112,7 @@ typedef struct {
     u32         log_capacity;
     bool        recording;
     Payload*    payloads;
+    u32         payload_capacity;
     u32         payload_head;
     bool        log_overflow;
 } HSSystem;
@@ -136,5 +137,22 @@ const char* hs_op_name(OpCode op);
 
 /* Debug/validation helper: validates message schema and routing. */
 bool hs_validate_message(const HSSystem* sys, const Message* msg, const char** out_err);
+
+/*
+ * Self-contained capture for deterministic replay.
+ *
+ * A capture stores messages plus deep-copied payload blocks. For payload-bearing
+ * messages, the capture rewrites payload_idx to refer to capture payload slots.
+ */
+typedef struct {
+    Message* msgs;
+    Payload* payloads;
+    u32      capacity;
+    u32      count;
+} HSCapture;
+
+void hs_capture_init(HSCapture* cap, Message* msg_buf, Payload* payload_buf, u32 capacity);
+bool hs_capture_from_log(const HSSystem* sys, const Message* msgs, u32 count, HSCapture* out);
+bool hs_capture_replay(HSSystem* sys, const HSCapture* cap);
 
 #endif

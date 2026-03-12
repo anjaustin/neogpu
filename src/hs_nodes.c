@@ -26,7 +26,7 @@ void hs_nodes_set_system(HSSystem* sys) {
 }
 
 static void* get_payload(u32 idx) {
-    if (!g_sys || idx >= HS_MAX_PAYLOADS) return NULL;
+    if (!g_sys || !g_sys->payloads || idx >= g_sys->payload_capacity) return NULL;
     return g_sys->payloads[idx].data;
 }
 

@@ -210,10 +210,22 @@ static void test_gpu(void) {
     printf("\nLog contains %d messages\n", log_count);
     TEST("gpu_recorded_msgs", log_count > 0);
 
+    /* Capture (self-contained payload copy) */
+    static Message cap_msgs[HS_MAX_MSG_LOG];
+    static Payload cap_payloads[HS_MAX_MSG_LOG];
+    HSCapture cap;
+    hs_capture_init(&cap, cap_msgs, cap_payloads, HS_MAX_MSG_LOG);
+    bool cap_ok = hs_capture_from_log(&gpu.system, gpu.log_buffer, log_count, &cap);
+    TEST("gpu_capture", cap_ok);
+
     /* Replay -- replay BEFORE clearing, so payload data is still valid */
     printf("\nReplaying frame...\n");
     bool replay_ok = hs_gpu_replay(&gpu, gpu.log_buffer, log_count);
     TEST("gpu_replay", replay_ok);
+
+    /* Replay the self-contained capture */
+    bool cap_replay_ok = hs_capture_replay(&gpu.system, &cap);
+    TEST("gpu_replay_capture", cap_replay_ok);
 }
 
 /* ============================================================
