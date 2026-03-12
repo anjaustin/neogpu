@@ -31,6 +31,8 @@ Implementation notes:
 
 The core also supports a self-contained capture format (`HSCapture`) that deep-copies payload blocks and can replay deterministically without relying on the transient payload ring. In a capture, payload-bearing messages can be rewritten so `payload_idx` refers to the capture payload slot.
 
+Capture persistence is documented in `docs/CAPTURE_FORMAT.md`.
+
 ## Nodes
 
 Current node ids (see `include/hs_nodes.h`):

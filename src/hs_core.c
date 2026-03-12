@@ -4,6 +4,35 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+typedef struct {
+    u8  magic[8];      /* "HSCAP1\0" */
+    u32 endian;        /* 0x01020304 */
+    u32 version;       /* 1 */
+    u32 msg_size;
+    u32 payload_size;
+    u32 count;
+} HSCaptureHeader;
+
+static void hs_capture_header_init(HSCaptureHeader* h, u32 count) {
+    memset(h, 0, sizeof(*h));
+    memcpy(h->magic, "HSCAP1\0", 7);
+    h->endian = 0x01020304u;
+    h->version = 1u;
+    h->msg_size = (u32)sizeof(Message);
+    h->payload_size = (u32)sizeof(Payload);
+    h->count = count;
+}
+
+static bool hs_capture_header_valid(const HSCaptureHeader* h) {
+    if (!h) return false;
+    if (memcmp(h->magic, "HSCAP1\0", 7) != 0) return false;
+    if (h->endian != 0x01020304u) return false;
+    if (h->version != 1u) return false;
+    if (h->msg_size != (u32)sizeof(Message)) return false;
+    if (h->payload_size != (u32)sizeof(Payload)) return false;
+    return true;
+}
+
 typedef enum {
     HS_ERR_VALIDATE = 1,
     HS_ERR_ROUTE = 2,
@@ -307,6 +336,49 @@ bool hs_capture_replay(HSSystem* sys, const HSCapture* cap) {
     sys->payload_capacity = saved_cap;
 
     return ok;
+}
+
+bool hs_capture_write_file(const HSCapture* cap, const char* path) {
+    if (!cap || !path || !cap->msgs || !cap->payloads) return false;
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+
+    HSCaptureHeader h;
+    hs_capture_header_init(&h, cap->count);
+
+    bool ok = true;
+    ok = ok && (fwrite(&h, sizeof(h), 1, f) == 1);
+    ok = ok && (fwrite(cap->msgs, sizeof(Message), cap->count, f) == cap->count);
+    ok = ok && (fwrite(cap->payloads, sizeof(Payload), cap->count, f) == cap->count);
+
+    fclose(f);
+    return ok;
+}
+
+bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Payload* payload_buf, u32 capacity) {
+    if (!cap || !path || !msg_buf || !payload_buf || capacity == 0) return false;
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+
+    HSCaptureHeader h;
+    bool ok = (fread(&h, sizeof(h), 1, f) == 1);
+    ok = ok && hs_capture_header_valid(&h);
+    ok = ok && (h.count <= capacity);
+
+    if (!ok) {
+        fclose(f);
+        return false;
+    }
+
+    ok = ok && (fread(msg_buf, sizeof(Message), h.count, f) == h.count);
+    ok = ok && (fread(payload_buf, sizeof(Payload), h.count, f) == h.count);
+    fclose(f);
+
+    if (!ok) return false;
+
+    hs_capture_init(cap, msg_buf, payload_buf, capacity);
+    cap->count = h.count;
+    return true;
 }
 
 bool hs_send(HSSystem* sys, Message* msg) {

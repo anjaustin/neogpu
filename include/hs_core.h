@@ -169,4 +169,8 @@ void hs_capture_init(HSCapture* cap, Message* msg_buf, Payload* payload_buf, u32
 bool hs_capture_from_log(const HSSystem* sys, const Message* msgs, u32 count, HSCapture* out);
 bool hs_capture_replay(HSSystem* sys, const HSCapture* cap);
 
+/* Capture persistence (binary, versioned) */
+bool hs_capture_write_file(const HSCapture* cap, const char* path);
+bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Payload* payload_buf, u32 capacity);
+
 #endif

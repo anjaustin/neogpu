@@ -336,6 +336,17 @@ static void test_gpu(void) {
     bool cap_ok = hs_capture_from_log(&gpu.system, gpu.log_buffer, log_count, &cap);
     TEST("gpu_capture", cap_ok);
 
+    /* Capture I/O */
+    const char* cap_path = "/tmp/neogpu_capture.bin";
+    bool cap_write_ok = hs_capture_write_file(&cap, cap_path);
+    TEST("gpu_capture_write", cap_write_ok);
+
+    static Message cap2_msgs[HS_MAX_MSG_LOG];
+    static Payload cap2_payloads[HS_MAX_MSG_LOG];
+    HSCapture cap2;
+    bool cap_read_ok = hs_capture_read_file(&cap2, cap_path, cap2_msgs, cap2_payloads, HS_MAX_MSG_LOG);
+    TEST("gpu_capture_read", cap_read_ok);
+
     /* Replay -- replay BEFORE clearing, so payload data is still valid */
     printf("\nReplaying frame...\n");
     bool replay_ok = hs_gpu_replay(&gpu, gpu.log_buffer, log_count);
@@ -344,6 +355,10 @@ static void test_gpu(void) {
     /* Replay the self-contained capture */
     bool cap_replay_ok = hs_capture_replay(&gpu.system, &cap);
     TEST("gpu_replay_capture", cap_replay_ok);
+
+    /* Replay the capture loaded from disk */
+    bool cap2_replay_ok = hs_capture_replay(&gpu.system, &cap2);
+    TEST("gpu_replay_capture_io", cap2_replay_ok);
 }
 
 /* ============================================================
