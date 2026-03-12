@@ -161,6 +161,7 @@ typedef struct {
     u32         log_capacity;
     bool        recording;
     bool        validate_on_send; /* runtime opt-in validation in hs_send */
+    bool        block_on_full;    /* if true, hs_send waits instead of failing */
     HSRenderList* render_list;
     Payload*    payloads;
     u32         payload_capacity;
@@ -186,6 +187,10 @@ typedef struct {
 
     atomic_uint producer_count;
     HSSpscQueue producers[HS_MAX_PRODUCERS];
+
+    pthread_mutex_t bp_lock;
+    pthread_cond_t  bp_cv;
+    atomic_uint     bp_waiters;
 } HSSystem;
 
 void hs_lock(HSSystem* sys);
@@ -204,6 +209,9 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
 void hs_register(HSSystem* sys, Node* node);
 bool hs_send(HSSystem* sys, Message* msg);
 u32  hs_step(HSSystem* sys);
+
+/* Wake threads blocked in hs_send when block_on_full is enabled. */
+void hs_wake_senders(HSSystem* sys);
 
 /* Allocate a payload block and copy up to HS_PAYLOAD_SIZE bytes into it. */
 bool hs_payload_alloc_and_copy(HSSystem* sys, const void* data, u32 len, u16* out_idx, u32* out_len);

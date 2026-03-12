@@ -4,6 +4,7 @@
 #include "hs_render.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 typedef struct {
     u8  magic[8];      /* "HSCAP1\0" */
@@ -399,6 +400,55 @@ static int hs_get_producer_id(HSSystem* sys) {
     return g_tls_prod.id;
 }
 
+static void hs_backpressure_wait(HSSystem* sys) {
+    if (!sys) return;
+    atomic_fetch_add_explicit(&sys->bp_waiters, 1, memory_order_relaxed);
+    pthread_mutex_lock(&sys->bp_lock);
+    /* Timed wait to avoid missed wakeups causing long stalls. */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long nsec = ts.tv_nsec + 1000000L; /* +1ms */
+    ts.tv_sec += nsec / 1000000000L;
+    ts.tv_nsec = nsec % 1000000000L;
+    (void)pthread_cond_timedwait(&sys->bp_cv, &sys->bp_lock, &ts);
+    pthread_mutex_unlock(&sys->bp_lock);
+    atomic_fetch_sub_explicit(&sys->bp_waiters, 1, memory_order_relaxed);
+}
+
+static void hs_backpressure_wake(HSSystem* sys) {
+    if (!sys) return;
+    if (atomic_load_explicit(&sys->bp_waiters, memory_order_relaxed) == 0) return;
+    pthread_mutex_lock(&sys->bp_lock);
+    pthread_cond_broadcast(&sys->bp_cv);
+    pthread_mutex_unlock(&sys->bp_lock);
+}
+
+void hs_wake_senders(HSSystem* sys) {
+    hs_backpressure_wake(sys);
+}
+
+static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u32 len) {
+    if (!sys || !msg) return false;
+
+    if (g_tls_in_step == sys) {
+        return hs_route_immediate(sys, msg, payload, len);
+    }
+
+    int pid = hs_get_producer_id(sys);
+    if (pid >= 0) {
+        if (hs_spsc_push(&sys->producers[pid], msg, payload, len)) {
+            atomic_fetch_add_explicit(&sys->spsc_ok, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&sys->spsc_ok_by_prod[pid], 1, memory_order_relaxed);
+            return true;
+        }
+        atomic_fetch_add_explicit(&sys->spsc_full, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&sys->spsc_full_by_prod[pid], 1, memory_order_relaxed);
+        /* fall through to MPSC */
+    }
+
+    return hs_submit_enqueue(sys, msg, payload, len);
+}
+
 typedef enum {
     HS_PAYLOAD_NONE = 0,
     HS_PAYLOAD_FIXED,
@@ -598,6 +648,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->payload_head = 0;
     sys->recording = true;
     sys->validate_on_send = false;
+    sys->block_on_full = false;
     sys->render_list = NULL;
     sys->log_overflow = false;
     sys->dropped_error_ex = 0;
@@ -639,6 +690,10 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
         pthread_mutexattr_destroy(&attr);
         sys->lock_inited = true;
     }
+
+    pthread_mutex_init(&sys->bp_lock, NULL);
+    pthread_cond_init(&sys->bp_cv, NULL);
+    atomic_init(&sys->bp_waiters, 0);
 }
 
 void hs_register(HSSystem* sys, Node* node) {
@@ -739,46 +794,20 @@ bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Pa
 
 bool hs_send(HSSystem* sys, Message* msg) {
     if (!sys || !msg) return false;
-
-    /* If called from within the step thread, route immediately to preserve behavior. */
-    if (g_tls_in_step == sys) {
-        return hs_route_immediate(sys, msg, NULL, 0);
+    for (;;) {
+        if (hs_send_enqueue(sys, msg, NULL, 0)) return true;
+        if (!sys->block_on_full) return false;
+        hs_backpressure_wait(sys);
     }
-
-    int pid = hs_get_producer_id(sys);
-    if (pid >= 0) {
-        if (hs_spsc_push(&sys->producers[pid], msg, NULL, 0)) {
-            atomic_fetch_add_explicit(&sys->spsc_ok, 1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&sys->spsc_ok_by_prod[pid], 1, memory_order_relaxed);
-            return true;
-        }
-        atomic_fetch_add_explicit(&sys->spsc_full, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&sys->spsc_full_by_prod[pid], 1, memory_order_relaxed);
-        /* fallback to MPSC */
-    }
-
-    return hs_submit_enqueue(sys, msg, NULL, 0);
 }
 
 bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len) {
     if (!sys || !msg) return false;
-
-    if (g_tls_in_step == sys) {
-        return hs_route_immediate(sys, msg, data, len);
+    for (;;) {
+        if (hs_send_enqueue(sys, msg, data, len)) return true;
+        if (!sys->block_on_full) return false;
+        hs_backpressure_wait(sys);
     }
-
-    int pid = hs_get_producer_id(sys);
-    if (pid >= 0) {
-        if (hs_spsc_push(&sys->producers[pid], msg, data, len)) {
-            atomic_fetch_add_explicit(&sys->spsc_ok, 1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&sys->spsc_ok_by_prod[pid], 1, memory_order_relaxed);
-            return true;
-        }
-        atomic_fetch_add_explicit(&sys->spsc_full, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&sys->spsc_full_by_prod[pid], 1, memory_order_relaxed);
-    }
-
-    return hs_submit_enqueue(sys, msg, data, len);
 }
 
 u32 hs_step(HSSystem* sys) {
@@ -840,6 +869,7 @@ u32 hs_step(HSSystem* sys) {
     
     sys->tick++;
     g_tls_in_step = NULL;
+    hs_backpressure_wake(sys);
     hs_unlock(sys);
     return processed;
 }
@@ -917,6 +947,26 @@ void hs_clear(HSSystem* sys) {
     sys->tick = 0;
     sys->payload_head = 0;
     sys->log_overflow = false;
+
+    /* Reset producer lanes and submit queues (no concurrent producers allowed). */
+    atomic_store_explicit(&sys->producer_count, 0, memory_order_relaxed);
+    for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
+        atomic_store_explicit(&sys->producers[i].head.v, 0, memory_order_relaxed);
+        atomic_store_explicit(&sys->producers[i].tail.v, 0, memory_order_relaxed);
+        atomic_store_explicit(&sys->spsc_full_by_prod[i], 0, memory_order_relaxed);
+        atomic_store_explicit(&sys->spsc_ok_by_prod[i], 0, memory_order_relaxed);
+    }
+    atomic_store_explicit(&sys->spsc_full, 0, memory_order_relaxed);
+    atomic_store_explicit(&sys->spsc_ok, 0, memory_order_relaxed);
+    atomic_store_explicit(&sys->mpsc_ok, 0, memory_order_relaxed);
+    atomic_store_explicit(&sys->submit_full, 0, memory_order_relaxed);
+
+    atomic_store_explicit(&sys->submit.enqueue_pos, 0, memory_order_relaxed);
+    atomic_store_explicit(&sys->submit.dequeue_pos, 0, memory_order_relaxed);
+    for (u32 i = 0; i < HS_SUBMIT_SIZE; i++) {
+        atomic_store_explicit(&sys->submit.slots[i].seq, i, memory_order_relaxed);
+        sys->submit.slots[i].payload_len = 0;
+    }
     for (u8 i = 0; i < sys->node_count; i++) {
         mq_init(&sys->nodes[i]->inbox);
         mq_init(&sys->nodes[i]->outbox);

@@ -719,8 +719,12 @@ static void* bench_sender(void* arg) {
             .payload_idx = (u16)(i & 0xFF),
             .payload_len = 0,
         };
-        if (hs_send(a->sys, &m)) a->ok++;
-        else a->fail++;
+        if (hs_send(a->sys, &m)) {
+            a->ok++;
+        } else {
+            if (atomic_load_explicit(a->stop, memory_order_acquire)) break;
+            a->fail++;
+        }
         i++;
     }
     return NULL;
@@ -734,10 +738,16 @@ static u64 ns_now(void) {
 
 static void bench_producers(int threads, int ms) {
     static HSGpu gpu;
-    hs_gpu_init(&gpu);
+    static bool inited = false;
+    if (!inited) {
+        hs_gpu_init(&gpu);
+        inited = true;
+    }
+    hs_clear(&gpu.system);
     gpu.system.validate_on_send = false;
     gpu.system.recording = false;
     gpu.system.render_list = NULL;
+    gpu.system.block_on_full = true;
 
     atomic_bool stop;
     atomic_init(&stop, false);
@@ -760,6 +770,8 @@ static void bench_producers(int threads, int ms) {
     }
 
     atomic_store_explicit(&stop, true, memory_order_release);
+    gpu.system.block_on_full = false;
+    hs_wake_senders(&gpu.system);
     for (int i = 0; i < threads; i++) pthread_join(th[i], NULL);
 
     /* Drain remaining */
@@ -783,6 +795,8 @@ static void bench_producers(int threads, int ms) {
     printf("  %2d thr, %4d ms: %.0f msg/s (ok=%llu fail=%llu) spsc_ok=%u mpsc_ok=%u spsc_full=%u submit_full=%u prod=%u\n",
            threads, ms, mps, (unsigned long long)ok, (unsigned long long)fail,
            (unsigned)spsc_ok, (unsigned)mpsc_ok, (unsigned)spsc_full, (unsigned)submit_full, (unsigned)prod_count);
+
+    TEST("bench_no_fail", fail == 0);
 }
 
 static void bench_comm_layer(void) {
