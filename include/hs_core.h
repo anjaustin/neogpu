@@ -13,6 +13,8 @@
 #include <string.h>
 #include <arm_neon.h>
 
+#include <pthread.h>
+
 typedef struct HSRenderList HSRenderList;
 
 #define HS_MAX_NODES       16
@@ -125,7 +127,13 @@ typedef struct {
     u32         payload_capacity;
     u32         payload_head;
     bool        log_overflow;
+
+    pthread_mutex_t lock;
+    bool            lock_inited;
 } HSSystem;
+
+void hs_lock(HSSystem* sys);
+void hs_unlock(HSSystem* sys);
 
 /* Message flags (Message.flags) */
 #define HS_MSGF_ACK   (1u << 0)  /* request OP_ACK after apply */

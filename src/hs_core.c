@@ -308,7 +308,12 @@ static bool hs_system_has_node(const HSSystem* sys, u8 id) {
 }
 
 bool hs_payload_alloc_and_copy(HSSystem* sys, const void* data, u32 len, u16* out_idx, u32* out_len) {
-    if (!sys || !sys->payloads || sys->payload_capacity == 0) return false;
+    if (!sys) return false;
+    hs_lock(sys);
+    if (!sys->payloads || sys->payload_capacity == 0) {
+        hs_unlock(sys);
+        return false;
+    }
 
     u32 copy_len = len;
     if (copy_len > HS_PAYLOAD_SIZE) copy_len = HS_PAYLOAD_SIZE;
@@ -323,6 +328,7 @@ bool hs_payload_alloc_and_copy(HSSystem* sys, const void* data, u32 len, u16* ou
 
     if (out_idx) *out_idx = (u16)idx;
     if (out_len) *out_len = copy_len;
+    hs_unlock(sys);
     return true;
 }
 
@@ -401,6 +407,16 @@ void mq_init(MessageQueue* q) {
     q->padding = 0;
 }
 
+void hs_lock(HSSystem* sys) {
+    if (!sys || !sys->lock_inited) return;
+    pthread_mutex_lock(&sys->lock);
+}
+
+void hs_unlock(HSSystem* sys) {
+    if (!sys || !sys->lock_inited) return;
+    pthread_mutex_unlock(&sys->lock);
+}
+
 bool mq_push(MessageQueue* q, Message* msg) {
     if (q->count >= HS_QUEUE_SIZE) return false;
     q->msgs[q->tail] = *msg;
@@ -436,6 +452,15 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->validate_on_send = false;
     sys->render_list = NULL;
     sys->log_overflow = false;
+
+    {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&sys->lock, &attr);
+        pthread_mutexattr_destroy(&attr);
+        sys->lock_inited = true;
+    }
 }
 
 void hs_register(HSSystem* sys, Node* node) {
@@ -453,6 +478,7 @@ void hs_capture_init(HSCapture* cap, Message* msg_buf, Payload* payload_buf, u32
 }
 
 bool hs_capture_from_log(const HSSystem* sys, const Message* msgs, u32 count, HSCapture* out) {
+    /* Capturing is read-only but depends on stable payload storage; caller should serialize appropriately. */
     if (!sys || !msgs || !out || !out->msgs || !out->payloads) return false;
     if (count > out->capacity) return false;
     if (!sys->payloads || sys->payload_capacity == 0) return false;
@@ -533,12 +559,14 @@ bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Pa
 }
 
 bool hs_send(HSSystem* sys, Message* msg) {
+    hs_lock(sys);
     msg->tick = sys->tick;
 
     if (sys->validate_on_send) {
         const char* err = NULL;
         if (!hs_validate_message(sys, msg, &err)) {
             hs_report_error_ex(sys, msg, HS_ERR_VALIDATE, HS_ERR_STAGE_SEND, err ? err : "validate failed");
+            hs_unlock(sys);
             return false;
         }
     }
@@ -554,17 +582,20 @@ bool hs_send(HSSystem* sys, Message* msg) {
             if (!pushed) {
                 hs_report_error_ex(sys, msg, HS_ERR_QUEUE_FULL, HS_ERR_STAGE_SEND, "inbox queue full");
                 hs_report_queue_full(sys, msg, msg->to);
+                hs_unlock(sys);
                 return false;
             }
             if (sys->recording) {
                 sys->log[sys->log_head++] = *msg;
             }
             hs_render_record(sys, msg);
+            hs_unlock(sys);
             return true;
         }
     }
 
     hs_report_error_ex(sys, msg, HS_ERR_ROUTE, HS_ERR_STAGE_SEND, "invalid destination node");
+    hs_unlock(sys);
     return false;
 }
 
@@ -578,6 +609,7 @@ bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len
 }
 
 u32 hs_step(HSSystem* sys) {
+    hs_lock(sys);
     u32 processed = 0;
     
     for (u8 i = 0; i < sys->node_count; i++) {
@@ -597,23 +629,33 @@ u32 hs_step(HSSystem* sys) {
     }
     
     sys->tick++;
+    hs_unlock(sys);
     return processed;
 }
 
 void hs_start_recording(HSSystem* sys) {
+    hs_lock(sys);
     sys->recording = true;
+    hs_unlock(sys);
 }
 
 u32 hs_stop_recording(HSSystem* sys) {
+    hs_lock(sys);
     sys->recording = false;
-    return sys->log_head;
+    u32 n = sys->log_head;
+    hs_unlock(sys);
+    return n;
 }
 
 bool hs_has_overflow(HSSystem* sys) {
-    return sys->log_overflow;
+    hs_lock(sys);
+    bool of = sys->log_overflow;
+    hs_unlock(sys);
+    return of;
 }
 
 bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
+    hs_lock(sys);
     for (u8 i = 0; i < sys->node_count; i++) {
         Node* node = sys->nodes[i];
         if (node->reset_fn) {
@@ -632,6 +674,7 @@ bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
             const char* err = NULL;
             if (!hs_validate_message(sys, &msg, &err)) {
                 hs_report_error_ex(sys, &msg, HS_ERR_VALIDATE, HS_ERR_STAGE_REPLAY, err ? err : "validate failed");
+                hs_unlock(sys);
                 return false;
             }
         }
@@ -648,14 +691,17 @@ bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
         }
         if (!found) {
             hs_report_error_ex(sys, &msg, HS_ERR_ROUTE, HS_ERR_STAGE_REPLAY, "invalid destination node");
+            hs_unlock(sys);
             return false;
         }
         sys->tick++;
     }
+    hs_unlock(sys);
     return true;
 }
 
 void hs_clear(HSSystem* sys) {
+    hs_lock(sys);
     sys->log_head = 0;
     sys->tick = 0;
     sys->payload_head = 0;
@@ -667,6 +713,8 @@ void hs_clear(HSSystem* sys) {
             sys->nodes[i]->reset_fn(sys->nodes[i]);
         }
     }
+
+    hs_unlock(sys);
 }
 
 const char* hs_op_name(OpCode op) {
