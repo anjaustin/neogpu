@@ -401,6 +401,17 @@ static void test_message_validation(void) {
     u32 sf = atomic_load_explicit(&gpu.system.submit_full, memory_order_relaxed);
     u32 lf = atomic_load_explicit(&gpu.system.spsc_full, memory_order_relaxed);
     TEST("queue_full_triggered", ok_count < (HS_SUBMIT_SIZE + HS_MAX_PRODUCERS * HS_SPSC_SIZE + 256) && (sf > 0 || lf > 0));
+
+    /* ensure per-producer counters sum to something when SPSC overflow happens */
+    if (lf > 0) {
+        u32 sum = 0;
+        for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
+            sum += atomic_load_explicit(&gpu.system.spsc_full_by_prod[i], memory_order_relaxed);
+        }
+        TEST("queue_full_sharded", sum > 0);
+    } else {
+        TEST("queue_full_sharded", true);
+    }
 }
 
 /* ============================================================
@@ -635,6 +646,52 @@ static void test_thread_safety_payloads(void) {
     SystemState* st = (SystemState*)gpu.system_node.state;
     TEST("payload_sent", total_sent > 0);
     TEST("payload_ack", st->ack_count > 0);
+}
+
+static void test_redteam_overproducers(void) {
+    printf("\n--- Red-Team: Over-Producers ---\n");
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
+    gpu.system.recording = false;
+
+    enum { N = 16 };
+    pthread_t th[N];
+    SenderArgs args[N];
+    atomic_bool stop;
+    atomic_init(&stop, false);
+
+    for (int i = 0; i < N; i++) {
+        args[i].sys = &gpu.system;
+        args[i].stop = &stop;
+        args[i].sent = 0;
+        args[i].failed = 0;
+        int rc = pthread_create(&th[i], NULL, sender_payload_thread, &args[i]);
+        TEST("thread_spawn_over", rc == 0);
+    }
+
+    for (int i = 0; i < 2500; i++) {
+        hs_step(&gpu.system);
+        usleep(200);
+    }
+
+    atomic_store_explicit(&stop, true, memory_order_release);
+    for (int i = 0; i < N; i++) pthread_join(th[i], NULL);
+
+    u32 total_sent = 0;
+    u32 total_failed = 0;
+    for (int i = 0; i < N; i++) {
+        total_sent += args[i].sent;
+        total_failed += args[i].failed;
+    }
+
+    SystemState* st = (SystemState*)gpu.system_node.state;
+
+    TEST("over_sent", total_sent > 0);
+    TEST("over_ack", st->ack_count > 0);
+    /* With >HS_MAX_PRODUCERS, we expect fallbacks; backpressure may or may not occur. */
+    TEST("over_fallback", atomic_load_explicit(&gpu.system.producer_count, memory_order_relaxed) >= HS_MAX_PRODUCERS);
 }
 
 /* ============================================================
@@ -878,6 +935,7 @@ int main(void) {
     test_thread_safety();
     test_thread_safety_many();
     test_thread_safety_payloads();
+    test_redteam_overproducers();
     test_gpu();
 
     printf("\n=== Results: %d passed, %d failed ===\n",

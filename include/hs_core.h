@@ -101,14 +101,21 @@ typedef struct {
 #define HS_SPSC_SIZE       256
 
 typedef struct {
+    atomic_uint v;
+    u8 pad[64 - sizeof(atomic_uint)];
+} __attribute__((aligned(64))) HSAtomicCacheLine;
+
+_Static_assert(sizeof(HSAtomicCacheLine) == 64, "HSAtomicCacheLine is one cache line");
+
+typedef struct {
     Message msg;
     u32 payload_len;
     u8 payload[HS_PAYLOAD_SIZE];
 } __attribute__((aligned(64))) HSSpscSlot;
 
 typedef struct {
-    atomic_uint head;
-    atomic_uint tail;
+    HSAtomicCacheLine head;
+    HSAtomicCacheLine tail;
     HSSpscSlot slots[HS_SPSC_SIZE];
 } HSSpscQueue;
 
@@ -171,6 +178,7 @@ typedef struct {
     atomic_uint submit_full;
 
     atomic_uint spsc_full;
+    atomic_uint spsc_full_by_prod[HS_MAX_PRODUCERS];
 
     atomic_uint producer_count;
     HSSpscQueue producers[HS_MAX_PRODUCERS];

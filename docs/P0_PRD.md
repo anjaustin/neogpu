@@ -16,6 +16,12 @@ Make the messaging layer safe and predictable when used from multiple threads, o
 - The step thread calls `hs_step()`, which drains producer lanes (and the fallback submit queue) and routes messages into node inboxes, and only then processes nodes.
 - Validation/logging/render-recording happen at route time (on the step thread).
 
+## Coherency-Aware Optimizations (P0)
+
+- **Cacheline isolation**: each SPSC lane has `head` and `tail` on separate cache lines to reduce false sharing.
+- **Batch drain**: the step thread drains each SPSC lane in batches (up to 32) and publishes a single `head` update per batch.
+- **Sharded backpressure**: SPSC overflow counters are tracked per producer lane (`spsc_full_by_prod`) to avoid contended global counters.
+
 Concurrency constraints:
 
 - `hs_send()` / `hs_send_with_payload()` are thread-safe.
