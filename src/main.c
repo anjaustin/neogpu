@@ -158,6 +158,16 @@ static int run_tool_mode(int argc, char** argv) {
         }
     }
 
+    if (!do_query_stats && !do_query_fabric && !do_set_mask && !do_set_budget && !do_set_block) {
+        tool_usage(argv ? argv[0] : NULL);
+        return 2;
+    }
+
+    if (loop_ms != 0 && !do_query_stats && !do_query_fabric) {
+        printf("--loop requires at least one query (--query-stats and/or --query-fabric)\n");
+        return 2;
+    }
+
     static HSGpu gpu;
     hs_gpu_init(&gpu);
     gpu.system.validate_on_send = true;
@@ -165,9 +175,10 @@ static int run_tool_mode(int argc, char** argv) {
 
     SystemState* st = (SystemState*)gpu.system_node.state;
 
+    bool setters_done = false;
     for (;;) {
-        /* setters */
-        if (do_set_mask) {
+        /* setters run once (even in loop mode) */
+        if (!setters_done && do_set_mask) {
             u8 p[4];
             hs_pack_set_record_mask(p, new_mask);
             Message m = {.to = NODE_SYSTEM, .from = NODE_CPU, .op = OP_SET_RECORD_MASK, .cid = 1, .channel = CHAN_RT};
@@ -181,7 +192,7 @@ static int run_tool_mode(int argc, char** argv) {
             }
         }
 
-        if (do_set_budget) {
+        if (!setters_done && do_set_budget) {
             u8 p[8];
             hs_pack_set_chan_budget(p, bud_ch, bud_val);
             Message m = {.to = NODE_SYSTEM, .from = NODE_CPU, .op = OP_SET_CHAN_BUDGET, .cid = 2, .channel = CHAN_RT};
@@ -191,11 +202,15 @@ static int run_tool_mode(int argc, char** argv) {
             } else {
                 u32 oldv = 0, newv = 0;
                 (void)hs_unpack_u32x2(gpu.system.payloads[st->last_result_payload_idx].data, st->last_result_len, &oldv, &newv);
-                printf("set-budget: ch=%u %u -> %u\n", (unsigned)bud_ch, (unsigned)oldv, (unsigned)newv);
+                if (oldv == 0xFFFFFFFFu || newv == 0xFFFFFFFFu) {
+                    printf("set-budget: invalid channel %u\n", (unsigned)bud_ch);
+                } else {
+                    printf("set-budget: ch=%u %u -> %u\n", (unsigned)bud_ch, (unsigned)oldv, (unsigned)newv);
+                }
             }
         }
 
-        if (do_set_block) {
+        if (!setters_done && do_set_block) {
             u8 p[2];
             hs_pack_set_block_policy(p, block_ch, block_val);
             Message m = {.to = NODE_SYSTEM, .from = NODE_CPU, .op = OP_SET_BLOCK_POLICY, .cid = 3, .channel = CHAN_RT};
@@ -205,9 +220,15 @@ static int run_tool_mode(int argc, char** argv) {
             } else {
                 u32 oldv = 0, newv = 0;
                 (void)hs_unpack_u32x2(gpu.system.payloads[st->last_result_payload_idx].data, st->last_result_len, &oldv, &newv);
-                printf("set-block: ch=%u %u -> %u\n", (unsigned)block_ch, (unsigned)oldv, (unsigned)newv);
+                if (oldv == 0xFFFFFFFFu || newv == 0xFFFFFFFFu) {
+                    printf("set-block: invalid channel %u\n", (unsigned)block_ch);
+                } else {
+                    printf("set-block: ch=%u %u -> %u\n", (unsigned)block_ch, (unsigned)oldv, (unsigned)newv);
+                }
             }
         }
+
+        setters_done = true;
 
         /* queries */
         if (do_query_stats) {
