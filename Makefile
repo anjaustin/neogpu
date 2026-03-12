@@ -1,7 +1,8 @@
 # NeoGPU build (native aarch64)
 CC = gcc
 CFLAGS = -O3 -march=armv8.2-a+fp16+simd -mtune=cortex-a72 \
-         -ffast-math -funroll-loops -Wall -Wextra -DNDEBUG -Iinclude
+         -ffast-math -funroll-loops -Wall -Wextra -DNDEBUG -Iinclude \
+         -MMD -MP
 LDFLAGS = -lm -lGLESv2 -lgbm -ldrm -lEGL -lpthread
 STRIP = strip
 
@@ -10,6 +11,7 @@ OBJ_DIR = src
 
 HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/main.c
 HS_OBJ = $(HS_SRC:.c=.o)
+HS_DEPS = $(HS_OBJ:.o=.d)
 HS_TARGET = neogpu_demo
 
 TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast
@@ -20,6 +22,8 @@ all: build build-tests
 
 build: $(HS_TARGET)
 
+-include $(HS_DEPS)
+
 $(HS_TARGET): $(HS_OBJ)
 	$(CC) $(HS_OBJ) $(LDFLAGS) -o $@
 	$(STRIP) $@
@@ -28,7 +32,7 @@ $(HS_TARGET): $(HS_OBJ)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(HS_OBJ) $(HS_TARGET) tests/test_
+	rm -f $(HS_OBJ) $(HS_DEPS) $(HS_TARGET) tests/test_
 
 run: $(HS_TARGET)
 	./$(HS_TARGET)

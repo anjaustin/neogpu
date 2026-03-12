@@ -17,6 +17,7 @@ package-lock.json
 pico/
 *.o
 *.a
+*.d
 neogpu_demo
 test_*
 tests/test_
