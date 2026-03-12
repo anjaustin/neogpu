@@ -24,6 +24,20 @@ make build
 make run
 ```
 
+## Tooling Mode
+
+`neogpu_demo` also exposes a small tooling client for querying/tuning the runtime:
+
+```bash
+./neogpu_demo --tool --query-stats --query-fabric
+
+# Set record mask (example: record render+rt)
+./neogpu_demo --tool --set-record-mask 0x00000006 --query-stats
+
+# Set render budget and query
+./neogpu_demo --tool --set-budget 2 8192 --query-stats
+```
+
 ## Building for Different Targets
 
 ### Native ARM (Cortex-A72)

@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
@@ -20,6 +21,221 @@ static int tests_failed = 0;
     if (cond) { tests_passed++; printf("  [PASS] %s\n", name); } \
     else      { tests_failed++; printf("  [FAIL] %s\n", name); } \
 } while(0)
+
+/* ============================================================
+ * Tooling CLI
+ * ============================================================ */
+static void tool_usage(const char* argv0) {
+    printf("NeoGPU tooling mode\n\n");
+    printf("Usage:\n");
+    printf("  %s --tool [commands...]\n\n", argv0 ? argv0 : "neogpu_demo");
+    printf("Commands:\n");
+    printf("  --query-stats                 Query system stats (OP_QUERY_STATS)\n");
+    printf("  --query-fabric                Query fabric counters (OP_QUERY_FABRIC)\n");
+    printf("  --set-record-mask <mask>      Set HSSystem.record_mask (OP_SET_RECORD_MASK)\n");
+    printf("  --set-budget <ch> <budget>    Set chan budget (OP_SET_CHAN_BUDGET)\n");
+    printf("  --set-block <ch> <0|1>        Set block policy (OP_SET_BLOCK_POLICY)\n");
+    printf("  --loop <ms>                   Repeat queries every ms (with queries enabled)\n");
+    printf("\nChannel ids: 1=RT, 2=RENDER, 3=TELEM\n");
+}
+
+static bool tool_wait_for_result(HSSystem* sys, SystemState* st, u32 start, u8 want_op, u32 max_steps) {
+    if (!sys || !st) return false;
+    for (u32 i = 0; i < max_steps; i++) {
+        hs_step(sys);
+        if (st->result_count > start) {
+            if (want_op == 0) return true;
+            return st->last_result_op == want_op;
+        }
+        usleep(1000);
+    }
+    return false;
+}
+
+static void tool_print_stats(HSSystem* sys, SystemState* st) {
+    if (!sys || !st) return;
+    u32 tick = 0, log_head = 0, record_mask = 0, prod = 0, flags = 0;
+    u32 budgets[3] = {0}, dropped[4] = {0};
+    if (!hs_unpack_result_system_stats(sys->payloads[st->last_result_payload_idx].data, st->last_result_len,
+                                       &tick, &log_head, &record_mask, budgets, dropped, &prod, &flags)) {
+        printf("stats: <decode failed>\n");
+        return;
+    }
+
+    printf("stats: tick=%u log_head=%u prod=%u record_mask=0x%08x\n",
+           (unsigned)tick, (unsigned)log_head, (unsigned)prod, (unsigned)record_mask);
+    printf("budgets: rt=%u render=%u telem=%u\n",
+           (unsigned)budgets[0], (unsigned)budgets[1], (unsigned)budgets[2]);
+    printf("dropped: error_ex=%u queue_full=%u system_nonrt=%u result=%u\n",
+           (unsigned)dropped[0], (unsigned)dropped[1], (unsigned)dropped[2], (unsigned)dropped[3]);
+    printf("flags: recording=%u validate=%u block_rt=%u block_render=%u block_telem=%u\n",
+           (unsigned)((flags >> 0) & 1u), (unsigned)((flags >> 1) & 1u),
+           (unsigned)((flags >> 2) & 1u), (unsigned)((flags >> 3) & 1u), (unsigned)((flags >> 4) & 1u));
+}
+
+static void tool_print_fabric(HSSystem* sys, SystemState* st) {
+    if (!sys || !st) return;
+    u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0};
+    u32 prod = 0, waiters = 0;
+    if (!hs_unpack_result_fabric(sys->payloads[st->last_result_payload_idx].data, st->last_result_len,
+                                 spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, &prod, &waiters)) {
+        printf("fabric: <decode failed>\n");
+        return;
+    }
+
+    printf("fabric: prod=%u waiters=%u\n", (unsigned)prod, (unsigned)waiters);
+    printf("spsc_ok:    rt=%u render=%u telem=%u\n", (unsigned)spsc_ok3[0], (unsigned)spsc_ok3[1], (unsigned)spsc_ok3[2]);
+    printf("spsc_full:  rt=%u render=%u telem=%u\n", (unsigned)spsc_full3[0], (unsigned)spsc_full3[1], (unsigned)spsc_full3[2]);
+    printf("mpsc_ok:    rt=%u render=%u telem=%u\n", (unsigned)mpsc_ok3[0], (unsigned)mpsc_ok3[1], (unsigned)mpsc_ok3[2]);
+    printf("submit_full:rt=%u render=%u telem=%u\n", (unsigned)submit_full3[0], (unsigned)submit_full3[1], (unsigned)submit_full3[2]);
+}
+
+static int run_tool_mode(int argc, char** argv) {
+    if (argc <= 1) {
+        tool_usage(argv ? argv[0] : NULL);
+        return 2;
+    }
+
+    bool do_query_stats = false;
+    bool do_query_fabric = false;
+    bool do_set_mask = false;
+    bool do_set_budget = false;
+    bool do_set_block = false;
+    u32 loop_ms = 0;
+
+    u32 new_mask = 0;
+    u8 bud_ch = 0;
+    u32 bud_val = 0;
+    u8 block_ch = 0;
+    u8 block_val = 0;
+
+    for (int i = 1; i < argc; i++) {
+        const char* a = argv[i];
+        if (!a) continue;
+
+        if (strcmp(a, "--tool") == 0) {
+            continue;
+        } else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
+            tool_usage(argv ? argv[0] : NULL);
+            return 0;
+        } else if (strcmp(a, "--query-stats") == 0) {
+            do_query_stats = true;
+        } else if (strcmp(a, "--query-fabric") == 0) {
+            do_query_fabric = true;
+        } else if (strcmp(a, "--set-record-mask") == 0) {
+            if (i + 1 >= argc) {
+                printf("missing value for --set-record-mask\n");
+                return 2;
+            }
+            new_mask = (u32)strtoul(argv[++i], NULL, 0);
+            do_set_mask = true;
+        } else if (strcmp(a, "--set-budget") == 0) {
+            if (i + 2 >= argc) {
+                printf("missing values for --set-budget\n");
+                return 2;
+            }
+            bud_ch = (u8)strtoul(argv[++i], NULL, 0);
+            bud_val = (u32)strtoul(argv[++i], NULL, 0);
+            do_set_budget = true;
+        } else if (strcmp(a, "--set-block") == 0) {
+            if (i + 2 >= argc) {
+                printf("missing values for --set-block\n");
+                return 2;
+            }
+            block_ch = (u8)strtoul(argv[++i], NULL, 0);
+            block_val = (u8)strtoul(argv[++i], NULL, 0);
+            do_set_block = true;
+        } else if (strcmp(a, "--loop") == 0) {
+            if (i + 1 >= argc) {
+                printf("missing value for --loop\n");
+                return 2;
+            }
+            loop_ms = (u32)strtoul(argv[++i], NULL, 0);
+        } else {
+            printf("unknown arg: %s\n", a);
+            tool_usage(argv ? argv[0] : NULL);
+            return 2;
+        }
+    }
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
+    gpu.system.recording = false;
+
+    SystemState* st = (SystemState*)gpu.system_node.state;
+
+    for (;;) {
+        /* setters */
+        if (do_set_mask) {
+            u8 p[4];
+            hs_pack_set_record_mask(p, new_mask);
+            Message m = {.to = NODE_SYSTEM, .from = NODE_CPU, .op = OP_SET_RECORD_MASK, .cid = 1, .channel = CHAN_RT};
+            u32 start = st->result_count;
+            if (!hs_send_with_payload(&gpu.system, &m, p, sizeof(p)) || !tool_wait_for_result(&gpu.system, st, start, OP_SET_RECORD_MASK, 2000)) {
+                printf("set-record-mask: failed\n");
+            } else {
+                u32 oldv = 0, newv = 0;
+                (void)hs_unpack_u32x2(gpu.system.payloads[st->last_result_payload_idx].data, st->last_result_len, &oldv, &newv);
+                printf("set-record-mask: 0x%08x -> 0x%08x\n", (unsigned)oldv, (unsigned)newv);
+            }
+        }
+
+        if (do_set_budget) {
+            u8 p[8];
+            hs_pack_set_chan_budget(p, bud_ch, bud_val);
+            Message m = {.to = NODE_SYSTEM, .from = NODE_CPU, .op = OP_SET_CHAN_BUDGET, .cid = 2, .channel = CHAN_RT};
+            u32 start = st->result_count;
+            if (!hs_send_with_payload(&gpu.system, &m, p, sizeof(p)) || !tool_wait_for_result(&gpu.system, st, start, OP_SET_CHAN_BUDGET, 2000)) {
+                printf("set-budget: failed\n");
+            } else {
+                u32 oldv = 0, newv = 0;
+                (void)hs_unpack_u32x2(gpu.system.payloads[st->last_result_payload_idx].data, st->last_result_len, &oldv, &newv);
+                printf("set-budget: ch=%u %u -> %u\n", (unsigned)bud_ch, (unsigned)oldv, (unsigned)newv);
+            }
+        }
+
+        if (do_set_block) {
+            u8 p[2];
+            hs_pack_set_block_policy(p, block_ch, block_val);
+            Message m = {.to = NODE_SYSTEM, .from = NODE_CPU, .op = OP_SET_BLOCK_POLICY, .cid = 3, .channel = CHAN_RT};
+            u32 start = st->result_count;
+            if (!hs_send_with_payload(&gpu.system, &m, p, sizeof(p)) || !tool_wait_for_result(&gpu.system, st, start, OP_SET_BLOCK_POLICY, 2000)) {
+                printf("set-block: failed\n");
+            } else {
+                u32 oldv = 0, newv = 0;
+                (void)hs_unpack_u32x2(gpu.system.payloads[st->last_result_payload_idx].data, st->last_result_len, &oldv, &newv);
+                printf("set-block: ch=%u %u -> %u\n", (unsigned)block_ch, (unsigned)oldv, (unsigned)newv);
+            }
+        }
+
+        /* queries */
+        if (do_query_stats) {
+            Message q = {.to = NODE_SYSTEM, .from = NODE_CPU, .op = OP_QUERY_STATS, .cid = 10, .channel = CHAN_DEFAULT};
+            u32 start = st->result_count;
+            if (!hs_send(&gpu.system, &q) || !tool_wait_for_result(&gpu.system, st, start, OP_QUERY_STATS, 2000)) {
+                printf("query-stats: failed\n");
+            } else {
+                tool_print_stats(&gpu.system, st);
+            }
+        }
+
+        if (do_query_fabric) {
+            Message q = {.to = NODE_SYSTEM, .from = NODE_CPU, .op = OP_QUERY_FABRIC, .cid = 11, .channel = CHAN_DEFAULT};
+            u32 start = st->result_count;
+            if (!hs_send(&gpu.system, &q) || !tool_wait_for_result(&gpu.system, st, start, OP_QUERY_FABRIC, 2000)) {
+                printf("query-fabric: failed\n");
+            } else {
+                tool_print_fabric(&gpu.system, st);
+            }
+        }
+
+        if (loop_ms == 0) break;
+        usleep(loop_ms * 1000);
+    }
+
+    return 0;
+}
 
 /* ============================================================
  * Math library tests
@@ -1359,7 +1575,12 @@ static void benchmark_buffer(void) {
 /* ============================================================
  * Main
  * ============================================================ */
-int main(void) {
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] && strcmp(argv[i], "--tool") == 0) {
+            return run_tool_mode(argc, argv);
+        }
+    }
     printf("=== HS-GPU NEON Test Suite ===\n");
 
     test_math();
