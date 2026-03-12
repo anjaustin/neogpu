@@ -12,23 +12,48 @@
 | Component | Status | Details |
 |-----------|--------|---------|
 | Message Queue | ✅ | 1M+ ops/sec, 256 slots, 64B aligned |
-| NEON Math | ✅ | vec4, mat4, splines (Bezier, Catmull-Rom, Hermite) |
-| GLES3/DRM | ✅ | Full initialization, 16 texture slots |
+| NEON Math | ✅ | vec4, mat4, splines (Bezier2/Bezier3, Catmull-Rom, Hermite) |
+| GLES3/DRM Backend | ✅ | DRM/GBM/EGL init + basic helpers; used by graphics tests |
 | Storage | ✅ | 16 slots × 256B, file I/O |
-| Audio Buffers | ✅ | 4 channels @ 48KHz |
-| Graphics Tests | ✅ | 6 tests (triangle, cube, raycast @ 270 FPS) |
+| Audio Buffers | ✅ | 4 channels @ 48KHz (buffer generation only) |
+| Graphics Tests | ✅ | 6 direct-GLES tests (triangle, cube, raycast @ ~270 FPS on Pi4) |
 
 ### ⚠️ Stub / Incomplete
 | Component | Status | Gap |
 |-----------|--------|-----|
-| Mesh Renderer | Stub | No vertex/fragment shaders in core |
-| Text Rendering | Stub | drawText just logs, no font rasterization |
-| Audio Playback | Stub | Buffers exist, no ALSA/PulseAudio |
-| Input Polling | Stub | Structs exist, no evdev/SDL2 |
-| Window System | Stub | DRM direct, no SDL2/GLFW |
+| Message → Backend Execution | Stub | Nodes mostly track state/log; not yet issuing real GLES draws via the message stream |
+| Async Ops (Threading) | Stub | Background task queue exists (`hs_async`); task ownership/results and real work paths need completion |
+| Mesh Renderer | Stub | No mesh data path + built-in shaders wired through message layer |
+| Text Rendering | Stub | `hs_gpu_draw_text` logs only; no font load/raster/atlas |
+| Audio Playback | Stub | Buffers exist; no ALSA/PulseAudio output device |
+| Input Polling | Stub | `HSInput` exists; no evdev/SDL2 polling implementation |
+| Window System (Desktop) | Stub | DRM path exists; no SDL2/GLFW window/context path |
 | Game Loop | Missing | No standard update/render loop |
 
 ## 3. Requirements
+
+### 3.0 Core Hardening (Priority: HIGH)
+
+**Description:** Stabilize the message ABI, payload rules, recording/replay, and backend boundaries so engine features (mesh, text, audio out, real input) can be built without breaking determinism or portability.
+
+**Requirements:**
+- **Message ABI spec**: define destination node, argument encoding, payload layout/size, and valid ranges for every opcode.
+- **Typed pack/unpack helpers** for all opcodes to avoid ad-hoc byte packing.
+- **Unified payload allocation**: a single allocator/copy path used by all message producers; explicit per-op truncation/validation behavior.
+- **Safe recording/replay**: capture mode deep-copies payload bytes so replay is self-contained; replay validates message stream (opcode, payload length, destination).
+- **Backend boundary**: define a backend interface that consumes decoded node state / render intent; keep nodes as “decode + state update”, keep platform calls in the backend.
+- **System op routing**: define a consistent home for `OP_ERROR`, `OP_TRACE`, `OP_STOP` (system node or system logging facility).
+- **Validation + tests**: debug-time validator + unit tests for pack/unpack + replay determinism + malformed message rejection.
+
+**Technical Approach:**
+```c
+// Examples (names TBD)
+bool hs_validate_message(const HSSystem* sys, const Message* msg);
+bool hs_payload_alloc_and_copy(HSSystem* sys, const void* data, u32 len, u16* out_idx, u32* out_len);
+
+// Backend interface (interface only)
+typedef struct HSBackend HSBackend;
+```
 
 ### 3.1 Mesh Renderer (Priority: HIGH)
 
@@ -197,6 +222,16 @@ void hs_window_poll(HSWindow* win);
 
 ## 5. Milestones
 
+### Milestone 0: Core Hardening
+- [ ] Add `docs/MESSAGE_ABI.md` (per-op schema + ranges)
+- [ ] Add opcode pack/unpack helpers (single source of truth)
+- [ ] Add debug-time message validator (send/receive)
+- [ ] Implement self-contained capture (deep-copy payload bytes)
+- [ ] Implement replay validation (schema + destination)
+- [ ] Define `include/hs_backend.h` backend interface
+- [ ] Resolve routing for `OP_ERROR`, `OP_TRACE`, `OP_STOP`
+- [ ] Add tests: pack/unpack round-trip + replay determinism + validator rejection
+
 ### Milestone 1: Mesh Renderer
 - [ ] Add `hs_mesh.h` with mesh structures
 - [ ] Add built-in vertex shader (MVP)
@@ -230,6 +265,10 @@ void hs_window_poll(HSWindow* win);
 ## 6. Success Criteria
 
 - [ ] 270+ FPS on Pi4 (existing benchmark)
+- [ ] Replay is self-contained (no dependence on transient payload lifetime)
+- [ ] All opcodes have an explicit, tested payload schema
+- [ ] Debug builds catch malformed messages with clear errors
+- [ ] Backend can be swapped without changing message ABI
 - [ ] Render 3D mesh with texture
 - [ ] Display text at 60 FPS
 - [ ] Play 4-channel audio simultaneously
@@ -247,5 +286,5 @@ void hs_window_poll(HSWindow* win);
 ---
 
 **Author:** NeoGPU Team  
-**Version:** 1.0  
-**Date:** 2026-03-11
+**Version:** 1.1  
+**Date:** 2026-03-12

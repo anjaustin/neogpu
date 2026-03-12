@@ -1,4 +1,5 @@
 #include "hs_gpu.h"
+#include "hs_msg.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -11,18 +12,21 @@ void hs_gpu_init(HSGpu* gpu) {
     gpu->texture_node.id = NODE_TEXTURE;
     gpu->output_node.id = NODE_OUTPUT;
     gpu->sound_node.id = NODE_SOUND;
+    gpu->system_node.id = NODE_SYSTEM;
     
     shader_node_init(&gpu->shader_node);
     buffer_node_init(&gpu->buffer_node);
     texture_node_init(&gpu->texture_node);
     output_node_init(&gpu->output_node);
     sound_node_init(&gpu->sound_node);
+    system_node_init(&gpu->system_node);
     
     hs_register(&gpu->system, &gpu->shader_node);
     hs_register(&gpu->system, &gpu->buffer_node);
     hs_register(&gpu->system, &gpu->texture_node);
     hs_register(&gpu->system, &gpu->output_node);
     hs_register(&gpu->system, &gpu->sound_node);
+    hs_register(&gpu->system, &gpu->system_node);
 }
 
 static void hs_gpu_send_simple(HSGpu* gpu, u8 to, OpCode op, u32 payload_idx, u32 payload_len) {
@@ -62,17 +66,9 @@ void hs_gpu_set_shader(HSGpu* gpu, u8 shader) {
 }
 
 void hs_gpu_set_param(HSGpu* gpu, u8 idx, vec4 value) {
-    /* Layout: [u32 param_idx][f32 x][f32 y][f32 z][f32 w] = 20 bytes, 4-byte aligned */
     u8 data[20];
-    u32 pidx = idx;
-    memcpy(&data[0], &pidx, 4);
-    f32 arr[4];
-    arr[0] = vgetq_lane_f32(value, 0);
-    arr[1] = vgetq_lane_f32(value, 1);
-    arr[2] = vgetq_lane_f32(value, 2);
-    arr[3] = vgetq_lane_f32(value, 3);
-    memcpy(&data[4], arr, 16);
-    hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_SET_PARAM, data, 20);
+    hs_pack_set_param(data, (u32)idx, value);
+    hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_SET_PARAM, data, sizeof(data));
 }
 
 void hs_gpu_set_global(HSGpu* gpu, u8 idx, mat4 value) {
@@ -113,8 +109,9 @@ void hs_gpu_cull(HSGpu* gpu, u8 mode) {
 }
 
 void hs_gpu_blend(HSGpu* gpu, u8 src, u8 dst) {
-    u8 data[2] = {src, dst};
-    hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_BLEND, data, 2);
+    u8 data[2];
+    hs_pack_u8x2(data, src, dst);
+    hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_BLEND, data, sizeof(data));
 }
 
 void hs_gpu_alpha(HSGpu* gpu, bool enable) {
@@ -130,23 +127,27 @@ void hs_gpu_color_mask(HSGpu* gpu, u8 mask) {
 }
 
 void hs_gpu_clip(HSGpu* gpu, u16 x, u16 y, u16 w, u16 h) {
-    u16 data[4] = {x, y, w, h};
+    u8 data[8];
+    hs_pack_u16x4(data, x, y, w, h);
     hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_CLIP, data, sizeof(data));
 }
 
 void hs_gpu_stencil(HSGpu* gpu, u8 op, u8 fail, u8 pass, u8 front) {
-    u8 data[4] = {op, fail, pass, front};
-    hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_STENCIL, data, 4);
+    u8 data[4];
+    hs_pack_stencil(data, op, fail, pass, front);
+    hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_STENCIL, data, sizeof(data));
 }
 
 void hs_gpu_stencil_func(HSGpu* gpu, u8 compare, u8 ref, u8 read_mask, u8 write_mask) {
-    u8 data[4] = {compare, ref, read_mask, write_mask};
-    hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_STENCIL_FUNC, data, 4);
+    u8 data[4];
+    hs_pack_stencil_func(data, compare, ref, read_mask, write_mask);
+    hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_STENCIL_FUNC, data, sizeof(data));
 }
 
 void hs_gpu_depth_compare(HSGpu* gpu, u8 compare, bool write) {
-    u8 data[2] = {compare, write ? 1 : 0};
-    hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_DEPTH_COMPARE, data, 2);
+    u8 data[2];
+    hs_pack_depth_compare(data, compare, write);
+    hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_DEPTH_COMPARE, data, sizeof(data));
 }
 
 void hs_gpu_load_buffer(HSGpu* gpu, u8 index) {
@@ -158,8 +159,9 @@ void hs_gpu_draw(HSGpu* gpu, u8 buffer) {
 }
 
 void hs_gpu_draw_instance(HSGpu* gpu, u8 buffer, u8 instance_buffer, u32 count) {
-    u8 data[4] = {buffer, instance_buffer, (count >> 0) & 0xFF, (count >> 8) & 0xFF};
-    hs_gpu_send_with_payload(gpu, NODE_BUFFER, OP_DRAW_INSTANCE, data, 4);
+    u8 data[4];
+    hs_pack_draw_instance(data, buffer, instance_buffer, count);
+    hs_gpu_send_with_payload(gpu, NODE_BUFFER, OP_DRAW_INSTANCE, data, sizeof(data));
 }
 
 void hs_gpu_draw_text(HSGpu* gpu, const char* text) {
@@ -176,8 +178,9 @@ void hs_gpu_load_texture(HSGpu* gpu, u8 index) {
 }
 
 void hs_gpu_set_target(HSGpu* gpu, u8 texture, u8 depth_buffer) {
-    u8 data[2] = {texture, depth_buffer};
-    hs_gpu_send_with_payload(gpu, NODE_TEXTURE, OP_SET_TARGET, data, 2);
+    u8 data[2];
+    hs_pack_u8x2(data, texture, depth_buffer);
+    hs_gpu_send_with_payload(gpu, NODE_TEXTURE, OP_SET_TARGET, data, sizeof(data));
 }
 
 void hs_gpu_show_texture(HSGpu* gpu, u8 texture) {
@@ -200,15 +203,14 @@ void hs_gpu_clear(HSGpu* gpu, vec4 color) {
 
 void hs_gpu_clear_ds(HSGpu* gpu, f32 depth, u8 stencil) {
     u8 data[8];
-    memcpy(data, &depth, 4);
-    data[4] = stencil;
-    data[5] = 0; data[6] = 0; data[7] = 0;
-    hs_gpu_send_with_payload(gpu, NODE_OUTPUT, OP_CLEAR_DS, data, 8);
+    hs_pack_clear_ds(data, depth, stencil);
+    hs_gpu_send_with_payload(gpu, NODE_OUTPUT, OP_CLEAR_DS, data, sizeof(data));
 }
 
 void hs_gpu_set_channel(HSGpu* gpu, u8 channel, u8 shader) {
-    u8 data[2] = {channel, shader};
-    hs_gpu_send_with_payload(gpu, NODE_SOUND, OP_SET_CHANNEL, data, 2);
+    u8 data[2];
+    hs_pack_u8x2(data, channel, shader);
+    hs_gpu_send_with_payload(gpu, NODE_SOUND, OP_SET_CHANNEL, data, sizeof(data));
 }
 
 u32 hs_gpu_process(HSGpu* gpu) {
@@ -245,15 +247,15 @@ bool hs_gpu_has_overflow(HSGpu* gpu) {
 }
 
 void hs_gpu_error(HSGpu* gpu, const char* msg) {
-    hs_gpu_send_with_payload(gpu, NODE_CPU, OP_ERROR, (const u8*)msg, strlen(msg) + 1);
+    hs_gpu_send_with_payload(gpu, NODE_SYSTEM, OP_ERROR, (const u8*)msg, strlen(msg) + 1);
 }
 
 void hs_gpu_trace(HSGpu* gpu, const char* msg) {
-    hs_gpu_send_with_payload(gpu, NODE_CPU, OP_TRACE, (const u8*)msg, strlen(msg) + 1);
+    hs_gpu_send_with_payload(gpu, NODE_SYSTEM, OP_TRACE, (const u8*)msg, strlen(msg) + 1);
 }
 
 void hs_gpu_stop(HSGpu* gpu) {
-    hs_gpu_send_simple(gpu, NODE_CPU, OP_STOP, 0, 0);
+    hs_gpu_send_simple(gpu, NODE_SYSTEM, OP_STOP, 0, 0);
 }
 
 void hs_gpu_begin_frame(HSGpu* gpu) {

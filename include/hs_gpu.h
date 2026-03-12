@@ -14,6 +14,7 @@ typedef struct {
     Node        texture_node;
     Node        output_node;
     Node        sound_node;
+    Node        system_node;
 } HSGpu;
 
 void hs_gpu_init(HSGpu* gpu);

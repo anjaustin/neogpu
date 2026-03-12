@@ -134,4 +134,7 @@ bool hs_has_overflow(HSSystem* sys);
 
 const char* hs_op_name(OpCode op);
 
+/* Debug/validation helper: validates message schema and routing. */
+bool hs_validate_message(const HSSystem* sys, const Message* msg, const char** out_err);
+
 #endif

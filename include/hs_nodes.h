@@ -10,6 +10,7 @@
 #define NODE_TEXTURE 3
 #define NODE_OUTPUT  4
 #define NODE_SOUND   5
+#define NODE_SYSTEM  6
 
 typedef struct {
     u8   current_shader;
@@ -66,23 +67,30 @@ typedef struct {
     u8 channel_shaders[4];
 } SoundState;
 
+typedef struct {
+    u8 stopped;
+} SystemState;
+
 int shader_node_process(Node* node);
 int buffer_node_process(Node* node);
 int texture_node_process(Node* node);
 int output_node_process(Node* node);
 int sound_node_process(Node* node);
+int system_node_process(Node* node);
 
 void shader_node_init(Node* node);
 void buffer_node_init(Node* node);
 void texture_node_init(Node* node);
 void output_node_init(Node* node);
 void sound_node_init(Node* node);
+void system_node_init(Node* node);
 
 void shader_node_reset(Node* node);
 void buffer_node_reset(Node* node);
 void texture_node_reset(Node* node);
 void output_node_reset(Node* node);
 void sound_node_reset(Node* node);
+void system_node_reset(Node* node);
 
 void hs_nodes_set_system(HSSystem* sys);
 const char* node_name(u8 id);

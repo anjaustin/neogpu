@@ -2,6 +2,137 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+static bool hs_system_has_node(const HSSystem* sys, u8 id) {
+    if (!sys) return false;
+    for (u8 i = 0; i < sys->node_count; i++) {
+        if (sys->nodes[i] && sys->nodes[i]->id == id) return true;
+    }
+    return false;
+}
+
+bool hs_validate_message(const HSSystem* sys, const Message* msg, const char** out_err) {
+    const char* err = NULL;
+    if (!sys || !msg) {
+        err = "null sys/msg";
+        if (out_err) *out_err = err;
+        return false;
+    }
+
+    if (msg->op >= OP_COUNT) {
+        err = "invalid opcode";
+        if (out_err) *out_err = err;
+        return false;
+    }
+
+    if (!hs_system_has_node(sys, msg->to)) {
+        err = "invalid destination node";
+        if (out_err) *out_err = err;
+        return false;
+    }
+
+    /* Per-op payload length checks based on current ABI. */
+    switch ((OpCode)msg->op) {
+        case OP_NOOP:
+        case OP_SET_SHADER:
+        case OP_CULL:
+        case OP_ALPHA:
+        case OP_DEPTH:
+        case OP_COLOR_MASK:
+        case OP_LOAD_BUFFER:
+        case OP_DRAW:
+        case OP_LOAD_TEXTURE:
+        case OP_SHOW_TEXTURE:
+        case OP_TEXTURE_FILTER:
+        case OP_TEXTURE_WRAP:
+        case OP_STOP:
+            if (msg->payload_len != 0) {
+                err = "unexpected payload";
+                break;
+            }
+            break;
+
+        case OP_SET_PARAM:
+            if (msg->payload_len != 20) err = "bad payload len";
+            break;
+
+        case OP_SET_GLOBAL:
+        case OP_SET_CAMERA:
+            if (msg->payload_len != 64) err = "bad payload len";
+            break;
+
+        case OP_BLEND:
+        case OP_SET_TARGET:
+        case OP_SET_CHANNEL:
+        case OP_DEPTH_COMPARE:
+            if (msg->payload_len != 2) err = "bad payload len";
+            break;
+
+        case OP_CLIP:
+            if (msg->payload_len != 8) err = "bad payload len";
+            break;
+
+        case OP_STENCIL:
+        case OP_STENCIL_FUNC:
+        case OP_DRAW_INSTANCE:
+            if (msg->payload_len != 4) err = "bad payload len";
+            break;
+
+        case OP_CLEAR:
+            if (msg->payload_len != 16) err = "bad payload len";
+            break;
+
+        case OP_CLEAR_DS:
+            if (msg->payload_len != 8) err = "bad payload len";
+            break;
+
+        case OP_DRAW_TEXT:
+        case OP_ERROR:
+        case OP_TRACE:
+            if (msg->payload_len == 0 || msg->payload_len > HS_PAYLOAD_SIZE) {
+                err = "bad payload len";
+                break;
+            }
+            /* Expect a null-terminated string (best-effort check). */
+            if (!sys->payloads) {
+                err = "null payload buffer";
+                break;
+            }
+            if (msg->payload_idx >= HS_MAX_PAYLOADS) {
+                err = "invalid payload index";
+                break;
+            }
+            if (sys->payloads[msg->payload_idx].data[msg->payload_len - 1] != 0) {
+                err = "string not terminated";
+                break;
+            }
+            break;
+
+        case OP_COUNT:
+            err = "invalid opcode";
+            break;
+    }
+
+    if (err) {
+        if (out_err) *out_err = err;
+        return false;
+    }
+
+    /* For payload-bearing ops, validate payload_idx range. */
+    if (msg->payload_len != 0) {
+        if (!sys->payloads) {
+            if (out_err) *out_err = "null payload buffer";
+            return false;
+        }
+        if (msg->payload_idx >= HS_MAX_PAYLOADS) {
+            if (out_err) *out_err = "invalid payload index";
+            return false;
+        }
+    }
+
+    if (out_err) *out_err = NULL;
+    return true;
+}
+
 void mq_init(MessageQueue* q) {
     q->head = 0;
     q->tail = 0;
@@ -61,6 +192,17 @@ static u32 allocate_payload(HSSystem* sys, const void* data, u32 len) {
 
 bool hs_send(HSSystem* sys, Message* msg) {
     msg->tick = sys->tick;
+
+#ifndef NDEBUG
+    {
+        const char* err = NULL;
+        if (!hs_validate_message(sys, msg, &err)) {
+            fprintf(stderr, "[HS] SEND REJECTED: op=%s to=%u err=%s\n",
+                    hs_op_name((OpCode)msg->op), (unsigned)msg->to, err ? err : "unknown");
+            return false;
+        }
+    }
+#endif
     
     if (sys->recording) {
         if (sys->log_head >= sys->log_capacity) {
@@ -135,6 +277,17 @@ bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
     for (u32 i = 0; i < count; i++) {
         Message msg = msgs[i];
         msg.tick = sys->tick;
+
+#ifndef NDEBUG
+        {
+            const char* err = NULL;
+            if (!hs_validate_message(sys, &msg, &err)) {
+                fprintf(stderr, "[HS] REPLAY REJECTED: i=%u op=%s to=%u err=%s\n",
+                        (unsigned)i, hs_op_name((OpCode)msg.op), (unsigned)msg.to, err ? err : "unknown");
+                return false;
+            }
+        }
+#endif
         
         bool found = false;
         for (u8 j = 0; j < sys->node_count; j++) {

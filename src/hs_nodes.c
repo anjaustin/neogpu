@@ -17,6 +17,7 @@ static BufferState buffer_state;
 static TextureState texture_state;
 static OutputState output_state;
 static SoundState sound_state;
+static SystemState system_state;
 
 static HSSystem* g_sys = NULL;
 
@@ -37,6 +38,7 @@ const char* node_name(u8 id) {
         case NODE_TEXTURE: return "Texture";
         case NODE_OUTPUT: return "Output";
         case NODE_SOUND:  return "Sound";
+        case NODE_SYSTEM: return "System";
         default:          return "Unknown";
     }
 }
@@ -334,27 +336,7 @@ int texture_node_process(Node* node) {
                 DBG_PRINT("[%s] Texture #%d wrap: %s\n", node_name(node->id), tex_idx, wrap ? "repeat" : "clamp");
                 break;
             }
-                
-            case OP_ERROR: {
-                void* data = get_payload(msg.payload_idx);
-                if (data) {
-                    DBG_PRINT("[ERROR] %s\n", (char*)data);
-                }
-                break;
-            }
-                
-            case OP_TRACE: {
-                void* data = get_payload(msg.payload_idx);
-                if (data) {
-                    DBG_PRINT("[TRACE] %s\n", (char*)data);
-                }
-                break;
-            }
-                
-            case OP_STOP:
-                DBG_PRINT("[System] STOP command received\n");
-                break;
-                
+                 
             default:
                 break;
         }
@@ -463,5 +445,53 @@ int sound_node_process(Node* node) {
         processed++;
     }
     
+    return processed;
+}
+
+void system_node_init(Node* node) {
+    memset(&system_state, 0, sizeof(SystemState));
+    node->state = &system_state;
+    node->process_fn = system_node_process;
+    node->reset_fn = system_node_reset;
+}
+
+void system_node_reset(Node* node) {
+    (void)node;
+    memset(&system_state, 0, sizeof(SystemState));
+}
+
+int system_node_process(Node* node) {
+    int processed = 0;
+    Message msg;
+
+    while (mq_pop(&node->inbox, &msg)) {
+        switch (msg.op) {
+            case OP_ERROR: {
+                void* data = get_payload(msg.payload_idx);
+                if (data) {
+                    fprintf(stderr, "[ERROR] %s\n", (char*)data);
+                }
+                break;
+            }
+
+            case OP_TRACE: {
+                void* data = get_payload(msg.payload_idx);
+                if (data) {
+                    printf("[TRACE] %s\n", (char*)data);
+                }
+                break;
+            }
+
+            case OP_STOP:
+                system_state.stopped = 1;
+                DBG_PRINT("[%s] STOP command received\n", node_name(node->id));
+                break;
+
+            default:
+                break;
+        }
+        processed++;
+    }
+
     return processed;
 }
