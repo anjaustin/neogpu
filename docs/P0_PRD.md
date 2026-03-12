@@ -9,6 +9,10 @@
 
 Make the messaging layer safe and predictable when used from multiple threads, or fail fast with explicit rules. This P0 focuses on correctness first; performance tuning comes after.
 
+## P0 Extension: Channelized Fabric
+
+See `docs/CHANNEL_FABRIC.md`.
+
 ## Current Model (After P0)
 
 - Producers call `hs_send()` / `hs_send_with_payload()` from any thread.

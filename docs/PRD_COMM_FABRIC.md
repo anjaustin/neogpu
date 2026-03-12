@@ -12,6 +12,8 @@ NeoGPU’s message layer is the engine spine: it routes commands, enables captur
 
 This PRD defines a set of communication features that improve correctness, determinism, observability, and portability without sacrificing the project’s performance goals.
 
+Channelization spec: `docs/CHANNEL_FABRIC.md`.
+
 ## 2. Goals
 
 - Provide a standard mechanism for acknowledgements and results (success/failure + optional data).
@@ -98,6 +100,8 @@ This PRD defines a set of communication features that improve correctness, deter
 - Add either:
   - multiple queues (priority tiers), or
   - a priority field in `Message` and multi-pass processing order.
+
+See also: `docs/lmm/channel_fabric_synthesize.md` (LMM synthesis for channelized fabric).
 
 ### 4.7 Introspection and Query Ops (Priority: LOW)
 
