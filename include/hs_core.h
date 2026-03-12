@@ -186,18 +186,21 @@ typedef struct {
     u32 dropped_error_ex;
     u32 dropped_queue_full;
 
-    HSSubmitQueue submit;
-    atomic_uint submit_full;
+    HSSubmitQueue submit[CHAN_COUNT];
+    atomic_uint submit_full[CHAN_COUNT];
 
-    atomic_uint spsc_full;
-    atomic_uint spsc_full_by_prod[HS_MAX_PRODUCERS];
+    atomic_uint spsc_full[CHAN_COUNT];
+    atomic_uint spsc_full_by_prod[CHAN_COUNT][HS_MAX_PRODUCERS];
 
-    atomic_uint spsc_ok;
-    atomic_uint spsc_ok_by_prod[HS_MAX_PRODUCERS];
-    atomic_uint mpsc_ok;
+    atomic_uint spsc_ok[CHAN_COUNT];
+    atomic_uint spsc_ok_by_prod[CHAN_COUNT][HS_MAX_PRODUCERS];
+    atomic_uint mpsc_ok[CHAN_COUNT];
 
     atomic_uint producer_count;
-    HSSpscQueue producers[HS_MAX_PRODUCERS];
+    HSSpscQueue producers[CHAN_COUNT][HS_MAX_PRODUCERS];
+
+    /* Channel policies */
+    bool block_on_full_chan[CHAN_COUNT];
 
     pthread_mutex_t bp_lock;
     pthread_cond_t  bp_cv;

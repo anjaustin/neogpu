@@ -384,6 +384,9 @@ static void test_message_validation(void) {
 
     /* Backpressure: overflow submit/producer queues without stepping */
     gpu.system.recording = false;
+    gpu.system.block_on_full = false;
+    gpu.system.block_on_full_chan[CHAN_RENDER] = false;
+    gpu.system.block_on_full_chan[CHAN_RT] = false;
     u32 ok_count = 0;
     for (u32 i = 0; i < (HS_SUBMIT_SIZE + HS_MAX_PRODUCERS * HS_SPSC_SIZE + 256); i++) {
         Message spam = {
@@ -399,15 +402,15 @@ static void test_message_validation(void) {
         if (hs_send(&gpu.system, &spam)) ok_count++;
     }
     hs_step(&gpu.system);
-    u32 sf = atomic_load_explicit(&gpu.system.submit_full, memory_order_relaxed);
-    u32 lf = atomic_load_explicit(&gpu.system.spsc_full, memory_order_relaxed);
+    u32 sf = atomic_load_explicit(&gpu.system.submit_full[CHAN_RENDER], memory_order_relaxed);
+    u32 lf = atomic_load_explicit(&gpu.system.spsc_full[CHAN_RENDER], memory_order_relaxed);
     TEST("queue_full_triggered", ok_count < (HS_SUBMIT_SIZE + HS_MAX_PRODUCERS * HS_SPSC_SIZE + 256) && (sf > 0 || lf > 0));
 
     /* ensure per-producer counters sum to something when SPSC overflow happens */
     if (lf > 0) {
         u32 sum = 0;
         for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
-            sum += atomic_load_explicit(&gpu.system.spsc_full_by_prod[i], memory_order_relaxed);
+            sum += atomic_load_explicit(&gpu.system.spsc_full_by_prod[CHAN_RENDER][i], memory_order_relaxed);
         }
         TEST("queue_full_sharded", sum > 0);
     } else {
@@ -656,6 +659,10 @@ static void test_redteam_overproducers(void) {
     hs_gpu_init(&gpu);
     gpu.system.validate_on_send = true;
     gpu.system.recording = false;
+    /* This test intentionally overloads producers; keep it non-blocking so threads can stop cleanly. */
+    gpu.system.block_on_full = false;
+    gpu.system.block_on_full_chan[CHAN_RENDER] = false;
+    gpu.system.block_on_full_chan[CHAN_RT] = false;
 
     enum { N = 16 };
     pthread_t th[N];
@@ -678,6 +685,7 @@ static void test_redteam_overproducers(void) {
     }
 
     atomic_store_explicit(&stop, true, memory_order_release);
+    hs_wake_senders(&gpu.system);
     for (int i = 0; i < N; i++) pthread_join(th[i], NULL);
 
     u32 total_sent = 0;
@@ -718,6 +726,7 @@ static void* bench_sender(void* arg) {
             .tick = 0,
             .payload_idx = (u16)(i & 0xFF),
             .payload_len = 0,
+            .channel = CHAN_RENDER,
         };
         if (hs_send(a->sys, &m)) {
             a->ok++;
@@ -771,6 +780,8 @@ static void bench_producers(int threads, int ms) {
 
     atomic_store_explicit(&stop, true, memory_order_release);
     gpu.system.block_on_full = false;
+    gpu.system.block_on_full_chan[CHAN_RENDER] = false;
+    gpu.system.block_on_full_chan[CHAN_RT] = false;
     hs_wake_senders(&gpu.system);
     for (int i = 0; i < threads; i++) pthread_join(th[i], NULL);
 
@@ -783,10 +794,10 @@ static void bench_producers(int threads, int ms) {
         fail += args[i].fail;
     }
 
-    u32 spsc_ok = atomic_load_explicit(&gpu.system.spsc_ok, memory_order_relaxed);
-    u32 mpsc_ok = atomic_load_explicit(&gpu.system.mpsc_ok, memory_order_relaxed);
-    u32 spsc_full = atomic_load_explicit(&gpu.system.spsc_full, memory_order_relaxed);
-    u32 submit_full = atomic_load_explicit(&gpu.system.submit_full, memory_order_relaxed);
+    u32 spsc_ok = atomic_load_explicit(&gpu.system.spsc_ok[CHAN_RENDER], memory_order_relaxed);
+    u32 mpsc_ok = atomic_load_explicit(&gpu.system.mpsc_ok[CHAN_RENDER], memory_order_relaxed);
+    u32 spsc_full = atomic_load_explicit(&gpu.system.spsc_full[CHAN_RENDER], memory_order_relaxed);
+    u32 submit_full = atomic_load_explicit(&gpu.system.submit_full[CHAN_RENDER], memory_order_relaxed);
     u32 prod_count = atomic_load_explicit(&gpu.system.producer_count, memory_order_relaxed);
 
     double sec = (double)ms / 1000.0;

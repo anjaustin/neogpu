@@ -249,7 +249,7 @@ static void hs_render_record(HSSystem* sys, const Message* msg) {
     (void)hs_render_push(sys->render_list, &cmd);
 }
 
-static bool hs_submit_enqueue(HSSystem* sys, const Message* msg, const void* payload, u32 payload_len) {
+static bool hs_submit_enqueue(HSSystem* sys, HSChannel ch, const Message* msg, const void* payload, u32 payload_len) {
     if (!sys || !msg) return false;
 
     /* fast reject invalid destination/op */
@@ -259,44 +259,46 @@ static bool hs_submit_enqueue(HSSystem* sys, const Message* msg, const void* pay
     u32 len = payload_len;
     if (len > HS_PAYLOAD_SIZE) len = HS_PAYLOAD_SIZE;
 
-    u32 pos = atomic_load_explicit(&sys->submit.enqueue_pos, memory_order_relaxed);
+    HSSubmitQueue* q = &sys->submit[(u32)ch];
+    u32 pos = atomic_load_explicit(&q->enqueue_pos, memory_order_relaxed);
     for (;;) {
-        HSSubmitSlot* slot = &sys->submit.slots[pos % HS_SUBMIT_SIZE];
+        HSSubmitSlot* slot = &q->slots[pos % HS_SUBMIT_SIZE];
         u32 seq = atomic_load_explicit(&slot->seq, memory_order_acquire);
         intptr_t dif = (intptr_t)seq - (intptr_t)pos;
         if (dif == 0) {
             if (atomic_compare_exchange_weak_explicit(
-                    &sys->submit.enqueue_pos, &pos, pos + 1,
+                    &q->enqueue_pos, &pos, pos + 1,
                     memory_order_relaxed, memory_order_relaxed)) {
                 /* claimed */
                 slot->msg = *msg;
                 slot->payload_len = len;
                 if (len && payload) memcpy(slot->payload, payload, len);
                 atomic_store_explicit(&slot->seq, pos + 1, memory_order_release);
-                atomic_fetch_add_explicit(&sys->mpsc_ok, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&sys->mpsc_ok[(u32)ch], 1, memory_order_relaxed);
                 return true;
             }
             continue;
         }
         if (dif < 0) {
-            sys->submit_full++;
+            atomic_fetch_add_explicit(&sys->submit_full[(u32)ch], 1, memory_order_relaxed);
             return false;
         }
-        pos = atomic_load_explicit(&sys->submit.enqueue_pos, memory_order_relaxed);
+        pos = atomic_load_explicit(&q->enqueue_pos, memory_order_relaxed);
     }
 }
 
-static bool hs_submit_dequeue(HSSystem* sys, Message* out_msg, u8 out_payload[HS_PAYLOAD_SIZE], u32* out_payload_len) {
+static bool hs_submit_dequeue(HSSystem* sys, HSChannel ch, Message* out_msg, u8 out_payload[HS_PAYLOAD_SIZE], u32* out_payload_len) {
     if (!sys || !out_msg || !out_payload_len) return false;
 
-    u32 pos = atomic_load_explicit(&sys->submit.dequeue_pos, memory_order_relaxed);
+    HSSubmitQueue* q = &sys->submit[(u32)ch];
+    u32 pos = atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
     for (;;) {
-        HSSubmitSlot* slot = &sys->submit.slots[pos % HS_SUBMIT_SIZE];
+        HSSubmitSlot* slot = &q->slots[pos % HS_SUBMIT_SIZE];
         u32 seq = atomic_load_explicit(&slot->seq, memory_order_acquire);
         intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
         if (dif == 0) {
             if (atomic_compare_exchange_weak_explicit(
-                    &sys->submit.dequeue_pos, &pos, pos + 1,
+                    &q->dequeue_pos, &pos, pos + 1,
                     memory_order_relaxed, memory_order_relaxed)) {
                 *out_msg = slot->msg;
                 *out_payload_len = slot->payload_len;
@@ -311,7 +313,7 @@ static bool hs_submit_dequeue(HSSystem* sys, Message* out_msg, u8 out_payload[HS
         if (dif < 0) {
             return false; /* empty */
         }
-        pos = atomic_load_explicit(&sys->submit.dequeue_pos, memory_order_relaxed);
+        pos = atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
     }
 }
 
@@ -442,23 +444,29 @@ static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u3
         msg->channel = (u8)hs_default_channel_for_op((OpCode)msg->op);
     }
 
+    HSChannel ch = (HSChannel)msg->channel;
+    if (ch <= CHAN_DEFAULT || ch >= CHAN_COUNT) {
+        ch = hs_default_channel_for_op((OpCode)msg->op);
+        msg->channel = (u8)ch;
+    }
+
     if (g_tls_in_step == sys) {
         return hs_route_immediate(sys, msg, payload, len);
     }
 
     int pid = hs_get_producer_id(sys);
     if (pid >= 0) {
-        if (hs_spsc_push(&sys->producers[pid], msg, payload, len)) {
-            atomic_fetch_add_explicit(&sys->spsc_ok, 1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&sys->spsc_ok_by_prod[pid], 1, memory_order_relaxed);
+        if (hs_spsc_push(&sys->producers[(u32)ch][pid], msg, payload, len)) {
+            atomic_fetch_add_explicit(&sys->spsc_ok[(u32)ch], 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&sys->spsc_ok_by_prod[(u32)ch][pid], 1, memory_order_relaxed);
             return true;
         }
-        atomic_fetch_add_explicit(&sys->spsc_full, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&sys->spsc_full_by_prod[pid], 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&sys->spsc_full[(u32)ch], 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&sys->spsc_full_by_prod[(u32)ch][pid], 1, memory_order_relaxed);
         /* fall through to MPSC */
     }
 
-    return hs_submit_enqueue(sys, msg, payload, len);
+    return hs_submit_enqueue(sys, ch, msg, payload, len);
 }
 
 typedef enum {
@@ -687,34 +695,47 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->log_overflow = false;
     sys->dropped_error_ex = 0;
     sys->dropped_queue_full = 0;
-    atomic_init(&sys->submit_full, 0);
-    atomic_init(&sys->spsc_full, 0);
-    atomic_init(&sys->spsc_ok, 0);
-    atomic_init(&sys->mpsc_ok, 0);
-    for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
-        atomic_init(&sys->spsc_full_by_prod[i], 0);
-        atomic_init(&sys->spsc_ok_by_prod[i], 0);
-    }
+    for (u32 c = 0; c < CHAN_COUNT; c++) {
+        atomic_init(&sys->submit_full[c], 0);
+        atomic_init(&sys->spsc_full[c], 0);
+        atomic_init(&sys->spsc_ok[c], 0);
+        atomic_init(&sys->mpsc_ok[c], 0);
 
-    atomic_init(&sys->submit.enqueue_pos, 0);
-    atomic_init(&sys->submit.dequeue_pos, 0);
-    for (u32 i = 0; i < HS_SUBMIT_SIZE; i++) {
-        atomic_init(&sys->submit.slots[i].seq, i);
-        memset(&sys->submit.slots[i].msg, 0, sizeof(Message));
-        sys->submit.slots[i].payload_len = 0;
-        memset(sys->submit.slots[i].payload, 0, HS_PAYLOAD_SIZE);
+        for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
+            atomic_init(&sys->spsc_full_by_prod[c][i], 0);
+            atomic_init(&sys->spsc_ok_by_prod[c][i], 0);
+        }
+
+        atomic_init(&sys->submit[c].enqueue_pos, 0);
+        atomic_init(&sys->submit[c].dequeue_pos, 0);
+        for (u32 i = 0; i < HS_SUBMIT_SIZE; i++) {
+            atomic_init(&sys->submit[c].slots[i].seq, i);
+            memset(&sys->submit[c].slots[i].msg, 0, sizeof(Message));
+            sys->submit[c].slots[i].payload_len = 0;
+            memset(sys->submit[c].slots[i].payload, 0, HS_PAYLOAD_SIZE);
+        }
     }
 
     atomic_init(&sys->producer_count, 0);
-    for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
-        atomic_init(&sys->producers[i].head.v, 0);
-        atomic_init(&sys->producers[i].tail.v, 0);
-        for (u32 j = 0; j < HS_SPSC_SIZE; j++) {
-            memset(&sys->producers[i].slots[j].msg, 0, sizeof(Message));
-            sys->producers[i].slots[j].payload_len = 0;
-            memset(sys->producers[i].slots[j].payload, 0, HS_PAYLOAD_SIZE);
+    for (u32 c = 0; c < CHAN_COUNT; c++) {
+        for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
+            atomic_init(&sys->producers[c][i].head.v, 0);
+            atomic_init(&sys->producers[c][i].tail.v, 0);
+            for (u32 j = 0; j < HS_SPSC_SIZE; j++) {
+                memset(&sys->producers[c][i].slots[j].msg, 0, sizeof(Message));
+                sys->producers[c][i].slots[j].payload_len = 0;
+                memset(sys->producers[c][i].slots[j].payload, 0, HS_PAYLOAD_SIZE);
+            }
         }
     }
+
+    /* default channel policies */
+    for (u32 c = 0; c < CHAN_COUNT; c++) {
+        sys->block_on_full_chan[c] = false;
+    }
+    sys->block_on_full_chan[CHAN_RT] = true;
+    sys->block_on_full_chan[CHAN_RENDER] = true;
+    sys->block_on_full_chan[CHAN_TELEM] = false;
 
     {
         pthread_mutexattr_t attr;
@@ -830,7 +851,9 @@ bool hs_send(HSSystem* sys, Message* msg) {
     if (!sys || !msg) return false;
     for (;;) {
         if (hs_send_enqueue(sys, msg, NULL, 0)) return true;
-        if (!sys->block_on_full) return false;
+        HSChannel ch = (HSChannel)msg->channel;
+        bool block = (ch != CHAN_TELEM) && (sys->block_on_full || (ch < CHAN_COUNT && sys->block_on_full_chan[(u32)ch]));
+        if (!block) return false;
         hs_backpressure_wait(sys);
     }
 }
@@ -839,7 +862,9 @@ bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len
     if (!sys || !msg) return false;
     for (;;) {
         if (hs_send_enqueue(sys, msg, data, len)) return true;
-        if (!sys->block_on_full) return false;
+        HSChannel ch = (HSChannel)msg->channel;
+        bool block = (ch != CHAN_TELEM) && (sys->block_on_full || (ch < CHAN_COUNT && sys->block_on_full_chan[(u32)ch]));
+        if (!block) return false;
         hs_backpressure_wait(sys);
     }
 }
@@ -850,39 +875,49 @@ u32 hs_step(HSSystem* sys) {
 
     g_tls_in_step = sys;
 
-    /* Drain per-producer queues into node inboxes */
+    enum { RT_BUDGET = 4096, RENDER_BUDGET = 16384, TELEM_BUDGET = 1024 };
     u32 prod_count = atomic_load_explicit(&sys->producer_count, memory_order_acquire);
     if (prod_count > HS_MAX_PRODUCERS) prod_count = HS_MAX_PRODUCERS;
-    for (u32 p = 0; p < prod_count; p++) {
-        HSSpscQueue* q = &sys->producers[p];
 
-        for (;;) {
-            u32 head = atomic_load_explicit(&q->head.v, memory_order_relaxed);
-            u32 tail = atomic_load_explicit(&q->tail.v, memory_order_acquire);
-            u32 avail = tail - head;
-            if (avail == 0) break;
+    for (HSChannel ch = CHAN_RT; ch <= CHAN_TELEM; ch++) {
+        u32 budget = (ch == CHAN_RT) ? RT_BUDGET : (ch == CHAN_RENDER) ? RENDER_BUDGET : TELEM_BUDGET;
+        u32 used = 0;
 
-            u32 n = avail;
-            if (n > 32) n = 32;
+        /* Drain per-producer SPSC lanes */
+        for (u32 p = 0; p < prod_count && used < budget; p++) {
+            HSSpscQueue* q = &sys->producers[(u32)ch][p];
+            for (;;) {
+                if (used >= budget) break;
+                u32 head = atomic_load_explicit(&q->head.v, memory_order_relaxed);
+                u32 tail = atomic_load_explicit(&q->tail.v, memory_order_acquire);
+                u32 avail = tail - head;
+                if (avail == 0) break;
 
-            for (u32 i = 0; i < n; i++) {
-                HSSpscSlot* s = &q->slots[(head + i) % HS_SPSC_SIZE];
-                (void)hs_route_immediate(sys, &s->msg, s->payload_len ? s->payload : NULL, s->payload_len);
+                u32 n = avail;
+                if (n > 32) n = 32;
+                if (n > (budget - used)) n = (budget - used);
+
+                for (u32 i = 0; i < n; i++) {
+                    HSSpscSlot* s = &q->slots[(head + i) % HS_SPSC_SIZE];
+                    (void)hs_route_immediate(sys, &s->msg, s->payload_len ? s->payload : NULL, s->payload_len);
+                }
+
+                atomic_store_explicit(&q->head.v, head + n, memory_order_release);
+                used += n;
+                processed += n;
             }
-
-            atomic_store_explicit(&q->head.v, head + n, memory_order_release);
-            processed += n;
         }
-    }
 
-    /* Drain fallback MPSC submit queue into node inboxes */
-    for (;;) {
-        Message m;
-        u8 payload[HS_PAYLOAD_SIZE];
-        u32 payload_len = 0;
-        if (!hs_submit_dequeue(sys, &m, payload, &payload_len)) break;
-        (void)hs_route_immediate(sys, &m, payload_len ? payload : NULL, payload_len);
-        processed++;
+        /* Drain fallback MPSC submit queue */
+        while (used < budget) {
+            Message m;
+            u8 payload[HS_PAYLOAD_SIZE];
+            u32 payload_len = 0;
+            if (!hs_submit_dequeue(sys, ch, &m, payload, &payload_len)) break;
+            (void)hs_route_immediate(sys, &m, payload_len ? payload : NULL, payload_len);
+            used++;
+            processed++;
+        }
     }
     
     for (u8 i = 0; i < sys->node_count; i++) {
@@ -984,22 +1019,25 @@ void hs_clear(HSSystem* sys) {
 
     /* Reset producer lanes and submit queues (no concurrent producers allowed). */
     atomic_store_explicit(&sys->producer_count, 0, memory_order_relaxed);
-    for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
-        atomic_store_explicit(&sys->producers[i].head.v, 0, memory_order_relaxed);
-        atomic_store_explicit(&sys->producers[i].tail.v, 0, memory_order_relaxed);
-        atomic_store_explicit(&sys->spsc_full_by_prod[i], 0, memory_order_relaxed);
-        atomic_store_explicit(&sys->spsc_ok_by_prod[i], 0, memory_order_relaxed);
-    }
-    atomic_store_explicit(&sys->spsc_full, 0, memory_order_relaxed);
-    atomic_store_explicit(&sys->spsc_ok, 0, memory_order_relaxed);
-    atomic_store_explicit(&sys->mpsc_ok, 0, memory_order_relaxed);
-    atomic_store_explicit(&sys->submit_full, 0, memory_order_relaxed);
+    for (u32 c = 0; c < CHAN_COUNT; c++) {
+        atomic_store_explicit(&sys->spsc_full[c], 0, memory_order_relaxed);
+        atomic_store_explicit(&sys->spsc_ok[c], 0, memory_order_relaxed);
+        atomic_store_explicit(&sys->mpsc_ok[c], 0, memory_order_relaxed);
+        atomic_store_explicit(&sys->submit_full[c], 0, memory_order_relaxed);
 
-    atomic_store_explicit(&sys->submit.enqueue_pos, 0, memory_order_relaxed);
-    atomic_store_explicit(&sys->submit.dequeue_pos, 0, memory_order_relaxed);
-    for (u32 i = 0; i < HS_SUBMIT_SIZE; i++) {
-        atomic_store_explicit(&sys->submit.slots[i].seq, i, memory_order_relaxed);
-        sys->submit.slots[i].payload_len = 0;
+        for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
+            atomic_store_explicit(&sys->producers[c][i].head.v, 0, memory_order_relaxed);
+            atomic_store_explicit(&sys->producers[c][i].tail.v, 0, memory_order_relaxed);
+            atomic_store_explicit(&sys->spsc_full_by_prod[c][i], 0, memory_order_relaxed);
+            atomic_store_explicit(&sys->spsc_ok_by_prod[c][i], 0, memory_order_relaxed);
+        }
+
+        atomic_store_explicit(&sys->submit[c].enqueue_pos, 0, memory_order_relaxed);
+        atomic_store_explicit(&sys->submit[c].dequeue_pos, 0, memory_order_relaxed);
+        for (u32 i = 0; i < HS_SUBMIT_SIZE; i++) {
+            atomic_store_explicit(&sys->submit[c].slots[i].seq, i, memory_order_relaxed);
+            sys->submit[c].slots[i].payload_len = 0;
+        }
     }
     for (u8 i = 0; i < sys->node_count; i++) {
         mq_init(&sys->nodes[i]->inbox);
