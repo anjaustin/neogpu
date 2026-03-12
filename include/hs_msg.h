@@ -66,4 +66,53 @@ static inline void hs_pack_clear_ds(u8 out[8], f32 depth, u8 stencil) {
     out[7] = 0;
 }
 
+static inline bool hs_unpack_set_param(const void* data, u32 len, u32* out_param_idx, f32 out_xyzw[4]) {
+    if (!data || len < 20) return false;
+    memcpy(out_param_idx, data, 4);
+    memcpy(out_xyzw, (const u8*)data + 4, 16);
+    return true;
+}
+
+static inline bool hs_unpack_u8x2(const void* data, u32 len, u8* out_a, u8* out_b) {
+    if (!data || len < 2) return false;
+    const u8* b = (const u8*)data;
+    if (out_a) *out_a = b[0];
+    if (out_b) *out_b = b[1];
+    return true;
+}
+
+static inline bool hs_unpack_u16x4(const void* data, u32 len, u16 out_xywh[4]) {
+    if (!data || len < 8) return false;
+    memcpy(out_xywh, data, 8);
+    return true;
+}
+
+static inline bool hs_unpack_u8x4(const void* data, u32 len, u8 out_vals[4]) {
+    if (!data || len < 4) return false;
+    memcpy(out_vals, data, 4);
+    return true;
+}
+
+static inline bool hs_unpack_draw_instance(const void* data, u32 len, u8* out_buffer, u8* out_instance_buffer, u32* out_count) {
+    if (!data || len < 4) return false;
+    const u8* v = (const u8*)data;
+    if (out_buffer) *out_buffer = v[0];
+    if (out_instance_buffer) *out_instance_buffer = v[1];
+    if (out_count) *out_count = (u32)v[2] | ((u32)v[3] << 8);
+    return true;
+}
+
+static inline bool hs_unpack_clear_color(const void* data, u32 len, f32 out_rgba[4]) {
+    if (!data || len < 16) return false;
+    memcpy(out_rgba, data, 16);
+    return true;
+}
+
+static inline bool hs_unpack_clear_ds(const void* data, u32 len, f32* out_depth, u8* out_stencil) {
+    if (!data || len < 8) return false;
+    if (out_depth) memcpy(out_depth, data, 4);
+    if (out_stencil) *out_stencil = ((const u8*)data)[4];
+    return true;
+}
+
 #endif

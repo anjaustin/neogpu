@@ -43,12 +43,11 @@ static void hs_gpu_send_simple(HSGpu* gpu, u8 to, OpCode op, u32 payload_idx, u3
 }
 
 bool hs_gpu_send_with_payload(HSGpu* gpu, u8 to, OpCode op, const void* data, u32 len) {
-    u32 idx = gpu->system.payload_head;
-    u32 cap = gpu->system.payload_capacity ? gpu->system.payload_capacity : (u32)HS_MAX_PAYLOADS;
-    gpu->system.payload_head = (gpu->system.payload_head + 1) % cap;
-    
-    u32 copy_len = len < HS_PAYLOAD_SIZE ? len : HS_PAYLOAD_SIZE;
-    memcpy(gpu->system.payloads[idx].data, data, copy_len);
+    u16 idx = 0;
+    u32 copy_len = 0;
+    if (!hs_payload_alloc_and_copy(&gpu->system, data, len, &idx, &copy_len)) {
+        return false;
+    }
     
     Message msg = {
         .to = to,
@@ -56,7 +55,7 @@ bool hs_gpu_send_with_payload(HSGpu* gpu, u8 to, OpCode op, const void* data, u3
         .op = op,
         .flags = 0,
         .tick = 0,
-        .payload_idx = (u16)idx,
+        .payload_idx = idx,
         .payload_len = copy_len
     };
     return hs_send(&gpu->system, &msg);
@@ -81,12 +80,11 @@ void hs_gpu_set_global(HSGpu* gpu, u8 idx, mat4 value) {
     float arr[16];
     m4_to_array(value, arr);
     
-    /* Allocate payload manually so we can set payload_idx for the index. */
-    u32 pidx = gpu->system.payload_head;
-    u32 cap = gpu->system.payload_capacity ? gpu->system.payload_capacity : (u32)HS_MAX_PAYLOADS;
-    gpu->system.payload_head = (gpu->system.payload_head + 1) % cap;
-    u32 copy_len = sizeof(arr) < HS_PAYLOAD_SIZE ? sizeof(arr) : HS_PAYLOAD_SIZE;
-    memcpy(gpu->system.payloads[pidx].data, arr, copy_len);
+    u16 pidx = 0;
+    u32 copy_len = 0;
+    if (!hs_payload_alloc_and_copy(&gpu->system, arr, sizeof(arr), &pidx, &copy_len)) {
+        return;
+    }
     
     Message msg = {
         .to = NODE_SHADER,
@@ -94,7 +92,7 @@ void hs_gpu_set_global(HSGpu* gpu, u8 idx, mat4 value) {
         .op = OP_SET_GLOBAL,
         .flags = idx,          /* Use flags field for the global index */
         .tick = 0,
-        .payload_idx = (u16)pidx,
+        .payload_idx = pidx,
         .payload_len = copy_len
     };
     hs_send(&gpu->system, &msg);

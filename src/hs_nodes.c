@@ -1,4 +1,5 @@
 #include "hs_nodes.h"
+#include "hs_msg.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -70,12 +71,12 @@ int shader_node_process(Node* node) {
                 void* data = get_payload(msg.payload_idx);
                 if (data && msg.payload_len >= 20) {
                     /* Layout: [u32 param_idx][f32 x][f32 y][f32 z][f32 w] */
-                    u32 param_idx;
-                    memcpy(&param_idx, data, 4);
+                    u32 param_idx = 0;
+                    f32 v[4];
+                    if (!hs_unpack_set_param(data, msg.payload_len, &param_idx, v)) break;
                     if (param_idx < 16) {
-                        f32* param_data = (f32*)((u8*)data + 4);
                         for (int i = 0; i < 4; i++) {
-                            shader_state.params[param_idx][i] = param_data[i];
+                            shader_state.params[param_idx][i] = v[i];
                         }
                         shader_state.params_set |= (1u << param_idx);
                         DBG_PRINT("[%s] Set param #%d = (%.2f, %.2f, %.2f, %.2f)\n", 
@@ -121,8 +122,10 @@ int shader_node_process(Node* node) {
             case OP_BLEND: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {
-                    shader_state.blend_src = ((u8*)data)[0];
-                    shader_state.blend_dst = ((u8*)data)[1];
+                    u8 src = 0, dst = 0;
+                    if (!hs_unpack_u8x2(data, msg.payload_len, &src, &dst)) break;
+                    shader_state.blend_src = src;
+                    shader_state.blend_dst = dst;
                     DBG_PRINT("[%s] Blend: src=%d, dst=%d\n", 
                            node_name(node->id), (int)shader_state.blend_src, (int)shader_state.blend_dst);
                 }
@@ -152,7 +155,8 @@ int shader_node_process(Node* node) {
             case OP_CLIP: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {
-                    u16* vals = (u16*)data;
+                    u16 vals[4];
+                    if (!hs_unpack_u16x4(data, msg.payload_len, vals)) break;
                     shader_state.clip_x = vals[0];
                     shader_state.clip_y = vals[1];
                     shader_state.clip_w = vals[2];
@@ -166,7 +170,8 @@ int shader_node_process(Node* node) {
             case OP_STENCIL: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {
-                    u8* vals = (u8*)data;
+                    u8 vals[4];
+                    if (!hs_unpack_u8x4(data, msg.payload_len, vals)) break;
                     shader_state.stencil_op = vals[0];
                     shader_state.stencil_fail = vals[1];
                     shader_state.stencil_pass = vals[2];
@@ -180,7 +185,8 @@ int shader_node_process(Node* node) {
             case OP_STENCIL_FUNC: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {
-                    u8* vals = (u8*)data;
+                    u8 vals[4];
+                    if (!hs_unpack_u8x4(data, msg.payload_len, vals)) break;
                     shader_state.stencil_compare = vals[0];
                     shader_state.stencil_ref = vals[1];
                     shader_state.stencil_read_mask = vals[2];
@@ -194,11 +200,12 @@ int shader_node_process(Node* node) {
             case OP_DEPTH_COMPARE: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {
-                    u8* vals = (u8*)data;
-                    shader_state.depth_compare = vals[0];
-                    shader_state.depth_write = vals[1];
+                    u8 cmp = 0, wr = 0;
+                    if (!hs_unpack_u8x2(data, msg.payload_len, &cmp, &wr)) break;
+                    shader_state.depth_compare = cmp;
+                    shader_state.depth_write = wr;
                     DBG_PRINT("[%s] Depth compare: comp=%d, write=%d\n",
-                           node_name(node->id), vals[0], vals[1]);
+                            node_name(node->id), (int)cmp, (int)wr);
                 }
                 break;
             }
@@ -243,11 +250,10 @@ int buffer_node_process(Node* node) {
             case OP_DRAW_INSTANCE: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {
-                    u8* vals = (u8*)data;
-                    /* Layout from encoder: [u8 buffer][u8 instance_buffer][u8 count_lo][u8 count_hi] */
-                    u8 buffer_idx = vals[0];
-                    u8 inst_buf = vals[1];
-                    u32 count = (u32)vals[2] | ((u32)vals[3] << 8);
+                    u8 buffer_idx = 0;
+                    u8 inst_buf = 0;
+                    u32 count = 0;
+                    if (!hs_unpack_draw_instance(data, msg.payload_len, &buffer_idx, &inst_buf, &count)) break;
                     (void)buffer_idx;
                     (void)inst_buf;
                     (void)count;
@@ -305,8 +311,11 @@ int texture_node_process(Node* node) {
             case OP_SET_TARGET: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {
-                    texture_state.current_target = ((u8*)data)[0];
-                    texture_state.current_depth_target = ((u8*)data)[1];
+                    u8 tex = 0;
+                    u8 depth = 0;
+                    if (!hs_unpack_u8x2(data, msg.payload_len, &tex, &depth)) break;
+                    texture_state.current_target = tex;
+                    texture_state.current_depth_target = depth;
                 } else {
                     texture_state.current_target = (msg.payload_idx & 0xF);
                     texture_state.current_depth_target = 0xF;  /* No depth */
@@ -377,7 +386,8 @@ int output_node_process(Node* node) {
             case OP_CLEAR: {
                 void* data = get_payload(msg.payload_idx);
                 if (data && msg.payload_len >= 4 * sizeof(f32)) {
-                    f32* color = (f32*)data;
+                    f32 color[4];
+                    if (!hs_unpack_clear_color(data, msg.payload_len, color)) break;
                     output_state.clear_color[0] = color[0];
                     output_state.clear_color[1] = color[1];
                     output_state.clear_color[2] = color[2];
@@ -391,9 +401,11 @@ int output_node_process(Node* node) {
             case OP_CLEAR_DS: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {
-                    f32* ds = (f32*)data;
-                    output_state.clear_depth = ds[0];
-                    output_state.clear_stencil = *((u8*)(&ds[1]));
+                    f32 depth = 0.0f;
+                    u8 stencil = 0;
+                    if (!hs_unpack_clear_ds(data, msg.payload_len, &depth, &stencil)) break;
+                    output_state.clear_depth = depth;
+                    output_state.clear_stencil = stencil;
                     DBG_PRINT("[%s] Clear DS: depth=%.2f, stencil=%d\n",
                            node_name(node->id), output_state.clear_depth, output_state.clear_stencil);
                 }
@@ -430,10 +442,12 @@ int sound_node_process(Node* node) {
             case OP_SET_CHANNEL: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {
-                    u8* vals = (u8*)data;
-                    if (vals[0] < 4) {
-                        sound_state.channel_shaders[vals[0]] = vals[1];
-                        DBG_PRINT("[%s] Channel %d -> shader #%d\n", node_name(node->id), vals[0], vals[1]);
+                    u8 ch = 0;
+                    u8 shader = 0;
+                    if (!hs_unpack_u8x2(data, msg.payload_len, &ch, &shader)) break;
+                    if (ch < 4) {
+                        sound_state.channel_shaders[ch] = shader;
+                        DBG_PRINT("[%s] Channel %d -> shader #%d\n", node_name(node->id), ch, shader);
                     }
                 }
                 break;

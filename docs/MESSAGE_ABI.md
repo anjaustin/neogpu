@@ -21,6 +21,11 @@ The goal is to make the existing implicit ABI explicit so it can be validated, c
 - For payload-bearing ops, `payload_idx` is an index into the payload ring.
 - Payloads larger than 64B are currently truncated by send helpers.
 
+Implementation notes:
+
+- Prefer `hs_payload_alloc_and_copy()` for allocating/copying payload bytes.
+- Prefer `include/hs_msg.h` pack/unpack helpers for opcode payload layouts.
+
 ### Capture/Replay Payloads
 
 The core also supports a self-contained capture format (`HSCapture`) that deep-copies payload blocks and can replay deterministically without relying on the transient payload ring. In a capture, payload-bearing messages can be rewritten so `payload_idx` refers to the capture payload slot.

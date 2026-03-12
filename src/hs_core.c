@@ -1,4 +1,5 @@
 #include "hs_core.h"
+#include "hs_nodes.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -8,6 +9,25 @@ static bool hs_system_has_node(const HSSystem* sys, u8 id) {
         if (sys->nodes[i] && sys->nodes[i]->id == id) return true;
     }
     return false;
+}
+
+bool hs_payload_alloc_and_copy(HSSystem* sys, const void* data, u32 len, u16* out_idx, u32* out_len) {
+    if (!sys || !sys->payloads || sys->payload_capacity == 0) return false;
+
+    u32 copy_len = len;
+    if (copy_len > HS_PAYLOAD_SIZE) copy_len = HS_PAYLOAD_SIZE;
+
+    u32 idx = sys->payload_head;
+    sys->payload_head = (sys->payload_head + 1) % sys->payload_capacity;
+
+    if (copy_len > 0) {
+        if (data) memcpy(sys->payloads[idx].data, data, copy_len);
+        else memset(sys->payloads[idx].data, 0, copy_len);
+    }
+
+    if (out_idx) *out_idx = (u16)idx;
+    if (out_len) *out_len = copy_len;
+    return true;
 }
 
 bool hs_validate_message(const HSSystem* sys, const Message* msg, const char** out_err) {
@@ -28,6 +48,64 @@ bool hs_validate_message(const HSSystem* sys, const Message* msg, const char** o
         err = "invalid destination node";
         if (out_err) *out_err = err;
         return false;
+    }
+
+    /* Per-op routing (current ABI). */
+    {
+        u8 expected_to = 0xFF;
+        switch ((OpCode)msg->op) {
+            case OP_NOOP:
+                expected_to = 0xFF;
+                break;
+            case OP_SET_SHADER:
+            case OP_SET_PARAM:
+            case OP_SET_GLOBAL:
+            case OP_SET_CAMERA:
+            case OP_CULL:
+            case OP_BLEND:
+            case OP_ALPHA:
+            case OP_DEPTH:
+            case OP_COLOR_MASK:
+            case OP_CLIP:
+            case OP_STENCIL:
+            case OP_STENCIL_FUNC:
+            case OP_DEPTH_COMPARE:
+                expected_to = NODE_SHADER;
+                break;
+            case OP_LOAD_BUFFER:
+            case OP_DRAW:
+            case OP_DRAW_INSTANCE:
+            case OP_DRAW_TEXT:
+                expected_to = NODE_BUFFER;
+                break;
+            case OP_LOAD_TEXTURE:
+            case OP_SET_TARGET:
+            case OP_SHOW_TEXTURE:
+            case OP_TEXTURE_FILTER:
+            case OP_TEXTURE_WRAP:
+                expected_to = NODE_TEXTURE;
+                break;
+            case OP_CLEAR:
+            case OP_CLEAR_DS:
+                expected_to = NODE_OUTPUT;
+                break;
+            case OP_SET_CHANNEL:
+                expected_to = NODE_SOUND;
+                break;
+            case OP_ERROR:
+            case OP_TRACE:
+            case OP_STOP:
+                expected_to = NODE_SYSTEM;
+                break;
+            default:
+                break;
+        }
+
+        if (expected_to != 0xFF && msg->to != expected_to) {
+            err = "bad destination";
+            if (out_err) *out_err = err;
+            return false;
+        }
     }
 
     /* Per-op payload length checks based on current ABI. */
@@ -181,17 +259,6 @@ void hs_register(HSSystem* sys, Node* node) {
     sys->nodes[sys->node_count++] = node;
 }
 
-static u32 allocate_payload(HSSystem* sys, const void* data, u32 len) {
-    if (len > HS_PAYLOAD_SIZE) {
-        len = HS_PAYLOAD_SIZE;
-    }
-    u32 idx = sys->payload_head;
-    u32 cap = sys->payload_capacity ? sys->payload_capacity : (u32)HS_MAX_PAYLOADS;
-    sys->payload_head = (sys->payload_head + 1) % cap;
-    memcpy(sys->payloads[idx].data, data, len);
-    return idx;
-}
-
 void hs_capture_init(HSCapture* cap, Message* msg_buf, Payload* payload_buf, u32 capacity) {
     if (!cap) return;
     cap->msgs = msg_buf;
@@ -269,8 +336,11 @@ bool hs_send(HSSystem* sys, Message* msg) {
 }
 
 bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len) {
-    msg->payload_idx = allocate_payload(sys, data, len);
-    msg->payload_len = len;
+    u16 idx = 0;
+    u32 copy_len = 0;
+    if (!hs_payload_alloc_and_copy(sys, data, len, &idx, &copy_len)) return false;
+    msg->payload_idx = idx;
+    msg->payload_len = copy_len;
     return hs_send(sys, msg);
 }
 

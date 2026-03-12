@@ -127,6 +127,12 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
 void hs_register(HSSystem* sys, Node* node);
 bool hs_send(HSSystem* sys, Message* msg);
 u32  hs_step(HSSystem* sys);
+
+/* Allocate a payload block and copy up to HS_PAYLOAD_SIZE bytes into it. */
+bool hs_payload_alloc_and_copy(HSSystem* sys, const void* data, u32 len, u16* out_idx, u32* out_len);
+
+/* Convenience wrapper: alloc+copy payload then send message. */
+bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len);
 void hs_start_recording(HSSystem* sys);
 u32  hs_stop_recording(HSSystem* sys);
 bool hs_replay(HSSystem* sys, Message* msgs, u32 count);
