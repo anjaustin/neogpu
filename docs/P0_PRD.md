@@ -12,8 +12,8 @@ Make the messaging layer safe and predictable when used from multiple threads, o
 ## Current Model (After P0)
 
 - Producers call `hs_send()` / `hs_send_with_payload()` from any thread.
-- Messages are enqueued into an MPSC submit queue (`HSSystem.submit`).
-- The step thread calls `hs_step()`, which drains the submit queue and routes messages into node inboxes, and only then processes nodes.
+- Producers enqueue into per-thread SPSC lanes (up to `HS_MAX_PRODUCERS`), with a fallback MPSC submit queue for overflow/unregistered producers.
+- The step thread calls `hs_step()`, which drains producer lanes (and the fallback submit queue) and routes messages into node inboxes, and only then processes nodes.
 - Validation/logging/render-recording happen at route time (on the step thread).
 
 Concurrency constraints:
@@ -61,3 +61,4 @@ Concurrency constraints:
 - Dropped-telemetry counters live in `HSSystem` (`dropped_error_ex`, `dropped_queue_full`).
 - `HSAsync.running` is implemented as `atomic_bool`.
 - MPSC submit queue lives in `HSSystem.submit` and backpressure is tracked in `HSSystem.submit_full`.
+- SPSC lane backpressure is tracked in `HSSystem.spsc_full`.

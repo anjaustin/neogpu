@@ -309,6 +309,37 @@ static bool hs_submit_dequeue(HSSystem* sys, Message* out_msg, u8 out_payload[HS
     }
 }
 
+static bool hs_spsc_push(HSSpscQueue* q, const Message* msg, const void* payload, u32 payload_len) {
+    if (!q || !msg) return false;
+    u32 len = payload_len;
+    if (len > HS_PAYLOAD_SIZE) len = HS_PAYLOAD_SIZE;
+
+    u32 tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
+    u32 head = atomic_load_explicit(&q->head, memory_order_acquire);
+    if ((tail - head) >= HS_SPSC_SIZE) return false;
+
+    HSSpscSlot* s = &q->slots[tail % HS_SPSC_SIZE];
+    s->msg = *msg;
+    s->payload_len = len;
+    if (len && payload) memcpy(s->payload, payload, len);
+    atomic_store_explicit(&q->tail, tail + 1, memory_order_release);
+    return true;
+}
+
+static bool hs_spsc_pop(HSSpscQueue* q, Message* out_msg, u8 out_payload[HS_PAYLOAD_SIZE], u32* out_payload_len) {
+    if (!q || !out_msg || !out_payload_len) return false;
+    u32 head = atomic_load_explicit(&q->head, memory_order_relaxed);
+    u32 tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+    if (head == tail) return false;
+
+    HSSpscSlot* s = &q->slots[head % HS_SPSC_SIZE];
+    *out_msg = s->msg;
+    *out_payload_len = s->payload_len;
+    if (out_payload && s->payload_len) memcpy(out_payload, s->payload, s->payload_len);
+    atomic_store_explicit(&q->head, head + 1, memory_order_release);
+    return true;
+}
+
 static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload, u32 payload_len) {
     /* Called by the step thread only. */
     if (!sys || !msg) return false;
@@ -354,6 +385,30 @@ static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload,
 
     hs_render_record(sys, msg);
     return true;
+}
+
+typedef struct {
+    HSSystem* sys;
+    int id;
+} HSProducerTLS;
+
+static _Thread_local HSProducerTLS g_tls_prod = {0};
+static _Thread_local HSSystem* g_tls_in_step = NULL;
+
+static int hs_get_producer_id(HSSystem* sys) {
+    if (g_tls_prod.sys != sys) {
+        g_tls_prod.sys = sys;
+        g_tls_prod.id = -1;
+    }
+    if (g_tls_prod.id >= 0) return g_tls_prod.id;
+
+    u32 id = atomic_fetch_add_explicit(&sys->producer_count, 1, memory_order_relaxed);
+    if (id >= HS_MAX_PRODUCERS) {
+        g_tls_prod.id = -2; /* fallback */
+        return -2;
+    }
+    g_tls_prod.id = (int)id;
+    return g_tls_prod.id;
 }
 
 typedef enum {
@@ -560,6 +615,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->dropped_error_ex = 0;
     sys->dropped_queue_full = 0;
     atomic_init(&sys->submit_full, 0);
+    atomic_init(&sys->spsc_full, 0);
 
     atomic_init(&sys->submit.enqueue_pos, 0);
     atomic_init(&sys->submit.dequeue_pos, 0);
@@ -568,6 +624,17 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
         memset(&sys->submit.slots[i].msg, 0, sizeof(Message));
         sys->submit.slots[i].payload_len = 0;
         memset(sys->submit.slots[i].payload, 0, HS_PAYLOAD_SIZE);
+    }
+
+    atomic_init(&sys->producer_count, 0);
+    for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
+        atomic_init(&sys->producers[i].head, 0);
+        atomic_init(&sys->producers[i].tail, 0);
+        for (u32 j = 0; j < HS_SPSC_SIZE; j++) {
+            memset(&sys->producers[i].slots[j].msg, 0, sizeof(Message));
+            sys->producers[i].slots[j].payload_len = 0;
+            memset(sys->producers[i].slots[j].payload, 0, HS_PAYLOAD_SIZE);
+        }
     }
 
     {
@@ -677,10 +744,36 @@ bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Pa
 }
 
 bool hs_send(HSSystem* sys, Message* msg) {
+    if (!sys || !msg) return false;
+
+    /* If called from within the step thread, route immediately to preserve behavior. */
+    if (g_tls_in_step == sys) {
+        return hs_route_immediate(sys, msg, NULL, 0);
+    }
+
+    int pid = hs_get_producer_id(sys);
+    if (pid >= 0) {
+        if (hs_spsc_push(&sys->producers[pid], msg, NULL, 0)) return true;
+        atomic_fetch_add_explicit(&sys->spsc_full, 1, memory_order_relaxed);
+        /* fallback to MPSC */
+    }
+
     return hs_submit_enqueue(sys, msg, NULL, 0);
 }
 
 bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len) {
+    if (!sys || !msg) return false;
+
+    if (g_tls_in_step == sys) {
+        return hs_route_immediate(sys, msg, data, len);
+    }
+
+    int pid = hs_get_producer_id(sys);
+    if (pid >= 0) {
+        if (hs_spsc_push(&sys->producers[pid], msg, data, len)) return true;
+        atomic_fetch_add_explicit(&sys->spsc_full, 1, memory_order_relaxed);
+    }
+
     return hs_submit_enqueue(sys, msg, data, len);
 }
 
@@ -688,17 +781,27 @@ u32 hs_step(HSSystem* sys) {
     hs_lock(sys);
     u32 processed = 0;
 
-    /* Drain submit queue into node inboxes */
+    g_tls_in_step = sys;
+
+    /* Drain per-producer queues into node inboxes */
+    for (u32 p = 0; p < HS_MAX_PRODUCERS; p++) {
+        for (;;) {
+            Message m;
+            u8 payload[HS_PAYLOAD_SIZE];
+            u32 payload_len = 0;
+            if (!hs_spsc_pop(&sys->producers[p], &m, payload, &payload_len)) break;
+            (void)hs_route_immediate(sys, &m, payload_len ? payload : NULL, payload_len);
+            processed++;
+        }
+    }
+
+    /* Drain fallback MPSC submit queue into node inboxes */
     for (;;) {
         Message m;
         u8 payload[HS_PAYLOAD_SIZE];
         u32 payload_len = 0;
         if (!hs_submit_dequeue(sys, &m, payload, &payload_len)) break;
-        if (payload_len) {
-            (void)hs_route_immediate(sys, &m, payload, payload_len);
-        } else {
-            (void)hs_route_immediate(sys, &m, NULL, 0);
-        }
+        (void)hs_route_immediate(sys, &m, payload_len ? payload : NULL, payload_len);
         processed++;
     }
     
@@ -719,6 +822,7 @@ u32 hs_step(HSSystem* sys) {
     }
     
     sys->tick++;
+    g_tls_in_step = NULL;
     hs_unlock(sys);
     return processed;
 }

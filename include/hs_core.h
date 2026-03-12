@@ -97,6 +97,21 @@ typedef struct {
     HSSubmitSlot slots[HS_SUBMIT_SIZE];
 } HSSubmitQueue;
 
+#define HS_MAX_PRODUCERS   8
+#define HS_SPSC_SIZE       256
+
+typedef struct {
+    Message msg;
+    u32 payload_len;
+    u8 payload[HS_PAYLOAD_SIZE];
+} __attribute__((aligned(64))) HSSpscSlot;
+
+typedef struct {
+    atomic_uint head;
+    atomic_uint tail;
+    HSSpscSlot slots[HS_SPSC_SIZE];
+} HSSpscQueue;
+
 /* Removed static_assert - on some ABIs struct is 12 bytes, not 16 */
 
 typedef struct __attribute__((aligned(64))) {
@@ -154,6 +169,11 @@ typedef struct {
 
     HSSubmitQueue submit;
     atomic_uint submit_full;
+
+    atomic_uint spsc_full;
+
+    atomic_uint producer_count;
+    HSSpscQueue producers[HS_MAX_PRODUCERS];
 } HSSystem;
 
 void hs_lock(HSSystem* sys);

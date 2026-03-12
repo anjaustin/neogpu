@@ -381,10 +381,10 @@ static void test_message_validation(void) {
     TEST("send_queued", bad_ok);
     TEST("error_ex_emitted", st->error_count > 0 && st->last_error_op == OP_SET_SHADER && st->last_error_to == NODE_BUFFER);
 
-    /* Backpressure: overflow submit queue without stepping */
+    /* Backpressure: overflow submit/producer queues without stepping */
     gpu.system.recording = false;
     u32 ok_count = 0;
-    for (u32 i = 0; i < (HS_SUBMIT_SIZE + 64); i++) {
+    for (u32 i = 0; i < (HS_SUBMIT_SIZE + HS_MAX_PRODUCERS * HS_SPSC_SIZE + 256); i++) {
         Message spam = {
             .to = NODE_SHADER,
             .from = NODE_CPU,
@@ -398,7 +398,9 @@ static void test_message_validation(void) {
         if (hs_send(&gpu.system, &spam)) ok_count++;
     }
     hs_step(&gpu.system);
-    TEST("queue_full_triggered", ok_count < (HS_SUBMIT_SIZE + 64) && gpu.system.submit_full > 0);
+    u32 sf = atomic_load_explicit(&gpu.system.submit_full, memory_order_relaxed);
+    u32 lf = atomic_load_explicit(&gpu.system.spsc_full, memory_order_relaxed);
+    TEST("queue_full_triggered", ok_count < (HS_SUBMIT_SIZE + HS_MAX_PRODUCERS * HS_SPSC_SIZE + 256) && (sf > 0 || lf > 0));
 }
 
 /* ============================================================
@@ -531,6 +533,45 @@ static void test_thread_safety(void) {
     SystemState* st = (SystemState*)gpu.system_node.state;
     TEST("thread_sent", args.sent > 0);
     TEST("thread_ack_progress", st->ack_count > 0);
+}
+
+static void test_thread_safety_many(void) {
+    printf("\n--- Thread Safety (Many Producers) ---\n");
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
+    gpu.system.recording = false;
+
+    enum { N = 4 };
+    pthread_t th[N];
+    SenderArgs args[N];
+    atomic_bool stop;
+    atomic_init(&stop, false);
+
+    for (int i = 0; i < N; i++) {
+        args[i].sys = &gpu.system;
+        args[i].stop = &stop;
+        args[i].sent = 0;
+        args[i].failed = 0;
+        int rc = pthread_create(&th[i], NULL, sender_thread, &args[i]);
+        TEST("thread_spawn_many", rc == 0);
+    }
+
+    for (int i = 0; i < 2000; i++) {
+        hs_step(&gpu.system);
+        usleep(500);
+    }
+
+    atomic_store_explicit(&stop, true, memory_order_release);
+    for (int i = 0; i < N; i++) pthread_join(th[i], NULL);
+
+    u32 total_sent = 0;
+    for (int i = 0; i < N; i++) total_sent += args[i].sent;
+    SystemState* st = (SystemState*)gpu.system_node.state;
+
+    TEST("many_sent", total_sent > 0);
+    TEST("many_ack_progress", st->ack_count > 0);
 }
 
 /* ============================================================
@@ -772,6 +813,7 @@ int main(void) {
     test_async_done();
     test_async_atomic_running();
     test_thread_safety();
+    test_thread_safety_many();
     test_gpu();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
