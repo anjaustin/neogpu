@@ -130,6 +130,10 @@ typedef struct {
 
     pthread_mutex_t lock;
     bool            lock_inited;
+
+    /* Telemetry about dropped best-effort system events */
+    u32 dropped_error_ex;
+    u32 dropped_queue_full;
 } HSSystem;
 
 void hs_lock(HSSystem* sys);

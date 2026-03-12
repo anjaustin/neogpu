@@ -90,7 +90,9 @@ static void hs_report_error_ex(HSSystem* sys, const Message* bad_msg, u32 code, 
         .payload_len = copy_len,
     };
 
-    (void)mq_push(&sys_node->inbox, &emsg);
+    if (!mq_push(&sys_node->inbox, &emsg)) {
+        sys->dropped_error_ex++;
+    }
 }
 
 static void hs_report_queue_full(HSSystem* sys, const Message* msg, u8 dest_node) {
@@ -108,7 +110,9 @@ static void hs_report_queue_full(HSSystem* sys, const Message* msg, u8 dest_node
         .payload_idx = (u16)(msg ? msg->op : 0),
         .payload_len = 0,
     };
-    (void)mq_push(&sys_node->inbox, &q);
+    if (!mq_push(&sys_node->inbox, &q)) {
+        sys->dropped_queue_full++;
+    }
 }
 
 static void hs_render_record(HSSystem* sys, const Message* msg) {
@@ -452,6 +456,8 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->validate_on_send = false;
     sys->render_list = NULL;
     sys->log_overflow = false;
+    sys->dropped_error_ex = 0;
+    sys->dropped_queue_full = 0;
 
     {
         pthread_mutexattr_t attr;
@@ -580,7 +586,6 @@ bool hs_send(HSSystem* sys, Message* msg) {
         if (sys->nodes[i]->id == msg->to) {
             bool pushed = mq_push(&sys->nodes[i]->inbox, msg);
             if (!pushed) {
-                hs_report_error_ex(sys, msg, HS_ERR_QUEUE_FULL, HS_ERR_STAGE_SEND, "inbox queue full");
                 hs_report_queue_full(sys, msg, msg->to);
                 hs_unlock(sys);
                 return false;

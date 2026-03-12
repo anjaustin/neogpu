@@ -478,6 +478,7 @@ static void* sender_thread(void* arg) {
         if (hs_send(a->sys, &m)) a->sent++;
         else a->failed++;
         i++;
+        usleep(50);
     }
     return NULL;
 }

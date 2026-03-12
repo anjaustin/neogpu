@@ -566,8 +566,10 @@ int system_node_process(Node* node) {
                         system_state.last_error_op = op;
                         system_state.last_error_to = to;
                         system_state.last_error_from = from;
+#if HS_DEBUG
                         fprintf(stderr, "[ERROR_EX] code=%u stage=%u op=%u to=%u from=%u cid=%u\n",
                                 (unsigned)code, (unsigned)stage, (unsigned)op, (unsigned)to, (unsigned)from, (unsigned)cid);
+#endif
                     }
                 }
                 break;

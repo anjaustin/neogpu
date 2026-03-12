@@ -45,3 +45,4 @@ Make the messaging layer safe and predictable when used from multiple threads, o
 
 - The recursive system lock lives in `include/hs_core.h` / `src/hs_core.c` (`hs_lock/hs_unlock`).
 - Multi-thread falsification test lives in `src/main.c` ("Thread Safety Tests").
+- Dropped-telemetry counters live in `HSSystem` (`dropped_error_ex`, `dropped_queue_full`).
