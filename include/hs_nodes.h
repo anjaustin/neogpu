@@ -80,6 +80,13 @@ typedef struct {
     u8  last_result_from;
     u8  last_result_op;
     u16 last_result_len;
+
+    u32 error_count;
+    u32 last_error_code;
+    u8  last_error_stage;
+    u8  last_error_op;
+    u8  last_error_to;
+    u8  last_error_from;
 } SystemState;
 
 int shader_node_process(Node* node);

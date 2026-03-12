@@ -115,4 +115,37 @@ static inline bool hs_unpack_clear_ds(const void* data, u32 len, f32* out_depth,
     return true;
 }
 
+/*
+ * Structured error payload (OP_ERROR_EX):
+ * [u32 code][u8 op][u8 to][u8 from][u8 stage][u32 cid][u32 arg0][u32 arg1][char msg[32]]
+ */
+static inline void hs_pack_error_ex(u8 out[52], u32 code, u8 op, u8 to, u8 from, u8 stage, u32 cid, u32 arg0, u32 arg1, const char* msg) {
+    memset(out, 0, 52);
+    memcpy(&out[0], &code, 4);
+    out[4] = op;
+    out[5] = to;
+    out[6] = from;
+    out[7] = stage;
+    memcpy(&out[8], &cid, 4);
+    memcpy(&out[12], &arg0, 4);
+    memcpy(&out[16], &arg1, 4);
+    if (msg) {
+        /* msg[32] at offset 20 */
+        strncpy((char*)&out[20], msg, 31);
+        out[20 + 31] = 0;
+    }
+}
+
+static inline bool hs_unpack_error_ex(const void* data, u32 len, u32* out_code, u8* out_op, u8* out_to, u8* out_from, u8* out_stage, u32* out_cid) {
+    if (!data || len < 52) return false;
+    const u8* b = (const u8*)data;
+    if (out_code) memcpy(out_code, &b[0], 4);
+    if (out_op) *out_op = b[4];
+    if (out_to) *out_to = b[5];
+    if (out_from) *out_from = b[6];
+    if (out_stage) *out_stage = b[7];
+    if (out_cid) memcpy(out_cid, &b[8], 4);
+    return true;
+}
+
 #endif

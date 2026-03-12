@@ -57,6 +57,7 @@ typedef enum {
     OP_TEXTURE_WRAP,
     OP_ACK,
     OP_RESULT,
+    OP_ERROR_EX,
     OP_ERROR,
     OP_TRACE,
     OP_STOP,
@@ -114,6 +115,7 @@ typedef struct {
     u32         log_head;
     u32         log_capacity;
     bool        recording;
+    bool        validate_on_send; /* runtime opt-in validation in hs_send */
     Payload*    payloads;
     u32         payload_capacity;
     u32         payload_head;

@@ -126,6 +126,8 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
   - Payload layout: C string, null-terminated
 - `OP_TRACE` (Payload, 1..64B)
   - Payload layout: C string, null-terminated
+- `OP_ERROR_EX` (Payload, 52B)
+  - Payload layout: `[u32 code][u8 op][u8 to][u8 from][u8 stage][u32 cid][u32 arg0][u32 arg1][char msg[32]]`
 - `OP_STOP` (Immediate)
   - No payload
 

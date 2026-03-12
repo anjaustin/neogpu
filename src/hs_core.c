@@ -1,7 +1,67 @@
 #include "hs_core.h"
 #include "hs_nodes.h"
+#include "hs_msg.h"
 #include <stdio.h>
 #include <stdlib.h>
+
+typedef enum {
+    HS_ERR_VALIDATE = 1,
+    HS_ERR_ROUTE = 2,
+    HS_ERR_QUEUE_FULL = 3,
+} HSErrorCode;
+
+typedef enum {
+    HS_ERR_STAGE_SEND = 1,
+    HS_ERR_STAGE_REPLAY = 2,
+} HSErrorStage;
+
+static Node* hs_node_by_id(HSSystem* sys, u8 id) {
+    if (!sys) return NULL;
+    for (u8 i = 0; i < sys->node_count; i++) {
+        if (sys->nodes[i] && sys->nodes[i]->id == id) return sys->nodes[i];
+    }
+    return NULL;
+}
+
+static void hs_report_error_ex(HSSystem* sys, const Message* bad_msg, u32 code, u8 stage, const char* detail) {
+    if (!sys) return;
+    Node* sys_node = hs_node_by_id(sys, NODE_SYSTEM);
+    if (!sys_node) {
+        if (detail) fprintf(stderr, "[HS] ERROR_EX: %s\n", detail);
+        return;
+    }
+
+    u8 payload[52];
+    hs_pack_error_ex(
+        payload,
+        code,
+        bad_msg ? bad_msg->op : 0,
+        bad_msg ? bad_msg->to : 0,
+        bad_msg ? bad_msg->from : 0,
+        stage,
+        bad_msg ? bad_msg->cid : 0,
+        bad_msg ? bad_msg->payload_len : 0,
+        bad_msg ? bad_msg->payload_idx : 0,
+        detail
+    );
+
+    u16 idx = 0;
+    u32 copy_len = 0;
+    if (!hs_payload_alloc_and_copy(sys, payload, sizeof(payload), &idx, &copy_len)) return;
+
+    Message emsg = {
+        .to = NODE_SYSTEM,
+        .from = NODE_CPU,
+        .op = OP_ERROR_EX,
+        .flags = 0,
+        .cid = bad_msg ? bad_msg->cid : 0,
+        .tick = (u16)sys->tick,
+        .payload_idx = idx,
+        .payload_len = copy_len,
+    };
+
+    (void)mq_push(&sys_node->inbox, &emsg);
+}
 
 typedef enum {
     HS_PAYLOAD_NONE = 0,
@@ -47,6 +107,8 @@ static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
 
     [OP_ACK]           = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
     [OP_RESULT]        = {NODE_SYSTEM, HS_PAYLOAD_RANGE,  0, HS_PAYLOAD_SIZE},
+
+    [OP_ERROR_EX]      = {NODE_SYSTEM, HS_PAYLOAD_FIXED, 52, 52},
 
     [OP_CLEAR]         = {NODE_OUTPUT, HS_PAYLOAD_FIXED, 16, 16},
     [OP_CLEAR_DS]      = {NODE_OUTPUT, HS_PAYLOAD_FIXED,  8,  8},
@@ -192,6 +254,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->payload_capacity = HS_MAX_PAYLOADS;
     sys->payload_head = 0;
     sys->recording = true;
+    sys->validate_on_send = false;
     sys->log_overflow = false;
 }
 
@@ -249,16 +312,13 @@ bool hs_capture_replay(HSSystem* sys, const HSCapture* cap) {
 bool hs_send(HSSystem* sys, Message* msg) {
     msg->tick = sys->tick;
 
-#ifndef NDEBUG
-    {
+    if (sys->validate_on_send) {
         const char* err = NULL;
         if (!hs_validate_message(sys, msg, &err)) {
-            fprintf(stderr, "[HS] SEND REJECTED: op=%s to=%u err=%s\n",
-                    hs_op_name((OpCode)msg->op), (unsigned)msg->to, err ? err : "unknown");
+            hs_report_error_ex(sys, msg, HS_ERR_VALIDATE, HS_ERR_STAGE_SEND, err ? err : "validate failed");
             return false;
         }
     }
-#endif
     
     if (sys->recording) {
         if (sys->log_head >= sys->log_capacity) {
@@ -273,7 +333,7 @@ bool hs_send(HSSystem* sys, Message* msg) {
             return mq_push(&sys->nodes[i]->inbox, msg);
         }
     }
-    fprintf(stderr, "[HS] ERROR: Invalid destination node %d\n", msg->to);
+    hs_report_error_ex(sys, msg, HS_ERR_ROUTE, HS_ERR_STAGE_SEND, "invalid destination node");
     return false;
 }
 
@@ -337,16 +397,13 @@ bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
         Message msg = msgs[i];
         msg.tick = sys->tick;
 
-#ifndef NDEBUG
-        {
+        if (sys->validate_on_send) {
             const char* err = NULL;
             if (!hs_validate_message(sys, &msg, &err)) {
-                fprintf(stderr, "[HS] REPLAY REJECTED: i=%u op=%s to=%u err=%s\n",
-                        (unsigned)i, hs_op_name((OpCode)msg.op), (unsigned)msg.to, err ? err : "unknown");
+                hs_report_error_ex(sys, &msg, HS_ERR_VALIDATE, HS_ERR_STAGE_REPLAY, err ? err : "validate failed");
                 return false;
             }
         }
-#endif
         
         bool found = false;
         for (u8 j = 0; j < sys->node_count; j++) {
@@ -358,7 +415,7 @@ bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
             }
         }
         if (!found) {
-            fprintf(stderr, "[HS] REPLAY ERROR: Invalid destination node %d at tick %u\n", msg.to, sys->tick);
+            hs_report_error_ex(sys, &msg, HS_ERR_ROUTE, HS_ERR_STAGE_REPLAY, "invalid destination node");
             return false;
         }
         sys->tick++;
@@ -410,6 +467,7 @@ const char* hs_op_name(OpCode op) {
         case OP_TEXTURE_WRAP:  return "TEXTURE_WRAP";
         case OP_ACK:           return "ACK";
         case OP_RESULT:        return "RESULT";
+        case OP_ERROR_EX:      return "ERROR_EX";
         case OP_ERROR:         return "ERROR";
         case OP_TRACE:         return "TRACE";
         case OP_STOP:          return "STOP";

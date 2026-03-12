@@ -528,6 +528,26 @@ int system_node_process(Node* node) {
                 system_state.last_result_len = (u16)msg.payload_len;
                 break;
 
+            case OP_ERROR_EX: {
+                void* data = get_payload(msg.payload_idx);
+                if (data) {
+                    u32 code = 0;
+                    u8 op = 0, to = 0, from = 0, stage = 0;
+                    u32 cid = 0;
+                    if (hs_unpack_error_ex(data, msg.payload_len, &code, &op, &to, &from, &stage, &cid)) {
+                        system_state.error_count++;
+                        system_state.last_error_code = code;
+                        system_state.last_error_stage = stage;
+                        system_state.last_error_op = op;
+                        system_state.last_error_to = to;
+                        system_state.last_error_from = from;
+                        fprintf(stderr, "[ERROR_EX] code=%u stage=%u op=%u to=%u from=%u cid=%u\n",
+                                (unsigned)code, (unsigned)stage, (unsigned)op, (unsigned)to, (unsigned)from, (unsigned)cid);
+                    }
+                }
+                break;
+            }
+
             case OP_ERROR: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {

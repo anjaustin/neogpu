@@ -140,6 +140,7 @@ static void test_message_validation(void) {
 
     static HSGpu gpu;
     hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
 
     const char* err = NULL;
 
@@ -231,6 +232,22 @@ static void test_message_validation(void) {
     SystemState* st = (SystemState*)gpu.system_node.state;
     TEST("ack_send_ok", send_ok);
     TEST("ack_received", st->ack_count > 0 && st->last_ack_cid == 123 && st->last_ack_op == OP_SET_SHADER);
+
+    /* Structured error emitted on send-time validation failure */
+    Message bad = {
+        .to = NODE_BUFFER,
+        .from = NODE_CPU,
+        .op = OP_SET_SHADER,
+        .flags = 0,
+        .cid = 777,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0,
+    };
+    bool bad_ok = hs_send(&gpu.system, &bad);
+    hs_step(&gpu.system);
+    TEST("send_rejected", !bad_ok);
+    TEST("error_ex_emitted", st->error_count > 0 && st->last_error_op == OP_SET_SHADER && st->last_error_to == NODE_BUFFER);
 }
 
 /* ============================================================
