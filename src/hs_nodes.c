@@ -534,6 +534,22 @@ int system_node_process(Node* node) {
                 system_state.last_queue_full_op = (u8)msg.payload_idx;
                 break;
 
+            case OP_ASYNC_DONE: {
+                void* data = get_payload(msg.payload_idx);
+                if (data) {
+                    u32 task_id = 0;
+                    u8 type = 0, slot = 0, success = 0;
+                    if (hs_unpack_async_done(data, msg.payload_len, &task_id, &type, &slot, &success)) {
+                        system_state.async_done_count++;
+                        system_state.last_async_task_id = task_id;
+                        system_state.last_async_type = type;
+                        system_state.last_async_slot = slot;
+                        system_state.last_async_success = success;
+                    }
+                }
+                break;
+            }
+
             case OP_ERROR_EX: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {

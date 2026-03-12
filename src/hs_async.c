@@ -5,6 +5,8 @@
  */
 
 #include "hs_async.h"
+#include "hs_nodes.h"
+#include "hs_msg.h"
 #include "hs_storage.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,12 +57,12 @@ static void* async_worker(void* arg) {
             }
             
             case ASYNC_SAVE_FILE: {
-                if (task.result) {
+                if (task.result && task.user_data && task.size > 0) {
                     FILE* f = fopen((const char*)task.user_data, "wb");
                     if (f) {
-                        fwrite(task.result, 1, *(u32*)task.user_data, f);
+                        size_t wrote = fwrite(task.result, 1, task.size, f);
                         fclose(f);
-                        task.success = 1;
+                        task.success = (wrote == task.size) ? 1 : 0;
                     }
                 }
                 break;
@@ -73,12 +75,11 @@ static void* async_worker(void* arg) {
         pthread_mutex_lock(&async->mutex);
         
         for (int i = 0; i < HS_ASYNC_MAX_PENDING; i++) {
-            if (async->tasks[i].type == task.type && 
-                async->tasks[i].slot == task.slot &&
-                !async->tasks[i].done) {
+            if (async->tasks[i].task_id == task.task_id && !async->tasks[i].done) {
                 async->tasks[i].done = task.done;
                 async->tasks[i].success = task.success;
                 async->tasks[i].result = task.result;
+                async->tasks[i].size = task.size;
                 break;
             }
         }
@@ -93,9 +94,16 @@ void hs_async_init(HSAsync* async, HSGraphics* gfx) {
     memset(async, 0, sizeof(HSAsync));
     async->gfx = gfx;
     async->running = false;
+    async->notify_to = NODE_SYSTEM;
     
     sem_init(&async->sem, 0, 0);
     pthread_mutex_init(&async->mutex, NULL);
+}
+
+void hs_async_attach_system(HSAsync* async, HSSystem* sys, u8 notify_to) {
+    if (!async) return;
+    async->sys = sys;
+    async->notify_to = notify_to;
 }
 
 void hs_async_shutdown(HSAsync* async) {
@@ -120,9 +128,11 @@ bool hs_async_load_texture(HSAsync* async, u8 slot, const char* path) {
     
     AsyncTask task = {
         .type = ASYNC_LOAD_TEXTURE,
+        .task_id = ++async->next_task_id,
         .slot = slot,
         .done = 0,
         .success = 0,
+        .size = 0,
         .result = NULL,
         .user_data = strdup(path)
     };
@@ -156,11 +166,13 @@ bool hs_async_save_file(HSAsync* async, const char* path, const void* data, u32 
     
     AsyncTask task = {
         .type = ASYNC_SAVE_FILE,
+        .task_id = ++async->next_task_id,
         .slot = 0,
         .done = 0,
         .success = 0,
+        .size = size,
         .result = copy,
-        .user_data = (void*)(uintptr_t)size
+        .user_data = strdup(path)
     };
     
     async->tasks[async->head] = task;
@@ -187,6 +199,22 @@ bool hs_async_process(HSAsync* async) {
     for (int i = 0; i < HS_ASYNC_MAX_PENDING; i++) {
         if (async->tasks[i].done) {
             has_done = true;
+
+            if (async->sys) {
+                u8 payload[8];
+                hs_pack_async_done(payload, async->tasks[i].task_id, (u8)async->tasks[i].type, async->tasks[i].slot, async->tasks[i].success);
+                Message m = {
+                    .to = async->notify_to,
+                    .from = NODE_CPU,
+                    .op = OP_ASYNC_DONE,
+                    .flags = 0,
+                    .cid = 0,
+                    .tick = 0,
+                    .payload_idx = 0,
+                    .payload_len = 0,
+                };
+                (void)hs_send_with_payload(async->sys, &m, payload, sizeof(payload));
+            }
             
             if (async->tasks[i].type == ASYNC_LOAD_TEXTURE) {
                 DBG_PRINT("[Async] Texture %d loaded: %s\n", 
@@ -194,9 +222,8 @@ bool hs_async_process(HSAsync* async) {
                     async->tasks[i].success ? "OK" : "FAILED");
             }
             
-            if (async->tasks[i].user_data) {
-                free(async->tasks[i].user_data);
-            }
+            if (async->tasks[i].user_data) free(async->tasks[i].user_data);
+            if (async->tasks[i].result) free(async->tasks[i].result);
             
             memset(&async->tasks[i], 0, sizeof(AsyncTask));
         }

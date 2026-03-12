@@ -148,4 +148,23 @@ static inline bool hs_unpack_error_ex(const void* data, u32 len, u32* out_code, 
     return true;
 }
 
+/* Async completion payload (OP_ASYNC_DONE): [u32 task_id][u8 type][u8 slot][u8 success][u8 reserved] */
+static inline void hs_pack_async_done(u8 out[8], u32 task_id, u8 type, u8 slot, u8 success) {
+    memcpy(&out[0], &task_id, 4);
+    out[4] = type;
+    out[5] = slot;
+    out[6] = success;
+    out[7] = 0;
+}
+
+static inline bool hs_unpack_async_done(const void* data, u32 len, u32* out_task_id, u8* out_type, u8* out_slot, u8* out_success) {
+    if (!data || len < 8) return false;
+    const u8* b = (const u8*)data;
+    if (out_task_id) memcpy(out_task_id, &b[0], 4);
+    if (out_type) *out_type = b[4];
+    if (out_slot) *out_slot = b[5];
+    if (out_success) *out_success = b[6];
+    return true;
+}
+
 #endif

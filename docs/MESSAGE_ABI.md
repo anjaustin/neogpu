@@ -132,6 +132,8 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
   - Payload layout: `[u32 code][u8 op][u8 to][u8 from][u8 stage][u32 cid][u32 arg0][u32 arg1][char msg[32]]`
 - `OP_QUEUE_FULL` (Immediate)
   - Header: `flags = destination node id`, `payload_idx = opcode that could not be enqueued`
+- `OP_ASYNC_DONE` (Payload, 8B)
+  - Payload layout: `[u32 task_id][u8 type][u8 slot][u8 success][u8 reserved]`
 - `OP_STOP` (Immediate)
   - No payload
 

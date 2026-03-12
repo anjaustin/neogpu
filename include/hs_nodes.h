@@ -92,6 +92,13 @@ typedef struct {
     u8  last_queue_full_to;
     u8  last_queue_full_op;
     u16 pad1;
+
+    u32 async_done_count;
+    u32 last_async_task_id;
+    u8  last_async_type;
+    u8  last_async_slot;
+    u8  last_async_success;
+    u8  pad2;
 } SystemState;
 
 int shader_node_process(Node* node);

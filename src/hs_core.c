@@ -157,6 +157,7 @@ static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
 
     [OP_ERROR_EX]      = {NODE_SYSTEM, HS_PAYLOAD_FIXED, 52, 52},
     [OP_QUEUE_FULL]    = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
+    [OP_ASYNC_DONE]    = {NODE_SYSTEM, HS_PAYLOAD_FIXED,  8, 8},
 
     [OP_CLEAR]         = {NODE_OUTPUT, HS_PAYLOAD_FIXED, 16, 16},
     [OP_CLEAR_DS]      = {NODE_OUTPUT, HS_PAYLOAD_FIXED,  8,  8},
@@ -567,6 +568,7 @@ const char* hs_op_name(OpCode op) {
         case OP_RESULT:        return "RESULT";
         case OP_ERROR_EX:      return "ERROR_EX";
         case OP_QUEUE_FULL:    return "QUEUE_FULL";
+        case OP_ASYNC_DONE:    return "ASYNC_DONE";
         case OP_ERROR:         return "ERROR";
         case OP_TRACE:         return "TRACE";
         case OP_STOP:          return "STOP";

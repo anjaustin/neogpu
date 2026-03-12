@@ -59,6 +59,7 @@ typedef enum {
     OP_RESULT,
     OP_ERROR_EX,
     OP_QUEUE_FULL,
+    OP_ASYNC_DONE,
     OP_ERROR,
     OP_TRACE,
     OP_STOP,

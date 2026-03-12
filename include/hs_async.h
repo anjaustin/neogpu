@@ -26,9 +26,12 @@ typedef enum {
 
 typedef struct {
     AsyncType type;
+    u32      task_id;
     u8       slot;
     u8       done;
     u8       success;
+    u8       pad0;
+    u32      size;
     void*    result;
     void*    user_data;
 } AsyncTask;
@@ -38,15 +41,21 @@ typedef struct {
     u8           pending_count;
     u8           head;
     u8           tail;
+    u32          next_task_id;
     sem_t        sem;
     pthread_t    thread;
     pthread_mutex_t mutex;
     volatile bool running;
     HSGraphics*  gfx;
+    HSSystem*    sys;
+    u8           notify_to;
 } HSAsync;
 
 void hs_async_init(HSAsync* async, HSGraphics* gfx);
 void hs_async_shutdown(HSAsync* async);
+
+/* If attached, hs_async_process emits OP_ASYNC_DONE messages to notify_to. */
+void hs_async_attach_system(HSAsync* async, HSSystem* sys, u8 notify_to);
 
 bool hs_async_load_texture(HSAsync* async, u8 slot, const char* path);
 bool hs_async_save_file(HSAsync* async, const char* path, const void* data, u32 size);

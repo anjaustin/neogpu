@@ -1,8 +1,10 @@
 #include <stdio.h>
+#include <unistd.h>
 #include "hs_gpu.h"
 #include "hs_math_neon.h"
 #include "hs_input.h"
 #include "hs_buffer.h"
+#include "hs_async.h"
 
 /* ============================================================
  * Test helpers
@@ -270,6 +272,56 @@ static void test_message_validation(void) {
 }
 
 /* ============================================================
+ * Async completion tests
+ * ============================================================ */
+static void test_async_done(void) {
+    printf("\n--- Async Completion Tests ---\n");
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
+    gpu.system.recording = false;
+
+    HSAsync async;
+    hs_async_init(&async, NULL);
+    hs_async_attach_system(&async, &gpu.system, NODE_SYSTEM);
+
+    const char* path = "/tmp/neogpu_async_test.bin";
+    const char data[] = "abc";
+    bool enq_ok = hs_async_save_file(&async, path, data, 3);
+    TEST("async_enqueued", enq_ok);
+
+    SystemState* st = (SystemState*)gpu.system_node.state;
+    u32 start = st->async_done_count;
+
+    bool got = false;
+    for (int i = 0; i < 200; i++) {
+        if (hs_async_process(&async)) {
+            hs_step(&gpu.system);
+            if (st->async_done_count > start) {
+                got = true;
+                break;
+            }
+        }
+        usleep(1000);
+    }
+
+    TEST("async_done_msg", got && st->last_async_success == 1);
+
+    FILE* f = fopen(path, "rb");
+    if (f) {
+        char buf[4] = {0};
+        size_t r = fread(buf, 1, 3, f);
+        fclose(f);
+        TEST("async_file_written", r == 3 && buf[0] == 'a' && buf[1] == 'b' && buf[2] == 'c');
+    } else {
+        TEST("async_file_written", false);
+    }
+
+    hs_async_shutdown(&async);
+}
+
+/* ============================================================
  * GPU message system demo (original + new ops)
  * ============================================================ */
 static void test_gpu(void) {
@@ -503,6 +555,7 @@ int main(void) {
     test_buffer();
     test_input();
     test_message_validation();
+    test_async_done();
     test_gpu();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
