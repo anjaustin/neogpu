@@ -1,6 +1,7 @@
 #include "hs_core.h"
 #include "hs_nodes.h"
 #include "hs_msg.h"
+#include "hs_render.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -108,6 +109,71 @@ static void hs_report_queue_full(HSSystem* sys, const Message* msg, u8 dest_node
         .payload_len = 0,
     };
     (void)mq_push(&sys_node->inbox, &q);
+}
+
+static void hs_render_record(HSSystem* sys, const Message* msg) {
+    if (!sys || !sys->render_list || !msg) return;
+
+    HSRenderCmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+
+    switch ((OpCode)msg->op) {
+        case OP_CLEAR: {
+            if (msg->payload_len != 16 || msg->payload_idx >= sys->payload_capacity) return;
+            f32 rgba[4];
+            if (!hs_unpack_clear_color(sys->payloads[msg->payload_idx].data, msg->payload_len, rgba)) return;
+            cmd.op = HS_RC_CLEAR;
+            cmd.f0 = rgba[0];
+            cmd.f1 = rgba[1];
+            cmd.f2 = rgba[2];
+            cmd.f3 = rgba[3];
+            break;
+        }
+
+        case OP_CLEAR_DS: {
+            if (msg->payload_len != 8 || msg->payload_idx >= sys->payload_capacity) return;
+            f32 depth = 0.0f;
+            u8 stencil = 0;
+            if (!hs_unpack_clear_ds(sys->payloads[msg->payload_idx].data, msg->payload_len, &depth, &stencil)) return;
+            cmd.op = HS_RC_CLEAR_DS;
+            cmd.f0 = depth;
+            cmd.a = stencil;
+            break;
+        }
+
+        case OP_DRAW:
+            cmd.op = HS_RC_DRAW;
+            cmd.a = (u8)(msg->payload_idx & 0xF);
+            break;
+
+        case OP_DRAW_INSTANCE: {
+            if (msg->payload_len != 4 || msg->payload_idx >= sys->payload_capacity) return;
+            u8 b = 0, ib = 0;
+            u32 count = 0;
+            if (!hs_unpack_draw_instance(sys->payloads[msg->payload_idx].data, msg->payload_len, &b, &ib, &count)) return;
+            cmd.op = HS_RC_DRAW_INSTANCE;
+            cmd.a = b;
+            cmd.b = ib;
+            cmd.x = count;
+            break;
+        }
+
+        case OP_DRAW_TEXT:
+            cmd.op = HS_RC_DRAW_TEXT;
+            cmd.payload_idx = msg->payload_idx;
+            cmd.payload_len = (u16)msg->payload_len;
+            break;
+
+        case OP_SHOW_TEXTURE:
+            cmd.op = HS_RC_SHOW_TEXTURE;
+            cmd.a = (u8)(msg->payload_idx & 0xF);
+            break;
+
+        default:
+            return;
+    }
+
+    (void)hs_render_push(sys->render_list, &cmd);
 }
 
 typedef enum {
@@ -304,6 +370,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->payload_head = 0;
     sys->recording = true;
     sys->validate_on_send = false;
+    sys->render_list = NULL;
     sys->log_overflow = false;
 }
 
@@ -428,6 +495,7 @@ bool hs_send(HSSystem* sys, Message* msg) {
             if (sys->recording) {
                 sys->log[sys->log_head++] = *msg;
             }
+            hs_render_record(sys, msg);
             return true;
         }
     }
@@ -507,6 +575,7 @@ bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
         bool found = false;
         for (u8 j = 0; j < sys->node_count; j++) {
             if (sys->nodes[j]->id == msg.to) {
+                hs_render_record(sys, &msg);
                 mq_push(&sys->nodes[j]->inbox, &msg);
                 sys->nodes[j]->process_fn(sys->nodes[j]);
                 found = true;

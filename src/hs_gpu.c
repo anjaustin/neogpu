@@ -7,6 +7,7 @@ void hs_gpu_init(HSGpu* gpu) {
     memset(gpu, 0, sizeof(*gpu));
     hs_init(&gpu->system, gpu->log_buffer, HS_MAX_MSG_LOG, gpu->payload_buffer);
     hs_nodes_set_system(&gpu->system);
+    gpu->system.render_list = &gpu->render;
     
     gpu->shader_node.id = NODE_SHADER;
     gpu->buffer_node.id = NODE_BUFFER;
@@ -47,7 +48,7 @@ static void hs_gpu_build_frame(const HSGpu* gpu, HSFrameContext* out) {
     out->output_state = gpu->output_node.state;
     out->sound_state = gpu->sound_node.state;
     out->system_state = gpu->system_node.state;
-    out->render = NULL;
+    out->render = &gpu->render;
 }
 
 static void hs_gpu_send_simple(HSGpu* gpu, u8 to, OpCode op, u32 payload_idx, u32 payload_len) {
@@ -283,6 +284,7 @@ void hs_gpu_stop(HSGpu* gpu) {
 }
 
 void hs_gpu_begin_frame(HSGpu* gpu) {
+    hs_render_reset(&gpu->render);
     if (gpu->backend && gpu->backend->ops && gpu->backend->ops->begin_frame) {
         HSFrameContext frame;
         hs_gpu_build_frame(gpu, &frame);

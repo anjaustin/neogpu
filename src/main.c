@@ -146,6 +146,59 @@ static void test_backend_hooks(void) {
     TEST("backend_end", st.end_count == 1);
 }
 
+typedef struct {
+    u32 cmd_count;
+    u8  ops[16];
+} MockExecState;
+
+static void mock_backend_exec_capture(void* ctx, const HSFrameContext* frame) {
+    MockExecState* st = (MockExecState*)ctx;
+    if (!frame || !frame->render) return;
+    st->cmd_count = frame->render->count;
+    u32 n = frame->render->count;
+    if (n > 16) n = 16;
+    for (u32 i = 0; i < n; i++) {
+        st->ops[i] = frame->render->cmds[i].op;
+    }
+}
+
+static void test_render_commands(void) {
+    printf("\n--- Render Command Tests ---\n");
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+
+    static MockExecState st;
+    memset(&st, 0, sizeof(st));
+
+    static const HSBackendOps ops = {
+        .init = NULL,
+        .shutdown = NULL,
+        .begin_frame = NULL,
+        .execute = mock_backend_exec_capture,
+        .end_frame = NULL,
+    };
+
+    HSBackend backend = {
+        .ctx = &st,
+        .ops = &ops,
+    };
+    hs_gpu_attach_backend(&gpu, &backend);
+
+    hs_gpu_begin_frame(&gpu);
+
+    vec4 clear_color = v4_make(0.2f, 0.3f, 0.4f, 1.0f);
+    hs_gpu_clear(&gpu, clear_color);
+    hs_gpu_draw_text(&gpu, "hi");
+    hs_gpu_draw(&gpu, 0);
+    hs_gpu_process(&gpu);
+
+    hs_gpu_end_frame(&gpu);
+
+    TEST("render_cmd_count", st.cmd_count >= 3);
+    TEST("render_cmd_clear", st.ops[0] == HS_RC_CLEAR);
+}
+
 /* ============================================================
  * Buffer tests
  * ============================================================ */
@@ -616,6 +669,7 @@ int main(void) {
 
     test_math();
     test_backend_hooks();
+    test_render_commands();
     test_buffer();
     test_input();
     test_message_validation();

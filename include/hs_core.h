@@ -13,6 +13,8 @@
 #include <string.h>
 #include <arm_neon.h>
 
+typedef struct HSRenderList HSRenderList;
+
 #define HS_MAX_NODES       16
 #define HS_MAX_MSG_LOG     65536
 #define HS_QUEUE_SIZE      256
@@ -118,6 +120,7 @@ typedef struct {
     u32         log_capacity;
     bool        recording;
     bool        validate_on_send; /* runtime opt-in validation in hs_send */
+    HSRenderList* render_list;
     Payload*    payloads;
     u32         payload_capacity;
     u32         payload_head;

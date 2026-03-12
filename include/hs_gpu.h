@@ -5,6 +5,7 @@
 #include "hs_nodes.h"
 #include "hs_math_neon.h"
 #include "hs_backend.h"
+#include "hs_render.h"
 
 typedef struct HSFrameContext {
     u32 tick;
@@ -15,7 +16,7 @@ typedef struct HSFrameContext {
     const void* output_state;
     const void* sound_state;
     const void* system_state;
-    const void* render;
+    const HSRenderList* render;
 } HSFrameContext;
 
 typedef struct HSGpu {
@@ -30,6 +31,8 @@ typedef struct HSGpu {
     Node        system_node;
 
     HSBackend*   backend;
+
+    HSRenderList render;
 } HSGpu;
 
 void hs_gpu_init(HSGpu* gpu);
