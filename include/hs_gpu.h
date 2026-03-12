@@ -4,8 +4,21 @@
 #include "hs_core.h"
 #include "hs_nodes.h"
 #include "hs_math_neon.h"
+#include "hs_backend.h"
 
-typedef struct {
+typedef struct HSFrameContext {
+    u32 tick;
+    const HSSystem* sys;
+    const void* shader_state;
+    const void* buffer_state;
+    const void* texture_state;
+    const void* output_state;
+    const void* sound_state;
+    const void* system_state;
+    const void* render;
+} HSFrameContext;
+
+typedef struct HSGpu {
     HSSystem    system;
     Message     log_buffer[HS_MAX_MSG_LOG];
     Payload     payload_buffer[HS_MAX_PAYLOADS];
@@ -15,9 +28,13 @@ typedef struct {
     Node        output_node;
     Node        sound_node;
     Node        system_node;
+
+    HSBackend*   backend;
 } HSGpu;
 
 void hs_gpu_init(HSGpu* gpu);
+
+void hs_gpu_attach_backend(HSGpu* gpu, HSBackend* backend);
 
 void hs_gpu_set_shader(HSGpu* gpu, u8 shader);
 void hs_gpu_set_param(HSGpu* gpu, u8 idx, vec4 value);

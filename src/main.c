@@ -84,6 +84,69 @@ static void test_math(void) {
 }
 
 /* ============================================================
+ * Backend hook tests
+ * ============================================================ */
+typedef struct {
+    u32 init_count;
+    u32 begin_count;
+    u32 exec_count;
+    u32 end_count;
+} MockBackendState;
+
+static bool mock_backend_init(void* ctx, HSGpu* gpu) {
+    (void)gpu;
+    ((MockBackendState*)ctx)->init_count++;
+    return true;
+}
+
+static void mock_backend_begin(void* ctx, const HSFrameContext* frame) {
+    (void)frame;
+    ((MockBackendState*)ctx)->begin_count++;
+}
+
+static void mock_backend_exec(void* ctx, const HSFrameContext* frame) {
+    (void)frame;
+    ((MockBackendState*)ctx)->exec_count++;
+}
+
+static void mock_backend_end(void* ctx, const HSFrameContext* frame) {
+    (void)frame;
+    ((MockBackendState*)ctx)->end_count++;
+}
+
+static void test_backend_hooks(void) {
+    printf("\n--- Backend Hook Tests ---\n");
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+
+    static MockBackendState st;
+    memset(&st, 0, sizeof(st));
+
+    static const HSBackendOps ops = {
+        .init = mock_backend_init,
+        .shutdown = NULL,
+        .begin_frame = mock_backend_begin,
+        .execute = mock_backend_exec,
+        .end_frame = mock_backend_end,
+    };
+
+    HSBackend backend = {
+        .ctx = &st,
+        .ops = &ops,
+    };
+
+    hs_gpu_attach_backend(&gpu, &backend);
+    hs_gpu_begin_frame(&gpu);
+    hs_gpu_end_frame(&gpu);
+
+    TEST("backend_init", st.init_count == 1);
+    TEST("backend_begin", st.begin_count == 1);
+    TEST("backend_execute", st.exec_count == 1);
+    TEST("backend_end", st.end_count == 1);
+}
+
+/* ============================================================
  * Buffer tests
  * ============================================================ */
 static void test_buffer(void) {
@@ -552,6 +615,7 @@ int main(void) {
     printf("=== HS-GPU NEON Test Suite ===\n");
 
     test_math();
+    test_backend_hooks();
     test_buffer();
     test_input();
     test_message_validation();

@@ -4,6 +4,7 @@
 #include <string.h>
 
 void hs_gpu_init(HSGpu* gpu) {
+    memset(gpu, 0, sizeof(*gpu));
     hs_init(&gpu->system, gpu->log_buffer, HS_MAX_MSG_LOG, gpu->payload_buffer);
     hs_nodes_set_system(&gpu->system);
     
@@ -27,6 +28,26 @@ void hs_gpu_init(HSGpu* gpu) {
     hs_register(&gpu->system, &gpu->output_node);
     hs_register(&gpu->system, &gpu->sound_node);
     hs_register(&gpu->system, &gpu->system_node);
+}
+
+void hs_gpu_attach_backend(HSGpu* gpu, HSBackend* backend) {
+    gpu->backend = backend;
+    if (gpu->backend && gpu->backend->ops && gpu->backend->ops->init) {
+        (void)gpu->backend->ops->init(gpu->backend->ctx, gpu);
+    }
+}
+
+static void hs_gpu_build_frame(const HSGpu* gpu, HSFrameContext* out) {
+    memset(out, 0, sizeof(*out));
+    out->tick = gpu->system.tick;
+    out->sys = &gpu->system;
+    out->shader_state = gpu->shader_node.state;
+    out->buffer_state = gpu->buffer_node.state;
+    out->texture_state = gpu->texture_node.state;
+    out->output_state = gpu->output_node.state;
+    out->sound_state = gpu->sound_node.state;
+    out->system_state = gpu->system_node.state;
+    out->render = NULL;
 }
 
 static void hs_gpu_send_simple(HSGpu* gpu, u8 to, OpCode op, u32 payload_idx, u32 payload_len) {
@@ -262,9 +283,18 @@ void hs_gpu_stop(HSGpu* gpu) {
 }
 
 void hs_gpu_begin_frame(HSGpu* gpu) {
-    (void)gpu;
+    if (gpu->backend && gpu->backend->ops && gpu->backend->ops->begin_frame) {
+        HSFrameContext frame;
+        hs_gpu_build_frame(gpu, &frame);
+        gpu->backend->ops->begin_frame(gpu->backend->ctx, &frame);
+    }
 }
 
 void hs_gpu_end_frame(HSGpu* gpu) {
-    (void)gpu;
+    if (gpu->backend && gpu->backend->ops) {
+        HSFrameContext frame;
+        hs_gpu_build_frame(gpu, &frame);
+        if (gpu->backend->ops->execute) gpu->backend->ops->execute(gpu->backend->ctx, &frame);
+        if (gpu->backend->ops->end_frame) gpu->backend->ops->end_frame(gpu->backend->ctx, &frame);
+    }
 }

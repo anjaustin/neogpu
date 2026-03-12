@@ -235,6 +235,9 @@ void hs_window_poll(HSWindow* win);
 Related PRDs:
 - `docs/PRD_COMM_FABRIC.md` (acks/results, structured errors, capture I/O, async completions, backpressure, introspection)
 
+Execution Path:
+- `include/hs_backend.h` defines the backend interface; the next major evolution is connecting the message-driven state + render commands to an execution backend (GLES).
+
 ### Milestone 1: Mesh Renderer
 - [ ] Add `hs_mesh.h` with mesh structures
 - [ ] Add built-in vertex shader (MVP)
