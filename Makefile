@@ -2,13 +2,13 @@
 CC = gcc
 CFLAGS = -O3 -march=armv8.2-a+fp16+simd -mtune=cortex-a72 \
          -ffast-math -funroll-loops -Wall -Wextra -DNDEBUG -Iinclude
-LDFLAGS = -lm -lGLESv2 -lgbm -ldrm -lEGL
+LDFLAGS = -lm -lGLESv2 -lgbm -ldrm -lEGL -lpthread
 STRIP = strip
 
 SRC_DIR = src
 OBJ_DIR = src
 
-HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/main.c
+HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/main.c
 HS_OBJ = $(HS_SRC:.c=.o)
 HS_TARGET = neogpu_demo
 
@@ -36,22 +36,22 @@ run: $(HS_TARGET)
 build-tests: $(HS_OBJ)
 	@echo "Building graphics tests..."
 	$(CC) $(CFLAGS) -c tests/test_01_clear.c -o tests/test_01_clear.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_01_clear.o $(LDFLAGS) -o tests/test_01_clear
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o tests/test_01_clear.o $(LDFLAGS) -o tests/test_01_clear
 	$(STRIP) tests/test_01_clear
 	$(CC) $(CFLAGS) -c tests/test_02_triangle.c -o tests/test_02_triangle.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_02_triangle.o $(LDFLAGS) -o tests/test_02_triangle
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o tests/test_02_triangle.o $(LDFLAGS) -o tests/test_02_triangle
 	$(STRIP) tests/test_02_triangle
 	$(CC) $(CFLAGS) -c tests/test_03_instancing.c -o tests/test_03_instancing.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_03_instancing.o $(LDFLAGS) -o tests/test_03_instancing
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o tests/test_03_instancing.o $(LDFLAGS) -o tests/test_03_instancing
 	$(STRIP) tests/test_03_instancing
 	$(CC) $(CFLAGS) -c tests/test_04_blending.c -o tests/test_04_blending.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_04_blending.o $(LDFLAGS) -o tests/test_04_blending
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o tests/test_04_blending.o $(LDFLAGS) -o tests/test_04_blending
 	$(STRIP) tests/test_04_blending
 	$(CC) $(CFLAGS) -c tests/test_05_cube3d.c -o tests/test_05_cube3d.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_05_cube3d.o $(LDFLAGS) -o tests/test_05_cube3d
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o tests/test_05_cube3d.o $(LDFLAGS) -o tests/test_05_cube3d
 	$(STRIP) tests/test_05_cube3d
 	$(CC) $(CFLAGS) -c tests/test_06_raycast.c -o tests/test_06_raycast.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o tests/test_06_raycast.o $(LDFLAGS) -o tests/test_06_raycast
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o tests/test_06_raycast.o $(LDFLAGS) -o tests/test_06_raycast
 	$(STRIP) tests/test_06_raycast
 
 run-test:
@@ -62,5 +62,5 @@ run-test:
 		exit 1; \
 	fi
 	$(CC) $(CFLAGS) -c tests/test_$(N)_*.c -o /tmp/test_$(N).o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o /tmp/test_$(N).o $(LDFLAGS) -o /tmp/test_$(N)
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o /tmp/test_$(N).o $(LDFLAGS) -o /tmp/test_$(N)
 	sudo /tmp/test_$(N)
