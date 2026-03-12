@@ -40,3 +40,8 @@ Make the messaging layer safe and predictable when used from multiple threads, o
 - Atomic fix for `HSAsync.running`.
 - Dropped-telemetry counters.
 - Tests proving multi-thread safety and re-entrancy.
+
+## Implementation Notes (Now)
+
+- The recursive system lock lives in `include/hs_core.h` / `src/hs_core.c` (`hs_lock/hs_unlock`).
+- Multi-thread falsification test lives in `src/main.c` ("Thread Safety Tests").

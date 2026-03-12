@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <unistd.h>
+#include <pthread.h>
 #include "hs_gpu.h"
 #include "hs_math_neon.h"
 #include "hs_input.h"
@@ -451,6 +452,71 @@ static void test_async_done(void) {
 }
 
 /* ============================================================
+ * Multi-thread messaging falsification
+ * ============================================================ */
+typedef struct {
+    HSSystem* sys;
+    volatile bool* stop;
+    u32 sent;
+    u32 failed;
+} SenderArgs;
+
+static void* sender_thread(void* arg) {
+    SenderArgs* a = (SenderArgs*)arg;
+    u32 i = 0;
+    while (!*a->stop) {
+        Message m = {
+            .to = NODE_SHADER,
+            .from = NODE_CPU,
+            .op = OP_SET_SHADER,
+            .flags = HS_MSGF_ACK,
+            .cid = i,
+            .tick = 0,
+            .payload_idx = (u16)(i & 0xFF),
+            .payload_len = 0,
+        };
+        if (hs_send(a->sys, &m)) a->sent++;
+        else a->failed++;
+        i++;
+    }
+    return NULL;
+}
+
+static void test_thread_safety(void) {
+    printf("\n--- Thread Safety Tests ---\n");
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
+    gpu.system.recording = false;
+
+    volatile bool stop = false;
+    SenderArgs args = {
+        .sys = &gpu.system,
+        .stop = &stop,
+        .sent = 0,
+        .failed = 0,
+    };
+
+    pthread_t th;
+    int rc = pthread_create(&th, NULL, sender_thread, &args);
+    TEST("thread_spawn", rc == 0);
+
+    /* Main thread steps while sender enqueues (leave CPU time for sender). */
+    for (int i = 0; i < 500; i++) {
+        hs_step(&gpu.system);
+        usleep(1000);
+    }
+
+    stop = true;
+    pthread_join(th, NULL);
+
+    SystemState* st = (SystemState*)gpu.system_node.state;
+    TEST("thread_sent", args.sent > 0);
+    TEST("thread_ack_progress", st->ack_count > 0);
+}
+
+/* ============================================================
  * GPU message system demo (original + new ops)
  * ============================================================ */
 static void test_gpu(void) {
@@ -687,6 +753,7 @@ int main(void) {
     test_input();
     test_message_validation();
     test_async_done();
+    test_thread_safety();
     test_gpu();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
