@@ -134,6 +134,7 @@ int shader_node_process(Node* node) {
             }
                 
             case OP_CULL:
+                shader_state.cull_mode = (u8)msg.payload_idx;
                 DBG_PRINT("[%s] Cull mode: %d\n", node_name(node->id), (int)msg.payload_idx);
                 break;
                 
@@ -163,10 +164,12 @@ int shader_node_process(Node* node) {
             }
                 
             case OP_DEPTH:
+                shader_state.depth_enabled = (msg.payload_idx != 0);
                 DBG_PRINT("[%s] Depth: %s\n", node_name(node->id), msg.payload_idx ? "enabled" : "disabled");
                 break;
                 
             case OP_COLOR_MASK:
+                shader_state.color_mask = (u8)msg.payload_idx;
                 DBG_PRINT("[%s] Color mask: 0x%02X\n", node_name(node->id), (int)msg.payload_idx);
                 break;
                 

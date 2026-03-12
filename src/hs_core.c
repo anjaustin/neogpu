@@ -118,6 +118,58 @@ static void hs_render_record(HSSystem* sys, const Message* msg) {
     memset(&cmd, 0, sizeof(cmd));
 
     switch ((OpCode)msg->op) {
+        case OP_CULL:
+            cmd.op = HS_RC_SET_CULL;
+            cmd.a = (u8)msg->payload_idx;
+            break;
+
+        case OP_BLEND: {
+            if (msg->payload_len != 2 || msg->payload_idx >= sys->payload_capacity) return;
+            u8 src = 0, dst = 0;
+            if (!hs_unpack_u8x2(sys->payloads[msg->payload_idx].data, msg->payload_len, &src, &dst)) return;
+            cmd.op = HS_RC_SET_BLEND;
+            cmd.a = src;
+            cmd.b = dst;
+            break;
+        }
+
+        case OP_ALPHA:
+            cmd.op = HS_RC_SET_ALPHA;
+            cmd.a = (u8)(msg->payload_idx ? 1 : 0);
+            break;
+
+        case OP_DEPTH:
+            cmd.op = HS_RC_SET_DEPTH;
+            cmd.a = (u8)(msg->payload_idx ? 1 : 0);
+            break;
+
+        case OP_DEPTH_COMPARE: {
+            if (msg->payload_len != 2 || msg->payload_idx >= sys->payload_capacity) return;
+            u8 cmp = 0, wr = 0;
+            if (!hs_unpack_u8x2(sys->payloads[msg->payload_idx].data, msg->payload_len, &cmp, &wr)) return;
+            cmd.op = HS_RC_SET_DEPTH_COMPARE;
+            cmd.a = cmp;
+            cmd.b = wr;
+            break;
+        }
+
+        case OP_COLOR_MASK:
+            cmd.op = HS_RC_SET_COLOR_MASK;
+            cmd.a = (u8)msg->payload_idx;
+            break;
+
+        case OP_CLIP: {
+            if (msg->payload_len != 8 || msg->payload_idx >= sys->payload_capacity) return;
+            u16 v[4];
+            if (!hs_unpack_u16x4(sys->payloads[msg->payload_idx].data, msg->payload_len, v)) return;
+            cmd.op = HS_RC_SET_CLIP;
+            cmd.x = v[0];
+            cmd.y = v[1];
+            cmd.payload_idx = v[2];
+            cmd.payload_len = v[3];
+            break;
+        }
+
         case OP_CLEAR: {
             if (msg->payload_len != 16 || msg->payload_idx >= sys->payload_capacity) return;
             f32 rgba[4];

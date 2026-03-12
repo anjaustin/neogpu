@@ -144,7 +144,12 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
 
 ## Render Recording
 
-When `HSSystem.render_list` is set (by `hs_gpu_init`), `hs_send()` records render-relevant ops into an `HSRenderList` in send order (clear/draw/text/show_texture). This is the bridge that allows a backend to execute pixels from the message stream.
+When `HSSystem.render_list` is set (by `hs_gpu_init`), `hs_send()` records render-relevant ops into an `HSRenderList` in send order.
+
+Currently recorded ops include:
+
+- state: `OP_CULL`, `OP_BLEND`, `OP_ALPHA`, `OP_DEPTH`, `OP_DEPTH_COMPARE`, `OP_COLOR_MASK`, `OP_CLIP`
+- commands: `OP_CLEAR`, `OP_CLEAR_DS`, `OP_DRAW`, `OP_DRAW_INSTANCE`, `OP_DRAW_TEXT`, `OP_SHOW_TEXTURE`
 
 The minimal GLES executor is implemented in `src/hs_backend_gles.c`.
 

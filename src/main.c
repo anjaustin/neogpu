@@ -187,6 +187,10 @@ static void test_render_commands(void) {
 
     hs_gpu_begin_frame(&gpu);
 
+    hs_gpu_color_mask(&gpu, 0x0F);
+    hs_gpu_alpha(&gpu, false);
+    hs_gpu_clip(&gpu, 0, 0, 640, 480);
+
     vec4 clear_color = v4_make(0.2f, 0.3f, 0.4f, 1.0f);
     hs_gpu_clear(&gpu, clear_color);
     hs_gpu_draw_text(&gpu, "hi");
@@ -195,8 +199,11 @@ static void test_render_commands(void) {
 
     hs_gpu_end_frame(&gpu);
 
-    TEST("render_cmd_count", st.cmd_count >= 3);
-    TEST("render_cmd_clear", st.ops[0] == HS_RC_CLEAR);
+    TEST("render_cmd_count", st.cmd_count >= 6);
+    TEST("render_cmd_mask", st.ops[0] == HS_RC_SET_COLOR_MASK);
+    TEST("render_cmd_alpha", st.ops[1] == HS_RC_SET_ALPHA);
+    TEST("render_cmd_clip", st.ops[2] == HS_RC_SET_CLIP);
+    TEST("render_cmd_clear", st.ops[3] == HS_RC_CLEAR);
 }
 
 /* ============================================================

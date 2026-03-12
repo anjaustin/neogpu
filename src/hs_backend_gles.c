@@ -14,6 +14,30 @@ typedef struct {
     GLint color_loc;
 } HSGLESBackend;
 
+static inline GLenum hs_gles_blend_factor(u8 v) {
+    switch (v) {
+        case 0: return GL_ZERO;
+        case 1: return GL_ONE;
+        case 5: return GL_SRC_ALPHA;
+        case 6: return GL_ONE_MINUS_SRC_ALPHA;
+        default: return GL_ONE;
+    }
+}
+
+static inline GLenum hs_gles_depth_func(u8 v) {
+    switch (v) {
+        case 0: return GL_ALWAYS;
+        case 1: return GL_LESS;
+        case 2: return GL_LEQUAL;
+        case 3: return GL_EQUAL;
+        case 4: return GL_GEQUAL;
+        case 5: return GL_GREATER;
+        case 6: return GL_NOTEQUAL;
+        case 7: return GL_NEVER;
+        default: return GL_LEQUAL;
+    }
+}
+
 static GLuint hs_compile_shader(GLenum type, const char* src) {
     GLuint sh = glCreateShader(type);
     glShaderSource(sh, 1, &src, NULL);
@@ -134,6 +158,62 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
     for (u32 i = 0; i < frame->render->count; i++) {
         const HSRenderCmd* c = &frame->render->cmds[i];
         switch ((HSRenderOp)c->op) {
+            case HS_RC_SET_CULL:
+                if (c->a == 0) {
+                    glDisable(GL_CULL_FACE);
+                } else {
+                    glEnable(GL_CULL_FACE);
+                    if (c->a == 255) glCullFace(GL_FRONT);
+                    else glCullFace(GL_BACK);
+                }
+                break;
+
+            case HS_RC_SET_BLEND:
+                glEnable(GL_BLEND);
+                glBlendFunc(hs_gles_blend_factor(c->a), hs_gles_blend_factor(c->b));
+                break;
+
+            case HS_RC_SET_ALPHA:
+                if (c->a) {
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                } else {
+                    glDisable(GL_BLEND);
+                }
+                break;
+
+            case HS_RC_SET_DEPTH:
+                if (c->a) glEnable(GL_DEPTH_TEST);
+                else glDisable(GL_DEPTH_TEST);
+                break;
+
+            case HS_RC_SET_DEPTH_COMPARE:
+                glEnable(GL_DEPTH_TEST);
+                glDepthFunc(hs_gles_depth_func(c->a));
+                glDepthMask(c->b ? GL_TRUE : GL_FALSE);
+                break;
+
+            case HS_RC_SET_COLOR_MASK:
+                glColorMask((c->a & 1) != 0, (c->a & 2) != 0, (c->a & 4) != 0, (c->a & 8) != 0);
+                break;
+
+            case HS_RC_SET_CLIP: {
+                u32 x = c->x;
+                u32 y = c->y;
+                u32 w = c->payload_idx;
+                u32 h = c->payload_len;
+                if (w == 0 || h == 0) {
+                    glDisable(GL_SCISSOR_TEST);
+                } else {
+                    glEnable(GL_SCISSOR_TEST);
+                    /* Messages are treated as top-left origin pixels. */
+                    int sy = (int)b->gfx.screen_height - (int)(y + h);
+                    if (sy < 0) sy = 0;
+                    glScissor((int)x, sy, (int)w, (int)h);
+                }
+                break;
+            }
+
             case HS_RC_CLEAR:
                 glClearColor(c->f0, c->f1, c->f2, c->f3);
                 glClear(GL_COLOR_BUFFER_BIT);
@@ -159,6 +239,10 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
             }
 
             case HS_RC_CLEAR_DS:
+                glClearDepthf(c->f0);
+                glClearStencil((GLint)c->a);
+                glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+                break;
             case HS_RC_DRAW_TEXT:
             case HS_RC_SHOW_TEXTURE:
             default:
