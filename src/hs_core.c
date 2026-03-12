@@ -92,6 +92,24 @@ static void hs_report_error_ex(HSSystem* sys, const Message* bad_msg, u32 code, 
     (void)mq_push(&sys_node->inbox, &emsg);
 }
 
+static void hs_report_queue_full(HSSystem* sys, const Message* msg, u8 dest_node) {
+    if (!sys) return;
+    Node* sys_node = hs_node_by_id(sys, NODE_SYSTEM);
+    if (!sys_node) return;
+
+    Message q = {
+        .to = NODE_SYSTEM,
+        .from = NODE_CPU,
+        .op = OP_QUEUE_FULL,
+        .flags = dest_node,
+        .cid = msg ? msg->cid : 0,
+        .tick = (u16)sys->tick,
+        .payload_idx = (u16)(msg ? msg->op : 0),
+        .payload_len = 0,
+    };
+    (void)mq_push(&sys_node->inbox, &q);
+}
+
 typedef enum {
     HS_PAYLOAD_NONE = 0,
     HS_PAYLOAD_FIXED,
@@ -138,6 +156,7 @@ static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
     [OP_RESULT]        = {NODE_SYSTEM, HS_PAYLOAD_RANGE,  0, HS_PAYLOAD_SIZE},
 
     [OP_ERROR_EX]      = {NODE_SYSTEM, HS_PAYLOAD_FIXED, 52, 52},
+    [OP_QUEUE_FULL]    = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
 
     [OP_CLEAR]         = {NODE_OUTPUT, HS_PAYLOAD_FIXED, 16, 16},
     [OP_CLEAR_DS]      = {NODE_OUTPUT, HS_PAYLOAD_FIXED,  8,  8},
@@ -392,19 +411,26 @@ bool hs_send(HSSystem* sys, Message* msg) {
         }
     }
     
-    if (sys->recording) {
-        if (sys->log_head >= sys->log_capacity) {
-            sys->log_overflow = true;
-            return false;
-        }
-        sys->log[sys->log_head++] = *msg;
+    if (sys->recording && sys->log_head >= sys->log_capacity) {
+        sys->log_overflow = true;
+        sys->recording = false;
     }
-    
+
     for (u8 i = 0; i < sys->node_count; i++) {
         if (sys->nodes[i]->id == msg->to) {
-            return mq_push(&sys->nodes[i]->inbox, msg);
+            bool pushed = mq_push(&sys->nodes[i]->inbox, msg);
+            if (!pushed) {
+                hs_report_error_ex(sys, msg, HS_ERR_QUEUE_FULL, HS_ERR_STAGE_SEND, "inbox queue full");
+                hs_report_queue_full(sys, msg, msg->to);
+                return false;
+            }
+            if (sys->recording) {
+                sys->log[sys->log_head++] = *msg;
+            }
+            return true;
         }
     }
+
     hs_report_error_ex(sys, msg, HS_ERR_ROUTE, HS_ERR_STAGE_SEND, "invalid destination node");
     return false;
 }
@@ -540,6 +566,7 @@ const char* hs_op_name(OpCode op) {
         case OP_ACK:           return "ACK";
         case OP_RESULT:        return "RESULT";
         case OP_ERROR_EX:      return "ERROR_EX";
+        case OP_QUEUE_FULL:    return "QUEUE_FULL";
         case OP_ERROR:         return "ERROR";
         case OP_TRACE:         return "TRACE";
         case OP_STOP:          return "STOP";

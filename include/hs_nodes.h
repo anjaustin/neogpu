@@ -87,6 +87,11 @@ typedef struct {
     u8  last_error_op;
     u8  last_error_to;
     u8  last_error_from;
+
+    u32 queue_full_count;
+    u8  last_queue_full_to;
+    u8  last_queue_full_op;
+    u16 pad1;
 } SystemState;
 
 int shader_node_process(Node* node);

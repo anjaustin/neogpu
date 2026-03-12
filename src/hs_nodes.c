@@ -528,6 +528,12 @@ int system_node_process(Node* node) {
                 system_state.last_result_len = (u16)msg.payload_len;
                 break;
 
+            case OP_QUEUE_FULL:
+                system_state.queue_full_count++;
+                system_state.last_queue_full_to = msg.flags;
+                system_state.last_queue_full_op = (u8)msg.payload_idx;
+                break;
+
             case OP_ERROR_EX: {
                 void* data = get_payload(msg.payload_idx);
                 if (data) {

@@ -248,6 +248,25 @@ static void test_message_validation(void) {
     hs_step(&gpu.system);
     TEST("send_rejected", !bad_ok);
     TEST("error_ex_emitted", st->error_count > 0 && st->last_error_op == OP_SET_SHADER && st->last_error_to == NODE_BUFFER);
+
+    /* Backpressure: overflow a node inbox */
+    gpu.system.recording = false;
+    u32 ok_count = 0;
+    for (u32 i = 0; i < (HS_QUEUE_SIZE + 8); i++) {
+        Message spam = {
+            .to = NODE_SHADER,
+            .from = NODE_CPU,
+            .op = OP_SET_SHADER,
+            .flags = 0,
+            .cid = i,
+            .tick = 0,
+            .payload_idx = 0,
+            .payload_len = 0,
+        };
+        if (hs_send(&gpu.system, &spam)) ok_count++;
+    }
+    hs_step(&gpu.system);
+    TEST("queue_full_triggered", ok_count < (HS_QUEUE_SIZE + 8) && st->queue_full_count > 0);
 }
 
 /* ============================================================
