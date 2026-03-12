@@ -10,7 +10,6 @@ The goal is to make the existing implicit ABI explicit so it can be validated, c
 
 - `to` / `from`: node ids
 - `op`: opcode (`OpCode`)
-- `flags`: opcode-specific small field
 - `flags`: opcode-specific small field (MSB is reserved for `HS_MSGF_ACK`)
 - `cid`: correlation id for request/response-style messages (0 means "none")
 - `tick`: assigned when routed/applied (step thread)
@@ -156,6 +155,8 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
     - Header: `flags = OP_FENCE`
     - Payload (8B): `[u32 tick][u8 channel][u8 rsv][u16 rsv]`
 
+  Note: this is an *apply-time* fence for the step thread ("messages drained and routed"). It is not a GPU hardware fence.
+
 ## Notes
 
 - The ABI as described here is the "as implemented" behavior.
@@ -165,7 +166,7 @@ Note: with the multi-producer submit queue enabled, `tick` is assigned when the 
 
 ## Render Recording
 
-When `HSSystem.render_list` is set (by `hs_gpu_init`), `hs_send()` records render-relevant ops into an `HSRenderList` in send order.
+When `HSSystem.render_list` is set (by `hs_gpu_init`), the step thread records render-relevant ops into an `HSRenderList` at apply time.
 
 Currently recorded ops include:
 
@@ -174,6 +175,14 @@ Currently recorded ops include:
 - frame markers: `OP_FRAME_BEGIN`, `OP_FRAME_END`, `OP_PRESENT`
 
 The minimal GLES executor is implemented in `src/hs_backend_gles.c`.
+
+## Capture Filtering
+
+The message log used for capture can be channel-filtered:
+
+- `HSSystem.record_mask` is a bitmask of channels to record.
+- Default is render-only (`CHAN_RENDER`).
+- Set it at runtime with `hs_set_record_mask()`.
 
 ## Message-Driven Buffers (Current)
 

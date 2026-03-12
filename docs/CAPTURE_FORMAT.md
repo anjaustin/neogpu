@@ -27,3 +27,14 @@ Where `count` is the number of recorded messages in the capture.
 
 - This format is intentionally strict: it rejects files if struct sizes do not match the current build.
 - Captures store payload blocks (64B) as-is; payload-bearing messages should reference capture-local payload indices.
+
+## Capture Policy (Channel Filtering)
+
+Captures are produced from a message log. Which messages enter that log is controlled by the system recording policy:
+
+- `HSSystem.recording`: enables/disables logging.
+- `HSSystem.record_mask`: bitmask of channels to record (`1u << HSChannel`).
+
+Default policy (P0): record `CHAN_RENDER` only. This keeps captures deterministic and compact while excluding best-effort telemetry.
+
+You can override the mask at runtime via `hs_set_record_mask()`.

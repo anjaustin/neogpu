@@ -2,7 +2,7 @@
 
 **Project:** NeoGPU  
 **Focus:** Extend the message-passing fabric to support robust engine-scale communication (results, tooling, async, backpressure)  
-**Status:** Proposed  
+**Status:** Active (partially implemented)  
 **Version:** 0.1  
 **Date:** 2026-03-12
 
@@ -22,6 +22,11 @@ Channelization spec: `docs/CHANNEL_FABRIC.md`.
 - Integrate async completions into the same message fabric.
 - Add backpressure/flow control primitives to avoid silent queue drops.
 - Enable introspection for debugging and profiling.
+
+P0 status note:
+
+- Channelized transport (RT/RENDER/TELEM), capture I/O, structured errors, async done, and blocking backpressure are implemented.
+- Frame markers (`OP_FRAME_BEGIN/END`, `OP_PRESENT`), capture filtering (`record_mask`), per-channel budgets, and apply-time fences (`OP_FENCE` -> `OP_RESULT`) are implemented.
 
 ## 3. Non-Goals
 
@@ -43,6 +48,11 @@ Channelization spec: `docs/CHANNEL_FABRIC.md`.
 - Correlate responses with requests:
   - Add a `u32 correlation_id` (preferred) or use `tick` + `from` as a best-effort key.
 - Ensure responses are recordable/replayable.
+
+Additional P0 requirement now implemented:
+
+- Provide a fence primitive for tooling:
+  - `OP_FENCE` to `NODE_SYSTEM` emits an `OP_RESULT` (flags=`OP_FENCE`) with a small payload that includes the apply-time tick.
 
 ### 4.2 Structured Error Model (Priority: HIGH)
 
@@ -100,6 +110,8 @@ Channelization spec: `docs/CHANNEL_FABRIC.md`.
 - Add either:
   - multiple queues (priority tiers), or
   - a priority field in `Message` and multi-pass processing order.
+
+P0 implementation: multiple queues per channel (`CHAN_RT`, `CHAN_RENDER`, `CHAN_TELEM`) with deterministic per-channel budgets.
 
 See also: `docs/lmm/channel_fabric_synthesize.md` (LMM synthesis for channelized fabric).
 

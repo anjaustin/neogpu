@@ -13,12 +13,24 @@ Make the messaging layer safe and predictable when used from multiple threads, o
 
 See `docs/CHANNEL_FABRIC.md`.
 
+## P0 Extension: Frame + QoS
+
+P0 also introduces a minimal frame/QoS contract on top of the channelized fabric:
+
+- Frame markers: `OP_FRAME_BEGIN`, `OP_FRAME_END`, `OP_PRESENT` (recorded in the render list).
+- Fences: `OP_FENCE` emits an `OP_RESULT` payload describing the apply-time tick.
+- Runtime knobs:
+  - capture filtering via `HSSystem.record_mask` (`hs_set_record_mask()`)
+  - deterministic per-channel budgets via `HSSystem.chan_budget[]` (`hs_set_channel_budget()`)
+
 ## Current Model (After P0)
 
 - Producers call `hs_send()` / `hs_send_with_payload()` from any thread.
 - Producers enqueue into per-thread SPSC lanes (up to `HS_MAX_PRODUCERS`), with a fallback MPSC submit queue for overflow/unregistered producers.
 - The step thread calls `hs_step()`, which drains producer lanes (and the fallback submit queue) and routes messages into node inboxes, and only then processes nodes.
 - Validation/logging/render-recording happen at route time (on the step thread).
+- Recording is channel-filtered via `HSSystem.record_mask` (default: `CHAN_RENDER` only).
+- The drain schedule is deterministic and budgeted per channel via `HSSystem.chan_budget[]`.
 
 ## Coherency-Aware Optimizations (P0)
 
@@ -31,6 +43,7 @@ Concurrency constraints:
 - `hs_send()` / `hs_send_with_payload()` are thread-safe.
 - `hs_step()` is single-threaded (one step thread).
 - Destructive lifecycle operations (`hs_clear`, `hs_replay`, `hs_init`) must not run concurrently with producer threads.
+- Note: `hs_clear()` invalidates cached producer ids via an internal epoch so the next sends re-register lanes correctly.
 
 ## Current Snapshot (Quick-Glance Table)
 
@@ -68,7 +81,9 @@ Concurrency constraints:
 
 - The recursive system lock lives in `include/hs_core.h` / `src/hs_core.c` (`hs_lock/hs_unlock`).
 - Multi-thread falsification test lives in `src/main.c` ("Thread Safety Tests").
-- Dropped-telemetry counters live in `HSSystem` (`dropped_error_ex`, `dropped_queue_full`).
+- Dropped-telemetry counters live in `HSSystem` (`dropped_error_ex`, `dropped_queue_full`, `dropped_system_nonrt`, `dropped_result`).
 - `HSAsync.running` is implemented as `atomic_bool`.
-- MPSC submit queue lives in `HSSystem.submit` and backpressure is tracked in `HSSystem.submit_full`.
-- SPSC lane backpressure is tracked in `HSSystem.spsc_full`.
+- MPSC submit queues live in `HSSystem.submit[CHAN_COUNT]` and backpressure is tracked in `HSSystem.submit_full[CHAN_COUNT]`.
+- SPSC lane backpressure is tracked in `HSSystem.spsc_full[CHAN_COUNT]`.
+- Capture filtering uses `HSSystem.record_mask` and `hs_set_record_mask()`.
+- Per-channel budgets use `HSSystem.chan_budget[]` and `hs_set_channel_budget()`.

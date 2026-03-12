@@ -106,12 +106,20 @@ hs_gpu_texture_wrap(&gpu, 0, true);      // Repeat wrap
 ### Recording/Replay
 ```c
 hs_gpu_start_recording(&gpu);
+hs_gpu_frame_begin(&gpu);
 // ... draw calls ...
+hs_gpu_frame_end(&gpu);
+hs_gpu_present(&gpu);
 u32 msg_count = hs_gpu_stop_recording(&gpu);
 
 // Replay later
 hs_gpu_replay(&gpu, gpu.log_buffer, msg_count);
 ```
+
+Notes:
+
+- Recording is channel-filtered by default (P0: render channel only). See `HSSystem.record_mask` and `hs_set_record_mask()`.
+- Use `hs_gpu_fence(&gpu, CHAN_RENDER, cid)` to request an apply-time fence result via `OP_RESULT`.
 
 ### Input
 ```c
