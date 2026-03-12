@@ -68,6 +68,12 @@ typedef enum {
     OP_ERROR,
     OP_TRACE,
     OP_STOP,
+
+    /* Frame/QoS control */
+    OP_FRAME_BEGIN,
+    OP_FRAME_END,
+    OP_PRESENT,
+    OP_FENCE,
     OP_COUNT
 } OpCode;
 
@@ -185,6 +191,14 @@ typedef struct {
     /* Telemetry about dropped best-effort system events */
     u32 dropped_error_ex;
     u32 dropped_queue_full;
+    u32 dropped_system_nonrt;
+    u32 dropped_result;
+
+    /* Capture policy */
+    u32 record_mask; /* bitmask of (1u << HSChannel) */
+
+    /* Per-channel drain budgets (messages per hs_step) */
+    u32 chan_budget[CHAN_COUNT];
 
     HSSubmitQueue submit[CHAN_COUNT];
     atomic_uint submit_full[CHAN_COUNT];
@@ -197,6 +211,7 @@ typedef struct {
     atomic_uint mpsc_ok[CHAN_COUNT];
 
     atomic_uint producer_count;
+    atomic_uint producer_epoch;
     HSSpscQueue producers[CHAN_COUNT][HS_MAX_PRODUCERS];
 
     /* Channel policies */
@@ -207,8 +222,15 @@ typedef struct {
     atomic_uint     bp_waiters;
 } HSSystem;
 
+static inline u32 hs_channel_bit(HSChannel ch) {
+    return (ch < CHAN_COUNT) ? (1u << (u32)ch) : 0u;
+}
+
 void hs_lock(HSSystem* sys);
 void hs_unlock(HSSystem* sys);
+
+void hs_set_record_mask(HSSystem* sys, u32 mask);
+void hs_set_channel_budget(HSSystem* sys, HSChannel ch, u32 budget);
 
 /* Message flags (Message.flags) */
 #define HS_MSGF_ACK   (1u << 7)  /* request OP_ACK after apply (must not collide with opcode-specific flags) */

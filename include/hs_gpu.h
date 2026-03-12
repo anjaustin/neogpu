@@ -88,6 +88,12 @@ void hs_gpu_error(HSGpu* gpu, const char* msg);
 void hs_gpu_trace(HSGpu* gpu, const char* msg);
 void hs_gpu_stop(HSGpu* gpu);
 
+/* Frame/QoS controls (message-level) */
+void hs_gpu_frame_begin(HSGpu* gpu);
+void hs_gpu_frame_end(HSGpu* gpu);
+void hs_gpu_present(HSGpu* gpu);
+bool hs_gpu_fence(HSGpu* gpu, HSChannel target, u32 cid);
+
 void hs_gpu_begin_frame(HSGpu* gpu);
 void hs_gpu_end_frame(HSGpu* gpu);
 

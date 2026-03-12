@@ -167,4 +167,21 @@ static inline bool hs_unpack_async_done(const void* data, u32 len, u32* out_task
     return true;
 }
 
+/* Fence result payload (OP_RESULT for OP_FENCE): [u32 tick][u8 channel][u8 reserved][u16 reserved] */
+static inline void hs_pack_result_fence(u8 out[8], u32 tick, u8 channel) {
+    memcpy(&out[0], &tick, 4);
+    out[4] = channel;
+    out[5] = 0;
+    out[6] = 0;
+    out[7] = 0;
+}
+
+static inline bool hs_unpack_result_fence(const void* data, u32 len, u32* out_tick, u8* out_channel) {
+    if (!data || len < 8) return false;
+    const u8* b = (const u8*)data;
+    if (out_tick) memcpy(out_tick, &b[0], 4);
+    if (out_channel) *out_channel = b[4];
+    return true;
+}
+
 #endif

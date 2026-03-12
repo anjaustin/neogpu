@@ -214,6 +214,12 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
     for (u32 i = 0; i < frame->render->count; i++) {
         const HSRenderCmd* c = &frame->render->cmds[i];
         switch ((HSRenderOp)c->op) {
+            case HS_RC_FRAME_BEGIN:
+            case HS_RC_FRAME_END:
+            case HS_RC_PRESENT:
+                /* Markers only; backend may ignore. */
+                break;
+
             case HS_RC_SET_CULL:
                 if (c->a == 0) {
                     glDisable(GL_CULL_FACE);

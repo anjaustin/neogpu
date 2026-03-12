@@ -10,7 +10,11 @@
 #define HS_RENDER_MAX_CMDS 2048
 
 typedef enum {
-    HS_RC_CLEAR = 1,
+    HS_RC_FRAME_BEGIN = 1,
+    HS_RC_FRAME_END,
+    HS_RC_PRESENT,
+
+    HS_RC_CLEAR,
     HS_RC_CLEAR_DS,
     HS_RC_SET_CULL,
     HS_RC_SET_BLEND,

@@ -290,6 +290,66 @@ void hs_gpu_stop(HSGpu* gpu) {
     hs_gpu_send_simple(gpu, NODE_SYSTEM, OP_STOP, 0, 0);
 }
 
+void hs_gpu_frame_begin(HSGpu* gpu) {
+    Message msg = {
+        .to = NODE_SYSTEM,
+        .from = NODE_CPU,
+        .op = OP_FRAME_BEGIN,
+        .flags = 0,
+        .cid = 0,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0,
+        .channel = CHAN_RENDER,
+    };
+    (void)hs_send(&gpu->system, &msg);
+}
+
+void hs_gpu_frame_end(HSGpu* gpu) {
+    Message msg = {
+        .to = NODE_SYSTEM,
+        .from = NODE_CPU,
+        .op = OP_FRAME_END,
+        .flags = 0,
+        .cid = 0,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0,
+        .channel = CHAN_RENDER,
+    };
+    (void)hs_send(&gpu->system, &msg);
+}
+
+void hs_gpu_present(HSGpu* gpu) {
+    Message msg = {
+        .to = NODE_SYSTEM,
+        .from = NODE_CPU,
+        .op = OP_PRESENT,
+        .flags = 0,
+        .cid = 0,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0,
+        .channel = CHAN_RENDER,
+    };
+    (void)hs_send(&gpu->system, &msg);
+}
+
+bool hs_gpu_fence(HSGpu* gpu, HSChannel target, u32 cid) {
+    Message msg = {
+        .to = NODE_SYSTEM,
+        .from = NODE_CPU,
+        .op = OP_FENCE,
+        .flags = (u8)target,
+        .cid = cid,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0,
+        .channel = CHAN_RT,
+    };
+    return hs_send(&gpu->system, &msg);
+}
+
 void hs_gpu_begin_frame(HSGpu* gpu) {
     hs_render_reset(&gpu->render);
     if (gpu->backend && gpu->backend->ops && gpu->backend->ops->begin_frame) {

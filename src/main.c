@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <time.h>
 #include "hs_gpu.h"
+#include "hs_msg.h"
 #include "hs_math_neon.h"
 #include "hs_input.h"
 #include "hs_buffer.h"
@@ -419,6 +420,100 @@ static void test_message_validation(void) {
 }
 
 /* ============================================================
+ * Frame/QoS tests
+ * ============================================================ */
+static void test_frame_qos(void) {
+    printf("\n--- Frame/QoS Tests ---\n");
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
+    gpu.system.recording = true;
+
+    SystemState* st = (SystemState*)gpu.system_node.state;
+
+    /* Capture policy: render-only should not record RT ACKs */
+    hs_clear(&gpu.system);
+    hs_start_recording(&gpu.system);
+    hs_set_record_mask(&gpu.system, hs_channel_bit(CHAN_RENDER));
+
+    u32 ack0 = st->ack_count;
+    Message m = {
+        .to = NODE_SHADER,
+        .from = NODE_CPU,
+        .op = OP_SET_SHADER,
+        .flags = HS_MSGF_ACK,
+        .cid = 1,
+        .tick = 0,
+        .payload_idx = 0,
+        .payload_len = 0,
+    };
+    bool ok = hs_send(&gpu.system, &m);
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    TEST("recordmask_send_ok", ok);
+    TEST("recordmask_ack_delivered", st->ack_count > ack0);
+
+    u32 n = hs_stop_recording(&gpu.system);
+    bool saw_ack = false;
+    for (u32 i = 0; i < n; i++) {
+        if (gpu.log_buffer[i].op == OP_ACK) {
+            saw_ack = true;
+            break;
+        }
+    }
+    TEST("recordmask_no_ack", !saw_ack);
+
+    /* If RT is included, ACK should be recorded */
+    hs_clear(&gpu.system);
+    hs_start_recording(&gpu.system);
+    hs_set_record_mask(&gpu.system, hs_channel_bit(CHAN_RENDER) | hs_channel_bit(CHAN_RT));
+    ack0 = st->ack_count;
+    ok = hs_send(&gpu.system, &m);
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    TEST("recordmask_send_ok2", ok);
+    TEST("recordmask_ack_delivered2", st->ack_count > ack0);
+
+    n = hs_stop_recording(&gpu.system);
+    saw_ack = false;
+    for (u32 i = 0; i < n; i++) {
+        if (gpu.log_buffer[i].op == OP_ACK) {
+            saw_ack = true;
+            break;
+        }
+    }
+    TEST("recordmask_with_ack", saw_ack);
+
+    /* Fence emits OP_RESULT (op=FENCE) with a decodeable payload */
+    hs_clear(&gpu.system);
+    u32 expect_tick = gpu.system.tick;
+    bool fence_ok = hs_gpu_fence(&gpu, CHAN_RENDER, 4242);
+    hs_step(&gpu.system);
+    TEST("fence_send_ok", fence_ok);
+    TEST("fence_result", st->result_count > 0 && st->last_result_cid == 4242 && st->last_result_op == OP_FENCE && st->last_result_len == 8);
+    {
+        u32 tick = 0;
+        u8 ch = 0;
+        bool unpack_ok = hs_unpack_result_fence(gpu.system.payloads[st->last_result_payload_idx].data, st->last_result_len, &tick, &ch);
+        TEST("fence_unpack", unpack_ok && tick == expect_tick && ch == (u8)CHAN_RENDER);
+    }
+
+    /* Frame markers show up in render list and reset it at FRAME_BEGIN */
+    hs_clear(&gpu.system);
+    hs_gpu_frame_begin(&gpu);
+    hs_gpu_clear(&gpu, v4_make(0.0f, 0.0f, 0.0f, 1.0f));
+    hs_gpu_frame_end(&gpu);
+    hs_gpu_present(&gpu);
+    hs_gpu_process(&gpu);
+    TEST("frame_markers", gpu.render.count >= 4 &&
+                          gpu.render.cmds[0].op == HS_RC_FRAME_BEGIN &&
+                          gpu.render.cmds[1].op == HS_RC_CLEAR &&
+                          gpu.render.cmds[2].op == HS_RC_FRAME_END &&
+                          gpu.render.cmds[3].op == HS_RC_PRESENT);
+}
+
+/* ============================================================
  * Async completion tests
  * ============================================================ */
 static void test_async_done(void) {
@@ -830,6 +925,7 @@ static void test_gpu(void) {
 
     printf("Recording frame...\n");
     hs_gpu_start_recording(&gpu);
+    hs_gpu_frame_begin(&gpu);
 
     /* Clear */
     vec4 clear_color = v4_make(0.1f, 0.1f, 0.12f, 1.0f);
@@ -891,6 +987,10 @@ static void test_gpu(void) {
 
     /* Sound channel */
     hs_gpu_set_channel(&gpu, 0, 2);
+    hs_gpu_process(&gpu);
+
+    hs_gpu_frame_end(&gpu);
+    hs_gpu_present(&gpu);
     hs_gpu_process(&gpu);
 
     u32 log_count = hs_gpu_stop_recording(&gpu);
@@ -1055,6 +1155,7 @@ int main(void) {
     test_buffer();
     test_input();
     test_message_validation();
+    test_frame_qos();
     test_async_done();
     test_async_atomic_running();
     test_thread_safety();

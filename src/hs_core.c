@@ -127,6 +127,19 @@ static void hs_render_record(HSSystem* sys, const Message* msg) {
     memset(&cmd, 0, sizeof(cmd));
 
     switch ((OpCode)msg->op) {
+        case OP_FRAME_BEGIN:
+            hs_render_reset(sys->render_list);
+            cmd.op = HS_RC_FRAME_BEGIN;
+            break;
+
+        case OP_FRAME_END:
+            cmd.op = HS_RC_FRAME_END;
+            break;
+
+        case OP_PRESENT:
+            cmd.op = HS_RC_PRESENT;
+            break;
+
         case OP_CULL:
             cmd.op = HS_RC_SET_CULL;
             cmd.a = (u8)msg->payload_idx;
@@ -361,9 +374,68 @@ static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload,
         }
     }
 
-    if (sys->recording && sys->log_head >= sys->log_capacity) {
+    bool record_this = false;
+    {
+        HSChannel ch = (HSChannel)msg->channel;
+        if (sys->recording && ch < CHAN_COUNT) {
+            record_this = (sys->record_mask & (1u << (u32)ch)) != 0;
+        }
+    }
+
+    if (record_this && sys->log_head >= sys->log_capacity) {
         sys->log_overflow = true;
         sys->recording = false;
+        record_this = false;
+    }
+
+    /* Frame/QoS control ops are handled by the system itself. */
+    if ((OpCode)msg->op == OP_FRAME_BEGIN || (OpCode)msg->op == OP_FRAME_END || (OpCode)msg->op == OP_PRESENT) {
+        hs_render_record(sys, msg);
+        if (record_this) {
+            sys->log[sys->log_head++] = *msg;
+        }
+        return true;
+    }
+
+    if ((OpCode)msg->op == OP_FENCE) {
+        Node* sys_node = hs_node_by_id(sys, NODE_SYSTEM);
+        HSChannel target = (HSChannel)msg->flags;
+        if (target == CHAN_DEFAULT) target = CHAN_RENDER;
+        if (target >= CHAN_COUNT) target = CHAN_RENDER;
+
+        u8 res_payload[8];
+        hs_pack_result_fence(res_payload, (u32)sys->tick, (u8)target);
+
+        u16 ridx = 0;
+        u32 rlen = 0;
+        if (sys_node && hs_payload_alloc_and_copy(sys, res_payload, sizeof(res_payload), &ridx, &rlen)) {
+            Message res = {
+                .to = NODE_SYSTEM,
+                .from = NODE_SYSTEM,
+                .op = OP_RESULT,
+                .flags = OP_FENCE,
+                .cid = msg->cid,
+                .tick = (u16)sys->tick,
+                .payload_idx = ridx,
+                .payload_len = rlen,
+                .channel = CHAN_RT,
+            };
+
+            if (!mq_push(&sys_node->inbox, &res)) {
+                sys->dropped_result++;
+            } else {
+                if (sys->recording && (sys->record_mask & (1u << (u32)CHAN_RT))) {
+                    if (sys->log_head < sys->log_capacity) {
+                        sys->log[sys->log_head++] = res;
+                    }
+                }
+            }
+        }
+
+        if (record_this) {
+            sys->log[sys->log_head++] = *msg;
+        }
+        return true;
     }
 
     Node* dest = hs_node_by_id(sys, msg->to);
@@ -372,12 +444,24 @@ static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload,
         return false;
     }
 
+    /* Keep RT pristine even if system inbox is flooded by non-RT. */
+    if (msg->to == NODE_SYSTEM) {
+        HSChannel ch = (HSChannel)msg->channel;
+        enum { HS_SYSTEM_RT_RESERVE = 32 };
+        if (ch != CHAN_RT) {
+            if (dest->inbox.count >= (HS_QUEUE_SIZE - HS_SYSTEM_RT_RESERVE)) {
+                sys->dropped_system_nonrt++;
+                return false;
+            }
+        }
+    }
+
     if (!mq_push(&dest->inbox, msg)) {
         hs_report_queue_full(sys, msg, msg->to);
         return false;
     }
 
-    if (sys->recording) {
+    if (record_this) {
         sys->log[sys->log_head++] = *msg;
     }
 
@@ -388,14 +472,17 @@ static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload,
 typedef struct {
     HSSystem* sys;
     int id;
+    u32 epoch;
 } HSProducerTLS;
 
 static _Thread_local HSProducerTLS g_tls_prod = {0};
 static _Thread_local HSSystem* g_tls_in_step = NULL;
 
 static int hs_get_producer_id(HSSystem* sys) {
-    if (g_tls_prod.sys != sys) {
+    u32 epoch = atomic_load_explicit(&sys->producer_epoch, memory_order_relaxed);
+    if (g_tls_prod.sys != sys || g_tls_prod.epoch != epoch) {
         g_tls_prod.sys = sys;
+        g_tls_prod.epoch = epoch;
         g_tls_prod.id = -1;
     }
     /* Cache both real producer ids (>=0) and fallback (-2). */
@@ -497,7 +584,14 @@ static HSChannel hs_default_channel_for_op(OpCode op) {
         case OP_RESULT:
         case OP_ASYNC_DONE:
         case OP_STOP:
+        case OP_FENCE:
             return CHAN_RT;
+
+        /* render/frame */
+        case OP_FRAME_BEGIN:
+        case OP_FRAME_END:
+        case OP_PRESENT:
+            return CHAN_RENDER;
 
         /* default render */
         default:
@@ -548,6 +642,11 @@ static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
     [OP_ERROR]         = {NODE_SYSTEM, HS_PAYLOAD_STRING, 1, HS_PAYLOAD_SIZE},
     [OP_TRACE]         = {NODE_SYSTEM, HS_PAYLOAD_STRING, 1, HS_PAYLOAD_SIZE},
     [OP_STOP]          = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
+
+    [OP_FRAME_BEGIN]   = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
+    [OP_FRAME_END]     = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
+    [OP_PRESENT]       = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
+    [OP_FENCE]         = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
 };
 
 bool hs_payload_alloc_and_copy(HSSystem* sys, const void* data, u32 len, u16* out_idx, u32* out_len) {
@@ -657,6 +756,21 @@ void hs_unlock(HSSystem* sys) {
     pthread_mutex_unlock(&sys->lock);
 }
 
+void hs_set_record_mask(HSSystem* sys, u32 mask) {
+    if (!sys) return;
+    hs_lock(sys);
+    sys->record_mask = mask;
+    hs_unlock(sys);
+}
+
+void hs_set_channel_budget(HSSystem* sys, HSChannel ch, u32 budget) {
+    if (!sys) return;
+    if (ch <= CHAN_DEFAULT || ch >= CHAN_COUNT) return;
+    hs_lock(sys);
+    sys->chan_budget[(u32)ch] = budget;
+    hs_unlock(sys);
+}
+
 bool mq_push(MessageQueue* q, Message* msg) {
     if (q->count >= HS_QUEUE_SIZE) return false;
     q->msgs[q->tail] = *msg;
@@ -695,6 +809,17 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->log_overflow = false;
     sys->dropped_error_ex = 0;
     sys->dropped_queue_full = 0;
+    sys->dropped_system_nonrt = 0;
+    sys->dropped_result = 0;
+
+    /* Capture defaults: record render channel only. */
+    sys->record_mask = hs_channel_bit(CHAN_RENDER);
+
+    /* Default per-channel drain budgets (messages per hs_step). */
+    for (u32 c = 0; c < CHAN_COUNT; c++) sys->chan_budget[c] = 0;
+    sys->chan_budget[CHAN_RT] = 4096;
+    sys->chan_budget[CHAN_RENDER] = 16384;
+    sys->chan_budget[CHAN_TELEM] = 1024;
     for (u32 c = 0; c < CHAN_COUNT; c++) {
         atomic_init(&sys->submit_full[c], 0);
         atomic_init(&sys->spsc_full[c], 0);
@@ -717,6 +842,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     }
 
     atomic_init(&sys->producer_count, 0);
+    atomic_init(&sys->producer_epoch, 1);
     for (u32 c = 0; c < CHAN_COUNT; c++) {
         for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
             atomic_init(&sys->producers[c][i].head.v, 0);
@@ -875,12 +1001,11 @@ u32 hs_step(HSSystem* sys) {
 
     g_tls_in_step = sys;
 
-    enum { RT_BUDGET = 4096, RENDER_BUDGET = 16384, TELEM_BUDGET = 1024 };
     u32 prod_count = atomic_load_explicit(&sys->producer_count, memory_order_acquire);
     if (prod_count > HS_MAX_PRODUCERS) prod_count = HS_MAX_PRODUCERS;
 
     for (HSChannel ch = CHAN_RT; ch <= CHAN_TELEM; ch++) {
-        u32 budget = (ch == CHAN_RT) ? RT_BUDGET : (ch == CHAN_RENDER) ? RENDER_BUDGET : TELEM_BUDGET;
+        u32 budget = sys->chan_budget[(u32)ch];
         u32 used = 0;
 
         /* Drain per-producer SPSC lanes */
@@ -1016,9 +1141,14 @@ void hs_clear(HSSystem* sys) {
     sys->tick = 0;
     sys->payload_head = 0;
     sys->log_overflow = false;
+    sys->dropped_error_ex = 0;
+    sys->dropped_queue_full = 0;
+    sys->dropped_system_nonrt = 0;
+    sys->dropped_result = 0;
 
     /* Reset producer lanes and submit queues (no concurrent producers allowed). */
     atomic_store_explicit(&sys->producer_count, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&sys->producer_epoch, 1, memory_order_relaxed);
     for (u32 c = 0; c < CHAN_COUNT; c++) {
         atomic_store_explicit(&sys->spsc_full[c], 0, memory_order_relaxed);
         atomic_store_explicit(&sys->spsc_ok[c], 0, memory_order_relaxed);
@@ -1086,6 +1216,10 @@ const char* hs_op_name(OpCode op) {
         case OP_ERROR:         return "ERROR";
         case OP_TRACE:         return "TRACE";
         case OP_STOP:          return "STOP";
+        case OP_FRAME_BEGIN:   return "FRAME_BEGIN";
+        case OP_FRAME_END:     return "FRAME_END";
+        case OP_PRESENT:       return "PRESENT";
+        case OP_FENCE:         return "FENCE";
         case OP_COUNT:         return "COUNT";
     }
     return "UNKNOWN";

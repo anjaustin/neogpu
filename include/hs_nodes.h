@@ -80,6 +80,8 @@ typedef struct {
     u8  last_result_from;
     u8  last_result_op;
     u16 last_result_len;
+    u16 last_result_payload_idx;
+    u16 pad_result;
 
     u32 error_count;
     u32 last_error_code;

@@ -139,6 +139,23 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
 - `OP_STOP` (Immediate)
   - No payload
 
+- `OP_FRAME_BEGIN` (Immediate)
+  - Frame marker for render recording; resets the render list when applied
+  - No payload
+- `OP_FRAME_END` (Immediate)
+  - Frame marker for render recording
+  - No payload
+- `OP_PRESENT` (Immediate)
+  - Frame marker for render recording (present/swap boundary)
+  - No payload
+
+- `OP_FENCE` (Immediate)
+  - Header: `cid = correlation id`
+  - Header: `flags = target channel` (`CHAN_RENDER` recommended)
+  - When applied, the system emits `OP_RESULT` with:
+    - Header: `flags = OP_FENCE`
+    - Payload (8B): `[u32 tick][u8 channel][u8 rsv][u16 rsv]`
+
 ## Notes
 
 - The ABI as described here is the "as implemented" behavior.
@@ -154,6 +171,7 @@ Currently recorded ops include:
 
 - state: `OP_CULL`, `OP_BLEND`, `OP_ALPHA`, `OP_DEPTH`, `OP_DEPTH_COMPARE`, `OP_COLOR_MASK`, `OP_CLIP`, `OP_TEXTURE_FILTER`, `OP_TEXTURE_WRAP`
 - commands: `OP_CLEAR`, `OP_CLEAR_DS`, `OP_DRAW`, `OP_DRAW_INSTANCE`, `OP_DRAW_TEXT`, `OP_SHOW_TEXTURE`
+- frame markers: `OP_FRAME_BEGIN`, `OP_FRAME_END`, `OP_PRESENT`
 
 The minimal GLES executor is implemented in `src/hs_backend_gles.c`.
 

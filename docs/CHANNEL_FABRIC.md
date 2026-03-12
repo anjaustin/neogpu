@@ -80,11 +80,15 @@ Each channel drain is budgeted to prevent starvation. Default budgets (tunable c
 
 Budgets are deterministic and do not depend on wall time.
 
+Implementation: budgets are stored in `HSSystem.chan_budget[]` and can be updated at runtime via `hs_set_channel_budget()`.
+
 ## 5) Capture/Replay
 
 - Default capture includes `CHAN_RENDER` only.
 - Optional capture profiles may include a subset of `CHAN_RT`.
 - `CHAN_TELEM` is excluded by default.
+
+Implementation: capture filtering is controlled by `HSSystem.record_mask` and `hs_set_record_mask()`.
 
 Replay uses the same channel schedule.
 
@@ -93,8 +97,14 @@ Replay uses the same channel schedule.
 Default channel assignment by opcode:
 
 - Render path: `OP_CLEAR`, `OP_CLEAR_DS`, `OP_DRAW`, `OP_DRAW_INSTANCE`, `OP_DRAW_TEXT`, `OP_SHOW_TEXTURE`, and render state ops -> `CHAN_RENDER`
+- Frame markers: `OP_FRAME_BEGIN`, `OP_FRAME_END`, `OP_PRESENT` -> `CHAN_RENDER`
 - RT/control path: `OP_ACK`, `OP_RESULT`, `OP_ASYNC_DONE`, and other control/interactive ops -> `CHAN_RT`
+- Fences: `OP_FENCE` -> `CHAN_RT` (emits `OP_RESULT`)
 - Telemetry: `OP_ERROR_EX`, `OP_ERROR`, `OP_TRACE`, `OP_QUEUE_FULL` -> `CHAN_TELEM`
+
+## 6.1) System Inbox Pristinity (P0)
+
+To keep RT results/ACKs usable under telemetry spam, the system may drop non-RT messages targeting `NODE_SYSTEM` when the system inbox is near full, preserving a small reserve for RT.
 
 Notes:
 

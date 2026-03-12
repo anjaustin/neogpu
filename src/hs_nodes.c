@@ -529,6 +529,7 @@ int system_node_process(Node* node) {
                 system_state.last_result_from = msg.from;
                 system_state.last_result_op = msg.flags;
                 system_state.last_result_len = (u16)msg.payload_len;
+                system_state.last_result_payload_idx = (u16)msg.payload_idx;
                 break;
 
             case OP_QUEUE_FULL:
