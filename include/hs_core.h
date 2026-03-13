@@ -149,6 +149,18 @@ typedef struct __attribute__((aligned(64))) {
     u8    data[HS_PAYLOAD_SIZE];
 } Payload;
 
+#define HS_TOOLBUS_SIZE 256
+#define HS_TOOLBUS_PAYLOAD_MAX HS_PAYLOAD_SIZE
+
+typedef struct {
+    u32 seq;
+    u32 cid;
+    u8  result_op;
+    u8  payload_len;
+    u16 pad;
+    u8  payload[HS_PAYLOAD_SIZE];
+} HSToolbusEntry;
+
 typedef struct __attribute__((aligned(64))) {
     Message  msgs[HS_QUEUE_SIZE];
     u16      head;
@@ -200,6 +212,7 @@ typedef struct {
     u32 dropped_queue_full;
     u32 dropped_system_nonrt;
     u32 dropped_result;
+    u32 dropped_toolbus;
 
     /* Capture policy */
     u32 record_mask; /* bitmask of (1u << HSChannel) */
@@ -227,6 +240,16 @@ typedef struct {
     pthread_mutex_t bp_lock;
     pthread_cond_t  bp_cv;
     atomic_uint     bp_waiters;
+
+    /* Toolbus for IPC result correlation */
+    pthread_mutex_t toolbus_lock;
+    pthread_cond_t  toolbus_cv;
+    bool            toolbus_inited;
+    u32             toolbus_seq;
+    u32             toolbus_head;
+    u32             toolbus_count;
+    u32             toolbus_dropped;
+    HSToolbusEntry  toolbus[HS_TOOLBUS_SIZE];
 } HSSystem;
 
 static inline u32 hs_channel_bit(HSChannel ch) {
@@ -292,5 +315,10 @@ bool hs_capture_replay(HSSystem* sys, const HSCapture* cap);
 /* Capture persistence (binary, versioned) */
 bool hs_capture_write_file(const HSCapture* cap, const char* path);
 bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Payload* payload_buf, u32 capacity);
+
+/* Toolbus: IPC result correlation */
+u32  hs_toolbus_seq(HSSystem* sys);
+void hs_toolbus_record_result(HSSystem* sys, const Message* result);
+bool hs_toolbus_wait(HSSystem* sys, u32 after_seq, u32 cid, u8 result_op, u8* out_payload, u32* out_len, u32 timeout_ms);
 
 #endif

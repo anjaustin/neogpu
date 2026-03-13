@@ -524,6 +524,94 @@ void hs_wake_senders(HSSystem* sys) {
     hs_backpressure_wake(sys);
 }
 
+u32 hs_toolbus_seq(HSSystem* sys) {
+    if (!sys) return 0;
+    if (!sys->toolbus_inited) return 0;
+    pthread_mutex_lock(&sys->toolbus_lock);
+    u32 s = sys->toolbus_seq;
+    pthread_mutex_unlock(&sys->toolbus_lock);
+    return s;
+}
+
+void hs_toolbus_record_result(HSSystem* sys, const Message* result) {
+    if (!sys || !result) return;
+    if (!sys->toolbus_inited) return;
+    if ((OpCode)result->op != OP_RESULT) return;
+
+    pthread_mutex_lock(&sys->toolbus_lock);
+
+    if (sys->toolbus_count >= HS_TOOLBUS_SIZE) {
+        sys->toolbus_dropped++;
+    } else {
+        sys->toolbus_count++;
+    }
+
+    u32 idx = sys->toolbus_head;
+    sys->toolbus_head = (sys->toolbus_head + 1) % HS_TOOLBUS_SIZE;
+    sys->toolbus_seq++;
+
+    HSToolbusEntry* e = &sys->toolbus[idx];
+    e->seq = sys->toolbus_seq;
+    e->cid = result->cid;
+    e->result_op = result->flags;
+    u32 n = result->payload_len;
+    if (n > HS_PAYLOAD_SIZE) n = HS_PAYLOAD_SIZE;
+    e->payload_len = (u8)n;
+
+    if (n > 0 && sys->payloads && result->payload_idx < sys->payload_capacity) {
+        memcpy(e->payload, sys->payloads[result->payload_idx].data, n);
+    }
+
+    pthread_cond_broadcast(&sys->toolbus_cv);
+    pthread_mutex_unlock(&sys->toolbus_lock);
+}
+
+bool hs_toolbus_wait(HSSystem* sys, u32 after_seq, u32 cid, u8 result_op, u8* out_payload, u32* out_len, u32 timeout_ms) {
+    if (!sys) return false;
+    if (!sys->toolbus_inited) return false;
+
+    pthread_mutex_lock(&sys->toolbus_lock);
+
+    const u64 deadline_ns = (u64)timeout_ms * 1000000ull;
+    struct timespec start_ts;
+    clock_gettime(CLOCK_REALTIME, &start_ts);
+
+    for (;;) {
+        for (u32 i = 0; i < HS_TOOLBUS_SIZE; i++) {
+            u32 pos = (sys->toolbus_head + HS_TOOLBUS_SIZE - 1 - i) % HS_TOOLBUS_SIZE;
+            const HSToolbusEntry* e = &sys->toolbus[pos];
+            if (e->seq == 0 || e->seq <= after_seq) break;
+            if (e->cid == cid && e->result_op == result_op) {
+                u32 n = e->payload_len;
+                if (out_payload && n) memcpy(out_payload, e->payload, n);
+                if (out_len) *out_len = n;
+                pthread_mutex_unlock(&sys->toolbus_lock);
+                return true;
+            }
+        }
+
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        u64 elapsed_ns = (u64)(now.tv_sec - start_ts.tv_sec) * 1000000000ull;
+        long dn = now.tv_nsec - start_ts.tv_nsec;
+        if (dn < 0) { elapsed_ns -= 1000000000ull; dn += 1000000000L; }
+        elapsed_ns += (u64)dn;
+        if (elapsed_ns >= deadline_ns) {
+            pthread_mutex_unlock(&sys->toolbus_lock);
+            return false;
+        }
+
+        u64 remain_ns = deadline_ns - elapsed_ns;
+        u64 wait_ns = remain_ns > 10000000ull ? 10000000ull : remain_ns;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        u64 add = (u64)ts.tv_nsec + wait_ns;
+        ts.tv_sec += (time_t)(add / 1000000000ull);
+        ts.tv_nsec = (long)(add % 1000000000ull);
+        (void)pthread_cond_timedwait(&sys->toolbus_cv, &sys->toolbus_lock, &ts);
+    }
+}
+
 static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u32 len) {
     if (!sys || !msg) return false;
 
@@ -907,6 +995,15 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     pthread_mutex_init(&sys->bp_lock, NULL);
     pthread_cond_init(&sys->bp_cv, NULL);
     atomic_init(&sys->bp_waiters, 0);
+
+    pthread_mutex_init(&sys->toolbus_lock, NULL);
+    pthread_cond_init(&sys->toolbus_cv, NULL);
+    sys->toolbus_inited = true;
+    sys->toolbus_seq = 0;
+    sys->toolbus_head = 0;
+    sys->toolbus_count = 0;
+    sys->toolbus_dropped = 0;
+    memset(sys->toolbus, 0, sizeof(sys->toolbus));
 }
 
 void hs_register(HSSystem* sys, Node* node) {
@@ -1207,6 +1304,16 @@ void hs_clear(HSSystem* sys) {
         if (sys->nodes[i]->reset_fn) {
             sys->nodes[i]->reset_fn(sys->nodes[i]);
         }
+    }
+
+    if (sys->toolbus_inited) {
+        pthread_mutex_lock(&sys->toolbus_lock);
+        sys->toolbus_seq++;
+        sys->toolbus_head = 0;
+        sys->toolbus_count = 0;
+        memset(sys->toolbus, 0, sizeof(sys->toolbus));
+        pthread_cond_broadcast(&sys->toolbus_cv);
+        pthread_mutex_unlock(&sys->toolbus_lock);
     }
 
     hs_unlock(sys);

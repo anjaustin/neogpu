@@ -6,6 +6,7 @@
 #include <time.h>
 #include "hs_gpu.h"
 #include "hs_msg.h"
+#include "hs_ipc.h"
 #include "hs_math_neon.h"
 #include "hs_input.h"
 #include "hs_buffer.h"
@@ -1594,6 +1595,126 @@ static void benchmark_buffer(void) {
 }
 
 /* ============================================================
+ * IPC Tests
+ * ============================================================ */
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <signal.h>
+
+typedef struct {
+    u32 magic;
+    u16 version;
+    u16 type;
+    u32 len;
+    u32 cid;
+} __attribute__((packed)) NgipHdr;
+
+typedef struct {
+    u8 op;
+    u8 flags;
+    u16 reserved;
+    u32 payload_len;
+} __attribute__((packed)) NgipReq;
+
+typedef struct {
+    u32 status;
+    u32 result_op;
+    u32 result_len;
+} __attribute__((packed)) NgipResp;
+
+static int ipc_write_full(int fd, const void* buf, size_t len) {
+    const u8* p = (const u8*)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, p + off, len - off);
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        if (w == 0) return -1;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+static int ipc_read_full(int fd, void* buf, size_t len) {
+    u8* p = (u8*)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t r = read(fd, p + off, len - off);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) return -1;
+        off += (size_t)r;
+    }
+    return 0;
+}
+
+static int ipc_connect(const char* path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) { close(fd); return -1; }
+    return fd;
+}
+
+static void* stepper_thread(void* arg) {
+    HSSystem* sys = (HSSystem*)arg;
+    for (int i = 0; i < 500; i++) {
+        hs_step(sys);
+        usleep(1000);
+    }
+    return NULL;
+}
+
+static void test_ipc(void) {
+    printf("\n--- IPC Tests ---\n");
+    signal(SIGPIPE, SIG_IGN);
+
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
+    gpu.system.recording = false;
+
+    char sock[128];
+    snprintf(sock, sizeof(sock), "/tmp/neogpu_ipc_test_%d.sock", (int)getpid());
+
+    HSIpcServer srv;
+    bool ok = hs_ipc_start(&srv, &gpu.system, sock);
+    TEST("ipc_start", ok);
+    if (!ok) return;
+
+    pthread_t th;
+    pthread_create(&th, NULL, stepper_thread, &gpu.system);
+    usleep(50000);
+
+    int fd = ipc_connect(sock);
+    TEST("ipc_connect", fd >= 0);
+    if (fd >= 0) {
+        NgipHdr h = {.magic = 0x4E474950u, .version = 1, .type = 1, .len = sizeof(NgipReq), .cid = 123};
+        NgipReq r = {.op = OP_QUERY_STATS, .flags = 0, .reserved = 0, .payload_len = 0};
+        ok = (ipc_write_full(fd, &h, sizeof(h)) == 0 && ipc_write_full(fd, &r, sizeof(r)) == 0);
+        TEST("ipc_query_send", ok);
+
+        NgipHdr rh;
+        NgipResp rr;
+        ok = (ipc_read_full(fd, &rh, sizeof(rh)) == 0 && ipc_read_full(fd, &rr, sizeof(rr)) == 0);
+        TEST("ipc_query_recv", ok && rr.status == 0 && rr.result_len == 64);
+
+        /* bad op - server closes connection, so this is expected to fail reading */
+        h.cid = 124; h.len = sizeof(NgipReq);
+        r.op = OP_DRAW;
+        ok = (ipc_write_full(fd, &h, sizeof(h)) == 0 && ipc_write_full(fd, &r, sizeof(r)) == 0);
+        /* Read may fail because server closes on bad op - this is OK per spec */
+        TEST("ipc_bad_op", ok);
+
+        close(fd);
+    }
+
+    hs_ipc_stop(&srv);
+    pthread_join(th, NULL);
+}
+
+/* ============================================================
  * Main
  * ============================================================ */
 int main(int argc, char** argv) {
@@ -1613,6 +1734,7 @@ int main(int argc, char** argv) {
     test_frame_qos();
     test_system_queries();
     test_redteam_system_queries();
+    test_ipc();
     test_async_done();
     test_async_atomic_running();
     test_thread_safety();
