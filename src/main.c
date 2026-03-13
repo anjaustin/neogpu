@@ -1659,9 +1659,10 @@ static int ipc_connect(const char* path) {
 
 static void* stepper_thread(void* arg) {
     HSSystem* sys = (HSSystem*)arg;
-    for (int i = 0; i < 500; i++) {
+    /* Balanced stepping - yield to allow IPC server to run */
+    for (int i = 0; i < 50000; i++) {
         hs_step(sys);
-        usleep(1000);
+        usleep(100);  /* 100us = 10000 steps/sec */
     }
     return NULL;
 }
@@ -1699,6 +1700,34 @@ static void test_ipc(void) {
         NgipResp rr;
         ok = (ipc_read_full(fd, &rh, sizeof(rh)) == 0 && ipc_read_full(fd, &rr, sizeof(rr)) == 0);
         TEST("ipc_query_recv", ok && rr.status == 0 && rr.result_len == 64);
+
+        usleep(100000);  /* Let stepper thread warm up */
+
+        /* Latency benchmark with send/wait breakdown */
+        {
+            struct timespec t0, t1, t2;
+            uint64_t send_ns = 0, wait_ns = 0;
+            int good = 0;
+            const int iterations = 100;
+            for (int i = 0; i < iterations; i++) {
+                h.cid = 2000 + i;
+                h.len = sizeof(NgipReq);
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+                if (ipc_write_full(fd, &h, sizeof(h)) == 0 && ipc_write_full(fd, &r, sizeof(r)) == 0) {
+                    clock_gettime(CLOCK_MONOTONIC, &t1);
+                    if (ipc_read_full(fd, &rh, sizeof(rh)) == 0 && ipc_read_full(fd, &rr, sizeof(rr)) == 0) {
+                        clock_gettime(CLOCK_MONOTONIC, &t2);
+                        if (rr.status == 0) good++;
+                        send_ns += (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec);
+                        wait_ns += (t2.tv_sec - t1.tv_sec) * 1000000000ULL + (t2.tv_nsec - t1.tv_nsec);
+                    }
+                }
+            }
+            double total_ms = (send_ns + wait_ns) / 1000000.0;
+            printf("  IPC latency (%d/%d req): send=%.2f ms, wait=%.2f ms, total=%.2f ms\n",
+                   good, iterations, send_ns / 1000000.0, wait_ns / 1000000.0, total_ms);
+            printf("  IPC throughput: %.0f req/sec\n", good * 1000.0 / (total_ms > 0 ? total_ms : 1));
+        }
 
         /* Quick benchmark: 100 queries */
         {

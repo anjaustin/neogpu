@@ -131,6 +131,7 @@ static int hs_ipc_handle_req(HSIpcServer* srv, int cfd, const HSIpcHdr* hdr) {
 
     if (hdr->len < sizeof(HSIpcReq) || hdr->len > (sizeof(HSIpcReq) + HS_PAYLOAD_SIZE)) {
         hs_ipc_send_error(cfd, hdr->cid, HS_IPC_ERR_BAD_LEN);
+        hs_ipc_send_error(cfd, hdr->cid, HS_IPC_ERR_BAD_LEN);
         /* Drain payload bytes if any */
         return -1;
     }
@@ -163,6 +164,9 @@ static int hs_ipc_handle_req(HSIpcServer* srv, int cfd, const HSIpcHdr* hdr) {
         return 0;
     }
 
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     u32 after_seq = hs_toolbus_seq(sys);
 
     Message m = {
@@ -184,6 +188,10 @@ static int hs_ipc_handle_req(HSIpcServer* srv, int cfd, const HSIpcHdr* hdr) {
     if (req->payload_len) ok = hs_send_with_payload(sys, &m, payload, req->payload_len);
     else ok = hs_send(sys, &m);
 
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long send_us = (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000;
+    (void)send_us;  /* unused for now */
+
     if (!ok) {
         hs_ipc_send_error(cfd, hdr->cid, HS_IPC_ERR_ENQUEUE_FAILED);
         return 0;
@@ -191,10 +199,14 @@ static int hs_ipc_handle_req(HSIpcServer* srv, int cfd, const HSIpcHdr* hdr) {
 
     u8 out[HS_TOOLBUS_PAYLOAD_MAX];
     u32 out_len = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     if (!hs_toolbus_wait(sys, after_seq, hdr->cid, req->op, out, &out_len, 250)) {
         hs_ipc_send_error(cfd, hdr->cid, HS_IPC_ERR_TIMEOUT);
         return 0;
     }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long wait_us = (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000;
+    (void)wait_us;  /* unused for now */
 
     HSIpcHdr rh = {
         .magic = HS_IPC_MAGIC,
