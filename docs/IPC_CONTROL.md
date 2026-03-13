@@ -74,6 +74,11 @@ Error status codes:
 
 `OP_RESULT` messages to `NODE_SYSTEM` are copied into a bounded internal ring buffer ("toolbus") so the IPC server can match results by `cid`.
 
+- Ring size: 256 entries (configurable via `HS_TOOLBUS_SIZE`)
+- Each entry stores: `cid`, `seq`, `result_op`, `payload_len`, `payload[64]`
+- Toolbus is cleared on `hs_clear()`
+- Dropped counter: `HSSystem.dropped_toolbus`
+
 If the toolbus is full, toolbus copies are dropped (counter increment). IPC requests may time out.
 
 ## Red-Team Requirements

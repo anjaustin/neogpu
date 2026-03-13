@@ -26,7 +26,9 @@ make run
 
 ## Tooling Mode
 
-`neogpu_demo` also exposes a small tooling client for querying/tuning the runtime:
+### In-Process Tooling
+
+`neogpu_demo` exposes in-process tooling via `--tool`:
 
 ```bash
 ./neogpu_demo --tool --query-stats --query-fabric
@@ -37,6 +39,29 @@ make run
 # Set render budget and query
 ./neogpu_demo --tool --set-budget 2 8192 --query-stats
 ```
+
+### IPC Server Mode
+
+Start an IPC server to attach external tools:
+
+```bash
+./neogpu_demo --ipc-server /tmp/neogpu.sock --ipc-ms 5000
+```
+
+Then use the standalone `neogpu_tool` client:
+
+```bash
+make tools
+
+./tools/neogpu_tool --sock /tmp/neogpu.sock query-stats
+./tools/neogpu_tool --sock /tmp/neogpu.sock query-fabric
+./tools/neogpu_tool --sock /tmp/neogpu.sock set-record-mask 6
+./tools/neogpu_tool --sock /tmp/neogpu.sock set-budget 2 8192
+./tools/neogpu_tool --sock /tmp/neogpu.sock set-block 2 0
+./tools/neogpu_tool --sock /tmp/neogpu.sock fence 2 123
+```
+
+Channel IDs: 1=RT, 2=RENDER, 3=TELEM
 
 ## Building for Different Targets
 
@@ -57,11 +82,13 @@ src/
   hs_core.c       - Message queue, OpCodes, system core
   hs_nodes.c      - Node message handlers (Shader, Buffer, Texture, Output, Sound)
   hs_gpu.c        - High-level GPU API
+  hs_ipc.c        - IPC server (Unix domain socket)
   main.c          - Demo/test suite
   benchmark.c     - Benchmarks
 
 include/
-  hs_core.h       - Core header
+  hs_core.h       - Core header (includes toolbus for IPC)
+  hs_ipc.h        - IPC server interface
   hs_nodes.h      - Node headers
   hs_gpu.h        - GPU API header
   hs_math_neon.h  - NEON-optimized vec4/mat4 math
