@@ -288,6 +288,13 @@ static bool hs_submit_enqueue(HSSystem* sys, HSChannel ch, const Message* msg, c
                 if (len && payload) memcpy(slot->payload, payload, len);
                 atomic_store_explicit(&slot->seq, pos + 1, memory_order_release);
                 atomic_fetch_add_explicit(&sys->mpsc_ok[(u32)ch], 1, memory_order_relaxed);
+                /* High-water tracking */
+                u32 depth = (pos + 1) - atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
+                u32 old_hw = atomic_load_explicit(&sys->submit_hw[(u32)ch], memory_order_relaxed);
+                while (depth > old_hw) {
+                    if (atomic_compare_exchange_weak_explicit(&sys->submit_hw[(u32)ch], &old_hw, depth,
+                            memory_order_relaxed, memory_order_relaxed)) break;
+                }
                 return true;
             }
             continue;
@@ -942,6 +949,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->chan_budget[CHAN_TELEM] = 1024;
     for (u32 c = 0; c < CHAN_COUNT; c++) {
         atomic_init(&sys->submit_full[c], 0);
+        atomic_init(&sys->submit_hw[c], 0);
         atomic_init(&sys->spsc_full[c], 0);
         atomic_init(&sys->spsc_ok[c], 0);
         atomic_init(&sys->mpsc_ok[c], 0);
@@ -1283,6 +1291,7 @@ void hs_clear(HSSystem* sys) {
         atomic_store_explicit(&sys->spsc_ok[c], 0, memory_order_relaxed);
         atomic_store_explicit(&sys->mpsc_ok[c], 0, memory_order_relaxed);
         atomic_store_explicit(&sys->submit_full[c], 0, memory_order_relaxed);
+        atomic_store_explicit(&sys->submit_hw[c], 0, memory_order_relaxed);
 
         for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
             atomic_store_explicit(&sys->producers[c][i].head.v, 0, memory_order_relaxed);

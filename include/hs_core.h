@@ -222,6 +222,7 @@ typedef struct {
 
     HSSubmitQueue submit[CHAN_COUNT];
     atomic_uint submit_full[CHAN_COUNT];
+    atomic_uint submit_hw[CHAN_COUNT];  /* High-water mark */
 
     atomic_uint spsc_full[CHAN_COUNT];
     atomic_uint spsc_full_by_prod[CHAN_COUNT][HS_MAX_PRODUCERS];
