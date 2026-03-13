@@ -19,6 +19,7 @@ pico/
 *.a
 *.d
 neogpu_demo
+neogpu_tool
 test_*
 tests/test_
 !tests/test_*.c

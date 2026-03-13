@@ -6,6 +6,8 @@ CFLAGS = -O3 -march=armv8-a+simd -mtune=cortex-a72 \
 LDFLAGS = -lm -lGLESv2 -lgbm -ldrm -lEGL -lpthread
 STRIP = strip
 
+VERSION := $(shell cat VERSION 2>/dev/null || echo "0.0.0")
+
 SRC_DIR = src
 OBJ_DIR = src
 
@@ -16,9 +18,12 @@ HS_TARGET = neogpu_demo
 
 TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast test_07_message_triangle
 
-.PHONY: build clean run all test run-test build-tests
+.PHONY: build clean run all test run-test build-tests version
 
 all: build build-tests
+
+version:
+	@echo "NeoGPU v$(VERSION)"
 
 build: $(HS_TARGET)
 
@@ -79,3 +84,8 @@ run-test:
 	$(CC) $(CFLAGS) -c tests/test_$(N)_*.c -o /tmp/test_$(N).o
 	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o /tmp/test_$(N).o $(LDFLAGS) -o /tmp/test_$(N)
 	sudo /tmp/test_$(N)
+
+release:
+	@echo "Creating release v$(VERSION)"
+	git tag -a v$(VERSION) -m "Release v$(VERSION)"
+	@echo "Run 'git push --tags' to push tags"
