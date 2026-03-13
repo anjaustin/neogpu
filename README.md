@@ -45,23 +45,41 @@ make run
 Start an IPC server to attach external tools:
 
 ```bash
+# Unix socket (local)
 ./neogpu_demo --ipc-server /tmp/neogpu.sock --ipc-ms 5000
+
+# TCP/IP (remote)
+./neogpu_demo --ipc-tcp 8765 --ipc-ms 5000
 ```
 
 Then use the standalone `neogpu_tool` client:
 
 ```bash
-make tools
+make tool
 
-./tools/neogpu_tool --sock /tmp/neogpu.sock query-stats
-./tools/neogpu_tool --sock /tmp/neogpu.sock query-fabric
-./tools/neogpu_tool --sock /tmp/neogpu.sock set-record-mask 6
-./tools/neogpu_tool --sock /tmp/neogpu.sock set-budget 2 8192
-./tools/neogpu_tool --sock /tmp/neogpu.sock set-block 2 0
-./tools/neogpu_tool --sock /tmp/neogpu.sock fence 2 123
+./neogpu_tool --sock /tmp/neogpu.sock query-stats
+./neogpu_tool --sock /tmp/neogpu.sock query-fabric
+./neogpu_tool --host localhost --port 8765 query-fabric  # TCP/IP
 ```
 
 Channel IDs: 1=RT, 2=RENDER, 3=TELEM
+
+## Channel Fabric (QoS)
+
+NeoGPU implements explicit RT/RENDER/TELEM channel semantics:
+
+| Channel | QoS | Budget (msgs/tick) | Behavior |
+|---------|-----|-------------------|----------|
+| RT | Critical | 4096 | Strict priority, no drops |
+| RENDER | Interactive | 16384 | Fair share, limited drops |
+| TELEM | Background | 1024 | Best-effort, auto-drop |
+
+Query fabric stats:
+
+```bash
+./neogpu_tool --sock /tmp/neogpu.sock query-fabric
+# Output includes: spsc_ok, spsc_full, mpsc_ok, submit_full, submit_hw, telem_dropped
+```
 
 ## Building for Different Targets
 
@@ -82,7 +100,7 @@ src/
   hs_core.c       - Message queue, OpCodes, system core
   hs_nodes.c      - Node message handlers (Shader, Buffer, Texture, Output, Sound)
   hs_gpu.c        - High-level GPU API
-  hs_ipc.c        - IPC server (Unix domain socket)
+  hs_ipc.c        - IPC server (Unix domain + TCP/IP)
   main.c          - Demo/test suite
   benchmark.c     - Benchmarks
 
