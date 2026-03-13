@@ -1700,6 +1700,22 @@ static void test_ipc(void) {
         ok = (ipc_read_full(fd, &rh, sizeof(rh)) == 0 && ipc_read_full(fd, &rr, sizeof(rr)) == 0);
         TEST("ipc_query_recv", ok && rr.status == 0 && rr.result_len == 64);
 
+        /* Quick benchmark: 100 queries */
+        {
+            clock_t start = clock();
+            int good = 0;
+            for (int i = 0; i < 100; i++) {
+                h.cid = 1000 + i;
+                if (ipc_write_full(fd, &h, sizeof(h)) == 0 && ipc_write_full(fd, &r, sizeof(r)) == 0) {
+                    if (ipc_read_full(fd, &rh, sizeof(rh)) == 0 && ipc_read_full(fd, &rr, sizeof(rr)) == 0) {
+                        if (rr.status == 0) good++;
+                    }
+                }
+            }
+            double ms = (double)(clock() - start) * 1000.0 / CLOCKS_PER_SEC;
+            printf("  IPC: %d req in %.2f ms (%.0f req/sec)\n", good, ms, good * 1000.0 / ms);
+        }
+
         /* bad op - server closes connection, so this is expected to fail reading */
         h.cid = 124; h.len = sizeof(NgipReq);
         r.op = OP_DRAW;
