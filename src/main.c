@@ -1752,7 +1752,30 @@ static void test_ipc(void) {
         /* Read may fail because server closes on bad op - this is OK per spec */
         TEST("ipc_bad_op", ok);
 
+        /* Close this connection, open new one for flood test */
         close(fd);
+        usleep(50000);  /* Let server recover */
+
+        /* Red-team: Flood test */
+        fd = ipc_connect(sock);
+        TEST("ipc_flood_connect", fd >= 0);
+        if (fd >= 0) {
+            h.cid = 100; h.len = sizeof(NgipReq); r.op = OP_QUERY_STATS;
+            clock_t start = clock();
+            int good = 0, total = 30;
+            for (int i = 0; i < total; i++) {
+                h.cid = 3000 + i;
+                if (ipc_write_full(fd, &h, sizeof(h)) == 0 && ipc_write_full(fd, &r, sizeof(r)) == 0) {
+                    if (ipc_read_full(fd, &rh, sizeof(rh)) == 0 && ipc_read_full(fd, &rr, sizeof(rr)) == 0) {
+                        if (rr.status == 0) good++;
+                    }
+                }
+            }
+            double ms = (double)(clock() - start) * 1000.0 / CLOCKS_PER_SEC;
+            printf("  IPC flood (%d req): %d ok, %.0f req/sec\n", total, good, total * 1000.0 / ms);
+            TEST("ipc_flood_no_crash", good > 0);
+            close(fd);
+        }
     }
 
     hs_ipc_stop(&srv);
@@ -1763,6 +1786,7 @@ static void test_ipc(void) {
  * Main
  * ============================================================ */
 int main(int argc, char** argv) {
+    setbuf(stdout, NULL);  /* Unbuffered stdout */
     for (int i = 1; i < argc; i++) {
         if (argv[i] && strcmp(argv[i], "--tool") == 0) {
             return run_tool_mode(argc, argv);
