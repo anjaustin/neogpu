@@ -28,6 +28,14 @@ $(HS_TARGET): $(HS_OBJ)
 	$(CC) $(HS_OBJ) $(LDFLAGS) -o $@
 	$(STRIP) $@
 
+TOOL_TGT = neogpu_tool
+
+$(TOOL_TGT):
+	$(CC) $(CFLAGS) tools/neogpu_tool.c src/hs_core.o src/hs_nodes.o -o $@ $(LDFLAGS)
+	$(STRIP) $@
+
+.PHONY: tool
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 

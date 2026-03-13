@@ -22,7 +22,7 @@ typedef struct HSRenderList HSRenderList;
 #define HS_MAX_MSG_LOG     65536
 #define HS_QUEUE_SIZE      256
 #define HS_MAX_PAYLOADS    4096
-#define HS_PAYLOAD_SIZE    64
+#define HS_PAYLOAD_SIZE    80
 
 typedef uint8_t  u8;
 typedef uint16_t u16;

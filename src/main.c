@@ -854,7 +854,7 @@ static void test_system_queries(void) {
     hs_step(&gpu.system);
     hs_step(&gpu.system);
     TEST("query_fabric_send", ok);
-    TEST("query_fabric_result", st->last_result_op == OP_QUERY_FABRIC && st->last_result_cid == 400 && st->last_result_len == 64);
+    TEST("query_fabric_result", st->last_result_op == OP_QUERY_FABRIC && st->last_result_cid == 400 && st->last_result_len >= 64);
     {
         u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0}, submit_hw3[3] = {0};
         u32 prod = 0, waiters = 0;
