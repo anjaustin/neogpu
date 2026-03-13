@@ -3,6 +3,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -233,26 +235,58 @@ static void* hs_ipc_thread_main(void* arg) {
     HSIpcServer* srv = (HSIpcServer*)arg;
     if (!srv) return NULL;
 
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return NULL;
-    srv->listen_fd = fd;
+    int fd;
+    if (srv->mode == HS_IPC_MODE_TCP) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return NULL;
+        srv->listen_fd = fd;
 
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, srv->path, sizeof(addr.sun_path) - 1);
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    (void)unlink(srv->path);
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        srv->listen_fd = -1;
-        return NULL;
-    }
-    (void)chmod(srv->path, 0600);
-    if (listen(fd, 4) != 0) {
-        close(fd);
-        srv->listen_fd = -1;
-        return NULL;
+        struct sockaddr_in tcp_addr;
+        memset(&tcp_addr, 0, sizeof(tcp_addr));
+        tcp_addr.sin_family = AF_INET;
+        tcp_addr.sin_port = htons(srv->port);
+        if (!srv->addr[0] || strcmp(srv->addr, "0.0.0.0") == 0) {
+            tcp_addr.sin_addr.s_addr = INADDR_ANY;
+        } else {
+            inet_pton(AF_INET, srv->addr, &tcp_addr.sin_addr);
+        }
+
+        if (bind(fd, (struct sockaddr*)&tcp_addr, sizeof(tcp_addr)) != 0) {
+            close(fd);
+            srv->listen_fd = -1;
+            return NULL;
+        }
+
+        if (listen(fd, 4) != 0) {
+            close(fd);
+            srv->listen_fd = -1;
+            return NULL;
+        }
+    } else {
+        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return NULL;
+        srv->listen_fd = fd;
+
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, srv->path, sizeof(addr.sun_path) - 1);
+
+        (void)unlink(srv->path);
+        if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+            close(fd);
+            srv->listen_fd = -1;
+            return NULL;
+        }
+        (void)chmod(srv->path, 0600);
+        if (listen(fd, 4) != 0) {
+            close(fd);
+            srv->listen_fd = -1;
+            return NULL;
+        }
     }
 
     atomic_store_explicit(&srv->running, true, memory_order_release);
@@ -305,7 +339,9 @@ static void* hs_ipc_thread_main(void* arg) {
 
     close(fd);
     srv->listen_fd = -1;
-    (void)unlink(srv->path);
+    if (srv->mode == HS_IPC_MODE_UNIX) {
+        (void)unlink(srv->path);
+    }
     atomic_store_explicit(&srv->running, false, memory_order_release);
     return NULL;
 }
@@ -314,10 +350,33 @@ bool hs_ipc_start(HSIpcServer* srv, HSSystem* sys, const char* path) {
     if (!srv || !sys || !path) return false;
     memset(srv, 0, sizeof(*srv));
     srv->sys = sys;
+    srv->mode = HS_IPC_MODE_UNIX;
     srv->listen_fd = -1;
     atomic_init(&srv->running, false);
     atomic_init(&srv->stop, false);
     strncpy(srv->path, path, sizeof(srv->path) - 1);
+
+    int rc = pthread_create(&srv->thread, NULL, hs_ipc_thread_main, srv);
+    if (rc != 0) return false;
+
+    /* wait briefly for running */
+    for (int i = 0; i < 50; i++) {
+        if (atomic_load_explicit(&srv->running, memory_order_acquire)) return true;
+        usleep(1000);
+    }
+    return atomic_load_explicit(&srv->running, memory_order_acquire);
+}
+
+bool hs_ipc_start_tcp(HSIpcServer* srv, HSSystem* sys, const char* addr, u16 port) {
+    if (!srv || !sys) return false;
+    memset(srv, 0, sizeof(*srv));
+    srv->sys = sys;
+    srv->mode = HS_IPC_MODE_TCP;
+    srv->port = port ? port : HS_IPC_DEFAULT_PORT;
+    if (addr) strncpy(srv->addr, addr, sizeof(srv->addr) - 1);
+    srv->listen_fd = -1;
+    atomic_init(&srv->running, false);
+    atomic_init(&srv->stop, false);
 
     int rc = pthread_create(&srv->thread, NULL, hs_ipc_thread_main, srv);
     if (rc != 0) return false;
