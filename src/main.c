@@ -76,10 +76,10 @@ static void tool_print_stats(HSSystem* sys, SystemState* st) {
 
 static void tool_print_fabric(HSSystem* sys, SystemState* st) {
     if (!sys || !st) return;
-    u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0}, submit_hw3[3] = {0};
+    u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0}, submit_hw3[3] = {0}, telem_dropped3[3] = {0};
     u32 prod = 0, waiters = 0;
     if (!hs_unpack_result_fabric(sys->payloads[st->last_result_payload_idx].data, st->last_result_len,
-                                 spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, submit_hw3, &prod, &waiters)) {
+                                 spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, submit_hw3, telem_dropped3, &prod, &waiters)) {
         printf("fabric: <decode failed>\n");
         return;
     }
@@ -90,6 +90,7 @@ static void tool_print_fabric(HSSystem* sys, SystemState* st) {
     printf("mpsc_ok:    rt=%u render=%u telem=%u\n", (unsigned)mpsc_ok3[0], (unsigned)mpsc_ok3[1], (unsigned)mpsc_ok3[2]);
     printf("submit_full:rt=%u render=%u telem=%u\n", (unsigned)submit_full3[0], (unsigned)submit_full3[1], (unsigned)submit_full3[2]);
     printf("submit_hw:  rt=%u render=%u telem=%u\n", (unsigned)submit_hw3[0], (unsigned)submit_hw3[1], (unsigned)submit_hw3[2]);
+    printf("telem_drop: rt=%u render=%u telem=%u\n", (unsigned)telem_dropped3[0], (unsigned)telem_dropped3[1], (unsigned)telem_dropped3[2]);
 }
 
 static int run_tool_mode(int argc, char** argv) {
@@ -856,10 +857,10 @@ static void test_system_queries(void) {
     TEST("query_fabric_send", ok);
     TEST("query_fabric_result", st->last_result_op == OP_QUERY_FABRIC && st->last_result_cid == 400 && st->last_result_len >= 64);
     {
-        u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0}, submit_hw3[3] = {0};
+        u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0}, submit_hw3[3] = {0}, telem_dropped3[3] = {0};
         u32 prod = 0, waiters = 0;
         bool uok = hs_unpack_result_fabric(gpu.system.payloads[st->last_result_payload_idx].data, st->last_result_len,
-                                           spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, submit_hw3, &prod, &waiters);
+                                           spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, submit_hw3, telem_dropped3, &prod, &waiters);
         TEST("query_fabric_unpack", uok && prod == atomic_load_explicit(&gpu.system.producer_count, memory_order_relaxed));
     }
 }

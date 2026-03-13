@@ -306,11 +306,15 @@ static inline bool hs_unpack_result_system_stats(const void* data, u32 len,
  * 56 submit_hw_rt(u32)
  * 60 submit_hw_render(u32)
  * 64 submit_hw_telem(u32)
+ * 68 telem_dropped_rt(u32)
+ * 72 telem_dropped_render(u32)
+ * 76 telem_dropped_telem(u32)
  */
-static inline void hs_pack_result_fabric(u8 out[80], const u32 spsc_ok3[3], const u32 spsc_full3[3],
+static inline void hs_pack_result_fabric(u8 out[96], const u32 spsc_ok3[3], const u32 spsc_full3[3],
                                         const u32 mpsc_ok3[3], const u32 submit_full3[3], 
-                                        const u32 submit_hw3[3], u32 producer_count, u32 bp_waiters) {
-    memset(out, 0, 80);
+                                        const u32 submit_hw3[3], const u32 telem_dropped3[3],
+                                        u32 producer_count, u32 bp_waiters) {
+    memset(out, 0, 96);
     memcpy(&out[0], spsc_ok3, 12);
     memcpy(&out[12], spsc_full3, 12);
     memcpy(&out[24], mpsc_ok3, 12);
@@ -318,10 +322,12 @@ static inline void hs_pack_result_fabric(u8 out[80], const u32 spsc_ok3[3], cons
     memcpy(&out[48], &producer_count, 4);
     memcpy(&out[52], &bp_waiters, 4);
     memcpy(&out[56], submit_hw3, 12);
+    memcpy(&out[68], telem_dropped3, 12);
 }
 
 static inline bool hs_unpack_result_fabric(const void* data, u32 len, u32 spsc_ok3[3], u32 spsc_full3[3],
                                           u32 mpsc_ok3[3], u32 submit_full3[3], u32 submit_hw3[3],
+                                          u32 telem_dropped3[3],
                                           u32* out_producer_count, u32* out_bp_waiters) {
     if (!data || len < 64) return false;
     const u8* b = (const u8*)data;
@@ -332,6 +338,7 @@ static inline bool hs_unpack_result_fabric(const void* data, u32 len, u32 spsc_o
     if (out_producer_count) memcpy(out_producer_count, &b[48], 4);
     if (out_bp_waiters) memcpy(out_bp_waiters, &b[52], 4);
     if (submit_hw3) memcpy(submit_hw3, &b[56], 12);
+    if (telem_dropped3) memcpy(telem_dropped3, &b[68], 12);
     return true;
 }
 

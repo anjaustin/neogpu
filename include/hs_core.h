@@ -22,7 +22,7 @@ typedef struct HSRenderList HSRenderList;
 #define HS_MAX_MSG_LOG     65536
 #define HS_QUEUE_SIZE      256
 #define HS_MAX_PAYLOADS    4096
-#define HS_PAYLOAD_SIZE    80
+#define HS_PAYLOAD_SIZE    96
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -223,6 +223,7 @@ typedef struct {
     HSSubmitQueue submit[CHAN_COUNT];
     atomic_uint submit_full[CHAN_COUNT];
     atomic_uint submit_hw[CHAN_COUNT];  /* High-water mark */
+    atomic_uint telem_dropped[CHAN_COUNT];  /* TELEM drops when queue full */
 
     atomic_uint spsc_full[CHAN_COUNT];
     atomic_uint spsc_full_by_prod[CHAN_COUNT][HS_MAX_PRODUCERS];

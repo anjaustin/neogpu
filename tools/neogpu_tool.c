@@ -186,9 +186,9 @@ static void print_stats(const u8* payload, u32 len) {
 }
 
 static void print_fabric(const u8* payload, u32 len) {
-    u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0}, submit_hw3[3] = {0};
+    u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0}, submit_hw3[3] = {0}, telem_dropped3[3] = {0};
     u32 prod = 0, waiters = 0;
-    if (!hs_unpack_result_fabric(payload, len, spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, submit_hw3, &prod, &waiters)) {
+    if (!hs_unpack_result_fabric(payload, len, spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, submit_hw3, telem_dropped3, &prod, &waiters)) {
         printf("fabric: <decode failed>\n");
         return;
     }
@@ -198,6 +198,7 @@ static void print_fabric(const u8* payload, u32 len) {
     printf("mpsc_ok:    rt=%u render=%u telem=%u\n", (unsigned)mpsc_ok3[0], (unsigned)mpsc_ok3[1], (unsigned)mpsc_ok3[2]);
     printf("submit_full:rt=%u render=%u telem=%u\n", (unsigned)submit_full3[0], (unsigned)submit_full3[1], (unsigned)submit_full3[2]);
     printf("submit_hw:  rt=%u render=%u telem=%u\n", (unsigned)submit_hw3[0], (unsigned)submit_hw3[1], (unsigned)submit_hw3[2]);
+    printf("telem_drop: rt=%u render=%u telem=%u\n", (unsigned)telem_dropped3[0], (unsigned)telem_dropped3[1], (unsigned)telem_dropped3[2]);
 }
 
 int main(int argc, char** argv) {

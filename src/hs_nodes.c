@@ -655,8 +655,8 @@ int system_node_process(Node* node) {
             }
 
             case OP_QUERY_FABRIC: {
-                u8 out[80];
-                u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0}, submit_hw3[3] = {0};
+                u8 out[96];
+                u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0}, submit_hw3[3] = {0}, telem_dropped3[3] = {0};
                 if (g_sys) {
                     spsc_ok3[0] = atomic_load_explicit(&g_sys->spsc_ok[CHAN_RT], memory_order_relaxed);
                     spsc_ok3[1] = atomic_load_explicit(&g_sys->spsc_ok[CHAN_RENDER], memory_order_relaxed);
@@ -677,9 +677,13 @@ int system_node_process(Node* node) {
                     submit_hw3[0] = atomic_load_explicit(&g_sys->submit_hw[CHAN_RT], memory_order_relaxed);
                     submit_hw3[1] = atomic_load_explicit(&g_sys->submit_hw[CHAN_RENDER], memory_order_relaxed);
                     submit_hw3[2] = atomic_load_explicit(&g_sys->submit_hw[CHAN_TELEM], memory_order_relaxed);
+
+                    telem_dropped3[0] = atomic_load_explicit(&g_sys->telem_dropped[CHAN_RT], memory_order_relaxed);
+                    telem_dropped3[1] = atomic_load_explicit(&g_sys->telem_dropped[CHAN_RENDER], memory_order_relaxed);
+                    telem_dropped3[2] = atomic_load_explicit(&g_sys->telem_dropped[CHAN_TELEM], memory_order_relaxed);
                 }
 
-                hs_pack_result_fabric(out, spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, submit_hw3,
+                hs_pack_result_fabric(out, spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, submit_hw3, telem_dropped3,
                                       g_sys ? atomic_load_explicit(&g_sys->producer_count, memory_order_relaxed) : 0,
                                       g_sys ? atomic_load_explicit(&g_sys->bp_waiters, memory_order_relaxed) : 0);
                 emit_result(node, &msg, OP_QUERY_FABRIC, out, sizeof(out));

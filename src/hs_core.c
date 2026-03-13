@@ -666,6 +666,11 @@ static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u3
         }
         atomic_fetch_add_explicit(&sys->spsc_full[(u32)ch], 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&sys->spsc_full_by_prod[(u32)ch][pid], 1, memory_order_relaxed);
+        /* TELEM: auto-drop instead of falling to MPSC */
+        if (ch == CHAN_TELEM) {
+            atomic_fetch_add_explicit(&sys->telem_dropped[(u32)ch], 1, memory_order_relaxed);
+            return true;  /* "delivered" (as drop) */
+        }
         /* fall through to MPSC */
     }
 
@@ -950,6 +955,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     for (u32 c = 0; c < CHAN_COUNT; c++) {
         atomic_init(&sys->submit_full[c], 0);
         atomic_init(&sys->submit_hw[c], 0);
+        atomic_init(&sys->telem_dropped[c], 0);
         atomic_init(&sys->spsc_full[c], 0);
         atomic_init(&sys->spsc_ok[c], 0);
         atomic_init(&sys->mpsc_ok[c], 0);
@@ -1292,6 +1298,7 @@ void hs_clear(HSSystem* sys) {
         atomic_store_explicit(&sys->mpsc_ok[c], 0, memory_order_relaxed);
         atomic_store_explicit(&sys->submit_full[c], 0, memory_order_relaxed);
         atomic_store_explicit(&sys->submit_hw[c], 0, memory_order_relaxed);
+        atomic_store_explicit(&sys->telem_dropped[c], 0, memory_order_relaxed);
 
         for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
             atomic_store_explicit(&sys->producers[c][i].head.v, 0, memory_order_relaxed);
