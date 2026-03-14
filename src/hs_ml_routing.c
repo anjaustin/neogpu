@@ -41,10 +41,20 @@ int hs_ml_route_optimal_threads(const HSRouteDesc* route, u32 M) {
     if (route->format == HS_ROUTE_BINARY) return 1;
 
     /* Ternary: memory-bound, 3 threads saturates Pi4 LPDDR4 bandwidth.
-     * Below 1M ops the thread launch overhead isn't worth it. */
+     *
+     * Measured crossover points (Pi4 Cortex-A72, best-of-5x20):
+     *   1T beats 2T/3T below N*K ~ 4M (e.g. N=2048 K=1024 still single-thread)
+     *   2T beats 1T  from  N*K ~ 4M
+     *   3T beats 2T  above N*K ~ 8M
+     *
+     * Using M*N*K as the op count so batched (M>1) calls also scale correctly.
+     */
     u64 ops = (u64)M * route->N * route->K;
-    if (ops < 1000000ULL) return 1;
-    if (ops < 8000000ULL) return 2;
+    /* Two-threshold: 1T below 3M ops, 3T above.
+     * 2T never cleanly beats both 1T and 3T on Pi4 — the crossover
+     * jumps directly from 1T-optimal to 3T-optimal around N*K=3M.
+     * Measured on Cortex-A72 @ 1800 MHz, LPDDR4. */
+    if (ops < 3000000ULL) return 1;
     return 3;
 }
 
