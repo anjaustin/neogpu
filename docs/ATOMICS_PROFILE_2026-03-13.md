@@ -760,3 +760,103 @@ Likely reasons:
 Reject item 9 in this form.
 
 Do not keep inbox-bound overwriteable-state coalescing.
+
+## Item 10 Result - Expand Dedicated SPSC Producer Slots to 16
+
+### Change Attempted
+
+Attempted in:
+
+- `include/hs_core.h`
+
+Approach:
+
+- increase `HS_MAX_PRODUCERS` from `8` to `16`
+- reduce immediate spillover into the fallback MPSC path when the benchmark runs 16 producer threads
+
+### Red-Team Validation
+
+Validation steps:
+
+- rebuilt `neogpu_demo`
+- reran the producer benchmark suite
+- rebuilt `neogpu_prof`
+- reran `gprof`
+
+### Result
+
+This change regressed throughput and was reverted.
+
+Observed benchmark result for the attempted version:
+
+- 1 thr: 9.37M msg/s
+- 2 thr: 7.63M msg/s
+- 4 thr: 5.96M msg/s
+- 8 thr: 5.98M msg/s
+- 16 thr: 5.66M msg/s
+
+### Failure Analysis
+
+Giving every producer a dedicated SPSC lane did reduce some fallback dependence, but it also expanded the scan and memory footprint of the SPSC fabric enough to lose overall.
+
+Likely reasons:
+
+- larger producer arrays increased step-thread scan cost and cache footprint
+- the benchmark did not benefit enough from reduced fallback pressure to offset that added fabric cost
+- the current routing structure still dominates even when more producers stay on SPSC lanes
+
+### Conclusion
+
+Reject item 10 in this form.
+
+Do not increase `HS_MAX_PRODUCERS` globally to 16.
+
+## Item 11 Result - NEON-Friendly Fixed-Size Payload Copy Helper
+
+### Change Attempted
+
+Attempted in:
+
+- `src/hs_core.c`
+
+Approach:
+
+- add a fixed-size `96`-byte payload copy helper using six `uint8x16_t` loads/stores
+- use that helper in hot payload copy sites instead of generic `memcpy`
+
+### Red-Team Validation
+
+Validation steps:
+
+- rebuilt `neogpu_demo`
+- reran the producer benchmark suite
+- rebuilt `neogpu_prof`
+- reran `gprof`
+
+### Result
+
+This change regressed throughput and was reverted.
+
+Observed benchmark result for the attempted version:
+
+- 1 thr: 9.10M msg/s
+- 2 thr: 6.16M msg/s
+- 4 thr: 7.26M msg/s
+- 8 thr: 5.62M msg/s
+- 16 thr: 4.29M msg/s
+
+### Failure Analysis
+
+The benchmark path is overwhelmingly dominated by no-payload traffic, so the fixed-size payload copy helper did not attack the real hot path.
+
+Likely reasons:
+
+- extra helper structure and code growth hurt icache locality in `hs_core.c`
+- the benchmark does not spend enough time copying 96-byte payloads for this to pay back
+- the compiler/libc path for the actual payload traffic mix was already good enough relative to the dominant queue costs
+
+### Conclusion
+
+Reject item 11 in this form.
+
+Do not keep the NEON fixed-size payload copy helper in the core fabric path.
