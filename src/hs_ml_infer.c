@@ -539,3 +539,112 @@ void hs_mlt_reset_stats(HSMLTernary* m) {
     (void)m;
     memset(&g_mlt_stats, 0, sizeof(g_mlt_stats));
 }
+
+/*============================================================================
+ * Stateful decode session
+ *============================================================================*/
+
+int hs_mlt_session_init(HSMLTernarySession* sess, HSMLTernary* model) {
+    if (!sess || !model || !model->loaded) return -1;
+    memset(sess, 0, sizeof(*sess));
+
+    sess->model  = model;
+    sess->hidden = malloc(model->hidden_size * sizeof(float));
+    if (!sess->hidden) return -1;
+
+    sess->caches = calloc(model->num_layers, sizeof(HSKVCache));
+    if (!sess->caches) { free(sess->hidden); sess->hidden = NULL; return -1; }
+
+    for (u32 l = 0; l < model->num_layers; l++) {
+        hs_kv_cache_init(&sess->caches[l],
+                         model->max_context,
+                         model->num_heads,
+                         model->num_heads,
+                         model->head_dim);
+    }
+
+    sess->seq_len = 0;
+    sess->ready   = true;
+    return 0;
+}
+
+void hs_mlt_session_free(HSMLTernarySession* sess) {
+    if (!sess) return;
+    free(sess->hidden);
+    if (sess->caches && sess->model) {
+        for (u32 l = 0; l < sess->model->num_layers; l++)
+            hs_kv_cache_free(&sess->caches[l]);
+        free(sess->caches);
+    }
+    memset(sess, 0, sizeof(*sess));
+}
+
+void hs_mlt_session_reset(HSMLTernarySession* sess) {
+    if (!sess || !sess->ready) return;
+    if (sess->caches && sess->model) {
+        for (u32 l = 0; l < sess->model->num_layers; l++)
+            hs_kv_cache_clear(&sess->caches[l]);
+    }
+    sess->seq_len = 0;
+}
+
+/* Internal: run one token through the model, updating caches. */
+static void session_step(HSMLTernarySession* sess, u32 token) {
+    HSMLTernary* m = sess->model;
+    u32 H = m->hidden_size;
+    u32 V = m->vocab_size;
+
+    /* Embedding lookup */
+    if (m->embedding && token < V)
+        memcpy(sess->hidden, m->embedding + (size_t)token * H, H * sizeof(float));
+    else
+        for (u32 i = 0; i < H; i++)
+            sess->hidden[i] = (float)((i + token) % 256) / 256.0f;
+
+    /* All layers */
+    for (u32 l = 0; l < m->num_layers; l++)
+        hs_mlt_layer_forward(sess->hidden, l, &sess->caches[l], m);
+
+    sess->seq_len++;
+}
+
+/* Write logits from current hidden state. */
+static void session_logits(HSMLTernarySession* sess, float* logits) {
+    HSMLTernary* m = sess->model;
+    u32 H = m->hidden_size;
+    u32 V = m->vocab_size;
+    float* normed = m->hidden_buf;  /* borrow model scratch — safe, not in use */
+    rmsnorm(normed, sess->hidden, m->final_norm, 1e-5f, H);
+#ifdef __ARM_NEON
+    for (u32 v = 0; v < V; v++) {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        u32 H4 = H & ~3u;
+        for (u32 i = 0; i < H4; i += 4)
+            acc = vfmaq_f32(acc, vld1q_f32(m->lm_head + v*H + i), vld1q_f32(normed + i));
+        float s = vaddvq_f32(acc);
+        for (u32 i = H4; i < H; i++) s += m->lm_head[v*H + i] * normed[i];
+        logits[v] = s;
+    }
+#else
+    for (u32 v = 0; v < V; v++) {
+        float s = 0;
+        for (u32 i = 0; i < H; i++) s += m->lm_head[v*H + i] * normed[i];
+        logits[v] = s;
+    }
+#endif
+}
+
+int hs_mlt_prefill(HSMLTernarySession* sess,
+                   const u32* tokens, u32 seq_len) {
+    if (!sess || !sess->ready || !tokens || seq_len == 0) return -1;
+    for (u32 i = 0; i < seq_len; i++)
+        session_step(sess, tokens[i]);
+    return 0;
+}
+
+int hs_mlt_decode(HSMLTernarySession* sess, u32 token, float* logits) {
+    if (!sess || !sess->ready || !logits) return -1;
+    session_step(sess, token);
+    session_logits(sess, logits);
+    return 0;
+}

@@ -209,3 +209,63 @@ void hs_mlt_reset_stats(HSMLTernary* m);
 extern HSMLTernaryStats g_mlt_stats;  /* global, reset on each forward pass */
 
 #endif /* HS_ML_INFER_H */
+
+/*============================================================================
+ * Stateful decode session
+ *
+ * Owns:
+ *   - hidden state vector (persists across decode steps)
+ *   - per-layer KV caches (accumulate across steps)
+ *
+ * Usage:
+ *   hs_mlt_session_init(&sess, model)   -- allocate
+ *   hs_mlt_prefill(&sess, tokens, n)    -- process context, fills KV caches
+ *   hs_mlt_decode(&sess, token, logits) -- one decode step, O(ctx*hd) attention
+ *   hs_mlt_session_free(&sess)          -- release
+ *
+ * The hidden state is preserved between decode steps — callers must not
+ * modify it. Reset with hs_mlt_session_reset() to start a new sequence.
+ *============================================================================*/
+
+typedef struct {
+    HSMLTernary* model;      /* non-owning pointer */
+
+    float*      hidden;      /* [hidden_size] current hidden state */
+    HSKVCache*  caches;      /* [num_layers] per-layer KV caches */
+
+    u32  seq_len;            /* tokens processed so far */
+    bool ready;              /* true after init */
+} HSMLTernarySession;
+
+/* Allocate session for model. model must outlive session. */
+int  hs_mlt_session_init(HSMLTernarySession* sess, HSMLTernary* model);
+
+/* Free session resources (does not free model). */
+void hs_mlt_session_free(HSMLTernarySession* sess);
+
+/* Clear KV caches and reset position — ready for a new sequence. */
+void hs_mlt_session_reset(HSMLTernarySession* sess);
+
+/*
+ * Prefill: process a prompt token sequence.
+ * Fills KV caches for all tokens. Hidden state reflects the last token.
+ * Call before the first hs_mlt_decode().
+ *
+ * tokens:  [seq_len] input token IDs
+ * seq_len: number of prompt tokens
+ * Returns 0 on success.
+ */
+int hs_mlt_prefill(HSMLTernarySession* sess,
+                   const u32* tokens, u32 seq_len);
+
+/*
+ * Decode: process one new token.
+ * Uses KV caches populated by prefill (or prior decode steps).
+ * Updates caches with the new K/V for this position.
+ * Writes logits for the next token prediction.
+ *
+ * token:  the new input token (last predicted token)
+ * logits: [vocab_size] output — caller-allocated
+ * Returns 0 on success.
+ */
+int hs_mlt_decode(HSMLTernarySession* sess, u32 token, float* logits);
