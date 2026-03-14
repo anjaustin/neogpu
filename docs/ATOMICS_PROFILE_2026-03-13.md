@@ -437,3 +437,194 @@ Promising next candidates:
 - reduce validation/logging/recording branches inside `hs_route_immediate()`
 - split the render fast path from the fully general path
 - reduce node inbox traffic or collapse trivial node processing for benchmark-style ops
+
+## Item 5 Result - `hs_route_immediate()` Fast Path
+
+### Change Attempted
+
+Attempted in:
+
+- `src/hs_core.c`
+
+Approach:
+
+- add a minimal fast path in `hs_route_immediate()` for the benchmark-shaped case
+- skip the general routing path when there is:
+  - no payload
+  - no validation
+  - no recording
+  - no render list
+  - non-system destination
+  - non-frame/fence opcode
+
+### Red-Team Validation
+
+Validation steps:
+
+- rebuilt `neogpu_demo`
+- reran the producer benchmark suite
+- rebuilt `neogpu_prof`
+- reran `gprof`
+
+### Result
+
+This change regressed throughput badly and was reverted.
+
+Observed benchmark result for the attempted version:
+
+- 1 thr: 2.45M msg/s
+- 2 thr: 2.83M msg/s
+- 4 thr: 2.80M msg/s
+- 8 thr: 2.69M msg/s
+- 16 thr: 1.92M msg/s
+
+Profile signal from the rejected version:
+
+- `hs_route_immediate`: 27.7%
+- `__aarch64_cas4_relax`: 26.4%
+- `hs_step`: 13.0%
+
+### Failure Analysis
+
+The extra fast-path branch did not reduce enough work to offset the branch and shape distortion it introduced.
+
+Likely reasons:
+
+- the benchmark still spends large time in queue contention and node processing after routing
+- the specialized branch duplicated logic without actually removing the most expensive downstream work
+- branch predictability may have worsened relative to the already-optimized generic path
+
+### Conclusion
+
+Reject item 5 in this form.
+
+Do not keep the specialized `hs_route_immediate()` fast path.
+
+## Next Investigation Direction
+
+Queue geometry shortcuts have now failed multiple red-team passes.
+
+The remaining high-confidence direction is to reduce downstream per-message work after routing, especially:
+
+- shader node processing cost for benchmark-heavy ops like `OP_SET_SHADER`
+- repeated inbox pops/pushes across nodes that do trivial state updates
+- benchmark topology that floods work which immediately becomes node inbox traffic
+
+## Item 6 Result - Skip Empty Node Processors
+
+### Change Attempted
+
+Attempted in:
+
+- `src/hs_core.c`
+
+Approach:
+
+- have `hs_step()` skip `node->process_fn()` calls when a node inbox is empty
+- avoid paying repeated empty `mq_pop()` checks inside node processors
+
+### Red-Team Validation
+
+Validation steps:
+
+- rebuilt `neogpu_demo`
+- reran the producer benchmark suite
+- rebuilt `neogpu_prof`
+- reran `gprof`
+
+### Result
+
+This change regressed throughput and was reverted.
+
+Observed benchmark result for the attempted version:
+
+- 1 thr: 3.77M msg/s
+- 2 thr: 2.63M msg/s
+- 4 thr: 2.01M msg/s
+- 8 thr: 2.21M msg/s
+- 16 thr: 1.47M msg/s
+
+Profile signal from the rejected version:
+
+- `hs_route_immediate`: 35.1%
+- `hs_step`: 18.6%
+- `mq_pop`: still visible at 3.2%
+
+### Failure Analysis
+
+The additional inbox-empty gate in `hs_step()` did not help in practice.
+
+Likely reasons:
+
+- the extra branch and queue-state check added overhead before every processor dispatch
+- benchmark traffic is concentrated enough that the main hot node still dominates
+- the expected savings from avoided empty node calls were smaller than the new scheduling overhead
+
+### Conclusion
+
+Reject item 6 in this form.
+
+Do not keep the skip-empty-node gate.
+
+## Next Investigation Direction
+
+At this point the strongest remaining path is not another scheduler heuristic.
+
+The better target is semantic work reduction for the benchmark-heavy message mix itself, especially:
+
+- collapsing trivial state-setting ops like `OP_SET_SHADER` before they become queue/inbox work
+- reducing render-record and node-process work for messages that only update the latest state
+
+## Item 7 Result - Direct `OP_SET_SHADER` Apply in `hs_route_immediate()`
+
+### Change Attempted
+
+Attempted in:
+
+- `src/hs_core.c`
+
+Approach:
+
+- special-case unacked `OP_SET_SHADER` messages in `hs_route_immediate()`
+- update shader state directly in the step thread instead of enqueueing into the shader node inbox and draining it later
+
+### Red-Team Validation
+
+Validation steps:
+
+- rebuilt `neogpu_demo`
+- reran the producer benchmark suite
+- rebuilt `neogpu_prof`
+- reran `gprof`
+
+### Result
+
+This change regressed throughput and was reverted.
+
+Observed benchmark result for the attempted version:
+
+- 1 thr: 4.04M msg/s
+- 2 thr: 5.54M msg/s
+- 4 thr: 3.00M msg/s
+- 8 thr: 2.73M msg/s
+- 16 thr: 1.91M msg/s
+
+### Failure Analysis
+
+Even though the benchmark op was `OP_SET_SHADER`, bypassing the node inbox was not enough to win.
+
+Likely reasons:
+
+- the added special-case branch penalized the general route path
+- the benchmark remains dominated by queue contention and routing overhead before the shader state write itself matters
+- direct special-casing did not eliminate enough downstream work to offset the new branch cost and path complexity
+
+### Conclusion
+
+Reject item 7 in this form.
+
+Do not keep the direct `OP_SET_SHADER` route-time apply shortcut.
+
+## Updated Read
+
+The repeated failed heuristics strongly suggest the core bottleneck is still shared queue contention and generic per-message routing structure, not isolated node-side work for `OP_SET_SHADER` alone.
