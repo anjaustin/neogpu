@@ -480,6 +480,8 @@ typedef struct {
     HSSystem* sys;
     int id;
     u32 epoch;
+    u32 spsc_ok_local[CHAN_COUNT];
+    u32 spsc_full_local[CHAN_COUNT];
 } HSProducerTLS;
 
 static _Thread_local HSProducerTLS g_tls_prod = {0};
@@ -491,6 +493,8 @@ static int hs_get_producer_id(HSSystem* sys) {
         g_tls_prod.sys = sys;
         g_tls_prod.epoch = epoch;
         g_tls_prod.id = -1;
+        memset(g_tls_prod.spsc_ok_local, 0, sizeof(g_tls_prod.spsc_ok_local));
+        memset(g_tls_prod.spsc_full_local, 0, sizeof(g_tls_prod.spsc_full_local));
     }
     /* Cache both real producer ids (>=0) and fallback (-2). */
     if (g_tls_prod.id != -1) return g_tls_prod.id;
@@ -502,6 +506,18 @@ static int hs_get_producer_id(HSSystem* sys) {
     }
     g_tls_prod.id = (int)id;
     return g_tls_prod.id;
+}
+
+static inline void hs_record_spsc_ok(HSSystem* sys, HSChannel ch, int pid) {
+    if (!sys || pid < 0 || pid >= HS_MAX_PRODUCERS || ch <= CHAN_DEFAULT || ch >= CHAN_COUNT) return;
+    u32 v = ++g_tls_prod.spsc_ok_local[(u32)ch];
+    atomic_store_explicit(&sys->spsc_ok_by_prod[(u32)ch][pid], v, memory_order_relaxed);
+}
+
+static inline void hs_record_spsc_full(HSSystem* sys, HSChannel ch, int pid) {
+    if (!sys || pid < 0 || pid >= HS_MAX_PRODUCERS || ch <= CHAN_DEFAULT || ch >= CHAN_COUNT) return;
+    u32 v = ++g_tls_prod.spsc_full_local[(u32)ch];
+    atomic_store_explicit(&sys->spsc_full_by_prod[(u32)ch][pid], v, memory_order_relaxed);
 }
 
 static void hs_backpressure_wait(HSSystem* sys) {
@@ -660,12 +676,10 @@ static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u3
     int pid = hs_get_producer_id(sys);
     if (pid >= 0) {
         if (hs_spsc_push(&sys->producers[(u32)ch][pid], msg, payload, len)) {
-            atomic_fetch_add_explicit(&sys->spsc_ok[(u32)ch], 1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&sys->spsc_ok_by_prod[(u32)ch][pid], 1, memory_order_relaxed);
+            hs_record_spsc_ok(sys, ch, pid);
             return true;
         }
-        atomic_fetch_add_explicit(&sys->spsc_full[(u32)ch], 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&sys->spsc_full_by_prod[(u32)ch][pid], 1, memory_order_relaxed);
+        hs_record_spsc_full(sys, ch, pid);
         /* TELEM: auto-drop instead of falling to MPSC */
         if (ch == CHAN_TELEM) {
             atomic_fetch_add_explicit(&sys->telem_dropped[(u32)ch], 1, memory_order_relaxed);
@@ -1380,6 +1394,12 @@ const char* hs_op_name(OpCode op) {
         case OP_SET_RECORD_MASK: return "SET_RECORD_MASK";
         case OP_SET_CHAN_BUDGET: return "SET_CHAN_BUDGET";
         case OP_SET_BLOCK_POLICY: return "SET_BLOCK_POLICY";
+        case OP_ML_LOAD:       return "ML_LOAD";
+        case OP_ML_UNLOAD:     return "ML_UNLOAD";
+        case OP_ML_FORWARD:    return "ML_FORWARD";
+        case OP_ML_GENERATE:   return "ML_GENERATE";
+        case OP_ML_TOKENIZE:   return "ML_TOKENIZE";
+        case OP_ML_DETOKENIZE: return "ML_DETOKENIZE";
         case OP_COUNT:         return "COUNT";
     }
     return "UNKNOWN";

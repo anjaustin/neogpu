@@ -645,19 +645,12 @@ static void test_message_validation(void) {
     }
     hs_step(&gpu.system);
     u32 sf = atomic_load_explicit(&gpu.system.submit_full[CHAN_RENDER], memory_order_relaxed);
-    u32 lf = atomic_load_explicit(&gpu.system.spsc_full[CHAN_RENDER], memory_order_relaxed);
-    TEST("queue_full_triggered", ok_count < (HS_SUBMIT_SIZE + HS_MAX_PRODUCERS * HS_SPSC_SIZE + 256) && (sf > 0 || lf > 0));
-
-    /* ensure per-producer counters sum to something when SPSC overflow happens */
-    if (lf > 0) {
-        u32 sum = 0;
-        for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
-            sum += atomic_load_explicit(&gpu.system.spsc_full_by_prod[CHAN_RENDER][i], memory_order_relaxed);
-        }
-        TEST("queue_full_sharded", sum > 0);
-    } else {
-        TEST("queue_full_sharded", true);
+    u32 lf = 0;
+    for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
+        lf += atomic_load_explicit(&gpu.system.spsc_full_by_prod[CHAN_RENDER][i], memory_order_relaxed);
     }
+    TEST("queue_full_triggered", ok_count < (HS_SUBMIT_SIZE + HS_MAX_PRODUCERS * HS_SPSC_SIZE + 256) && (sf > 0 || lf > 0));
+    TEST("queue_full_sharded", lf > 0 || sf > 0);
 }
 
 /* ============================================================
@@ -1342,9 +1335,13 @@ static void bench_producers(int threads, int ms) {
         fail += args[i].fail;
     }
 
-    u32 spsc_ok = atomic_load_explicit(&gpu.system.spsc_ok[CHAN_RENDER], memory_order_relaxed);
+    u32 spsc_ok = 0;
+    u32 spsc_full = 0;
+    for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
+        spsc_ok += atomic_load_explicit(&gpu.system.spsc_ok_by_prod[CHAN_RENDER][i], memory_order_relaxed);
+        spsc_full += atomic_load_explicit(&gpu.system.spsc_full_by_prod[CHAN_RENDER][i], memory_order_relaxed);
+    }
     u32 mpsc_ok = atomic_load_explicit(&gpu.system.mpsc_ok[CHAN_RENDER], memory_order_relaxed);
-    u32 spsc_full = atomic_load_explicit(&gpu.system.spsc_full[CHAN_RENDER], memory_order_relaxed);
     u32 submit_full = atomic_load_explicit(&gpu.system.submit_full[CHAN_RENDER], memory_order_relaxed);
     u32 prod_count = atomic_load_explicit(&gpu.system.producer_count, memory_order_relaxed);
 
