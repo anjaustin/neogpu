@@ -1,6 +1,6 @@
 # NeoGPU - ARM NEON Optimized GPU
 
-High-performance message-passing GPU layer with ARM NEON SIMD optimizations.
+Message-native runtime substrate for graphics, tooling, and experimental inference on ARM/NEON hardware.
 
 ## Performance
 
@@ -8,6 +8,16 @@ High-performance message-passing GPU layer with ARM NEON SIMD optimizations.
 - **177x faster** than original HashLink version
 - **73KB binary** (vs 2MB+ HashLink runtime)
 - **270 FPS** on Raspberry Pi 4 (ray casting spheres test)
+
+## What NeoGPU Is
+
+NeoGPU is a message-native runtime substrate. Rendering is its clearest proof surface today. Tooling and IPC are operationally real peers in the same runtime. ML exists in the tree, but remains experimental until it reaches the same operational standard.
+
+## Runtime Surfaces
+
+- **Graphics**: canonical proof surface on Pi hardware
+- **Tooling / IPC**: operational introspection and control path
+- **Inference / ML**: experimental subsystem, not yet production-real inside this repo
 
 ## New Features (vs Original)
 
@@ -92,6 +102,16 @@ make build
 ```bash
 make CC=aarch64-linux-gnu-gcc STRIP=aarch64-linux-gnu-strip build
 ```
+
+## Canonical Proof Surface
+
+The clearest proof that NeoGPU is real is visible hardware behavior plus runtime tooling:
+
+- `tests/test_06_raycast.c` - shader-driven sphere demo with live FPS HUD
+- `tests/test_07_message_triangle.c` - message-driven render path demo
+- `./neogpu_demo --tool --query-stats --query-fabric` - runtime fabric introspection
+
+If a change improves local code but weakens these proof surfaces, treat it as suspect until revalidated.
 
 ## Project Structure
 
