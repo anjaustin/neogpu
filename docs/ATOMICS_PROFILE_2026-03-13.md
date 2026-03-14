@@ -217,3 +217,85 @@ Conclusion:
 
 - keep item 1 because it removes a proven hot atomic-add cost
 - proceed immediately to item 2 to attack the newly exposed dominant CAS bottleneck
+
+## Item 2 Result - Remove Per-Enqueue `submit_hw` CAS Tracking
+
+### Change
+
+Implemented in:
+
+- `src/hs_core.c`
+
+Details:
+
+- removed `submit_hw` compare-exchange updates from `hs_submit_enqueue()`
+- moved submit queue depth observation into the single step thread
+- high-water tracking is now updated from `hs_step()` with load/store semantics instead of producer-side CAS contention
+
+### Red-Team Validation
+
+Validation steps:
+
+- rebuilt `neogpu_demo`
+- reran the benchmark suite
+- rebuilt `neogpu_prof`
+- reran `gprof`
+- compared item 2 results against item 1
+
+### Throughput Delta vs Item 1
+
+Item 1:
+
+- 1 thr: 11.13M msg/s
+- 2 thr: 16.85M msg/s
+- 4 thr: 7.75M msg/s
+- 8 thr: 6.87M msg/s
+- 16 thr: 6.14M msg/s
+
+Item 2:
+
+- 1 thr: 11.04M msg/s
+- 2 thr: 15.57M msg/s
+- 4 thr: 8.49M msg/s
+- 8 thr: 7.18M msg/s
+- 16 thr: 6.23M msg/s
+
+Interpretation:
+
+- near-neutral at 1 thread
+- slight regression at 2 threads
+- solid recovery at 4, 8, and 16 threads
+- this matches the hypothesis that item 2 helps once fallback queue contention becomes the bottleneck
+
+### Profiling Delta vs Item 1
+
+Item 1 profile:
+
+- `__aarch64_cas4_relax`: 31.3%
+- `__aarch64_ldadd4_relax`: 15.4%
+- `hs_step`: 13.9%
+
+Item 2 profile:
+
+- `__aarch64_cas4_relax`: 32.6%
+- `__aarch64_ldadd4_relax`: 16.4%
+- `hs_step`: 10.2%
+
+Interpretation:
+
+- flat-profile percentages remain noisy because the remaining fallback queue CAS operations still dominate the profile
+- step-thread cost fell materially, which is consistent with moving high-water bookkeeping off the producer path
+- benchmark throughput is the more convincing signal for this item: medium/high contention improved
+
+### Red-Team Conclusion
+
+Item 2 is a net win and should be kept.
+
+- it improves the contention-heavy ranges that item 1 exposed
+- it simplifies producer-side hot code
+- it does not change queue semantics, only where telemetry-style high-water accounting is maintained
+
+Conclusion:
+
+- keep item 2
+- proceed to item 3 to reduce repeated step-thread scanning work

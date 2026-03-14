@@ -288,13 +288,6 @@ static bool hs_submit_enqueue(HSSystem* sys, HSChannel ch, const Message* msg, c
                 if (len && payload) memcpy(slot->payload, payload, len);
                 atomic_store_explicit(&slot->seq, pos + 1, memory_order_release);
                 atomic_fetch_add_explicit(&sys->mpsc_ok[(u32)ch], 1, memory_order_relaxed);
-                /* High-water tracking */
-                u32 depth = (pos + 1) - atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
-                u32 old_hw = atomic_load_explicit(&sys->submit_hw[(u32)ch], memory_order_relaxed);
-                while (depth > old_hw) {
-                    if (atomic_compare_exchange_weak_explicit(&sys->submit_hw[(u32)ch], &old_hw, depth,
-                            memory_order_relaxed, memory_order_relaxed)) break;
-                }
                 return true;
             }
             continue;
@@ -1152,6 +1145,18 @@ bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len
     }
 }
 
+static inline void hs_submit_note_depth_step(HSSystem* sys, HSChannel ch) {
+    if (!sys || ch <= CHAN_DEFAULT || ch >= CHAN_COUNT) return;
+    HSSubmitQueue* q = &sys->submit[(u32)ch];
+    u32 enq = atomic_load_explicit(&q->enqueue_pos, memory_order_relaxed);
+    u32 deq = atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
+    u32 depth = enq - deq;
+    u32 old = atomic_load_explicit(&sys->submit_hw[(u32)ch], memory_order_relaxed);
+    if (depth > old) {
+        atomic_store_explicit(&sys->submit_hw[(u32)ch], depth, memory_order_relaxed);
+    }
+}
+
 u32 hs_step(HSSystem* sys) {
     hs_lock(sys);
     u32 processed = 0;
@@ -1164,6 +1169,8 @@ u32 hs_step(HSSystem* sys) {
     for (HSChannel ch = CHAN_RT; ch <= CHAN_TELEM; ch++) {
         u32 budget = sys->chan_budget[(u32)ch];
         u32 used = 0;
+
+        hs_submit_note_depth_step(sys, ch);
 
         /* Drain per-producer SPSC lanes */
         for (u32 p = 0; p < prod_count && used < budget; p++) {
