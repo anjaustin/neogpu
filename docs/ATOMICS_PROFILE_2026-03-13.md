@@ -299,3 +299,75 @@ Conclusion:
 
 - keep item 2
 - proceed to item 3 to reduce repeated step-thread scanning work
+
+## Item 3 Result - Active Producer Masks in `hs_step()`
+
+### Change Attempted
+
+Attempted in:
+
+- `include/hs_core.h`
+- `src/hs_core.c`
+
+Approach:
+
+- track per-channel active producer masks
+- mark producers active on successful SPSC push
+- have `hs_step()` scan only the active producers instead of all producer slots
+
+### Red-Team Validation
+
+Validation steps:
+
+- rebuilt `neogpu_demo`
+- reran the benchmark suite
+- rebuilt `neogpu_prof`
+- reran `gprof`
+
+### Result
+
+This change regressed throughput badly and was reverted.
+
+Observed benchmark result for the attempted version:
+
+- 1 thr: 7.49M msg/s
+- 2 thr: 9.34M msg/s
+- 4 thr: 6.07M msg/s
+- 8 thr: 5.43M msg/s
+- 16 thr: 4.70M msg/s
+
+Profile signal from the rejected version:
+
+- new hotspot: `__aarch64_ldset4_relax` at 16.1%
+- `hs_step()` share did not improve enough to justify the new atomic bitset churn
+
+### Failure Analysis
+
+The active-mask idea introduced new atomic set/clear traffic on every producer activation and idle transition.
+
+That replaced scan overhead with another contested synchronization path:
+
+- producer-side `fetch_or`
+- step-side `fetch_and`
+- race-repair logic that re-set the bit when a producer became active again during drain
+
+Net effect:
+
+- more atomic churn
+- worse throughput across all tested thread counts
+
+### Conclusion
+
+Reject item 3 in this form.
+
+Do not keep the active producer mask implementation.
+
+## Next Investigation Direction
+
+A better step-thread optimization should avoid introducing new shared atomics.
+
+Promising alternatives:
+
+- increase SPSC burst size adaptively when a producer is clearly hot
+- reduce per-message work in `hs_route_immediate()` and node processing
+- revisit benchmark topology to reduce fallback MPSC pressure before adding more coordination state
