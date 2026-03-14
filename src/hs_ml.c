@@ -344,7 +344,7 @@ void hs_tokenizer_init(HSTokenizer* tok,
     if (!tok->token_to_id) return;
     
     tok->vocab_sizes = malloc(vocab_size * sizeof(u32));
-    if (!tok->vocab_sizes) return;
+    if (!tok->vocab_sizes) { free(tok->token_to_id); tok->token_to_id = NULL; return; }
     
     for (u32 i = 0; i < vocab_size; i++) {
         u32 len = 0;
@@ -360,7 +360,7 @@ void hs_tokenizer_init(HSTokenizer* tok,
     
     tok->encode_buffer_size = 4096;
     tok->encode_buffer = malloc(tok->encode_buffer_size);
-    if (!tok->encode_buffer) return;
+    if (!tok->encode_buffer) { free(tok->token_to_id); tok->token_to_id = NULL; free(tok->vocab_sizes); tok->vocab_sizes = NULL; return; }
 }
 
 void hs_tokenizer_free(HSTokenizer* tok) {
@@ -1037,10 +1037,12 @@ u32 hs_ml_generate(HSMLSystem* ml,
     
     /* Tokenize input */
     HSTokenizer tok;
-    /* For now, create a simple identity tokenizer */
-    /* In real use, would load from model file */
-    char** dummy_vocab = NULL;
-    hs_tokenizer_init(&tok, dummy_vocab, ml->vocab_size, 0, 1, 2, 3);
+    if (!prompt || !output_tokens || ml->vocab_size == 0) return 0;
+    if (!ml->tokenizer_vocab) {
+        printf("Tokenizer not loaded\n");
+        return 0;
+    }
+    hs_tokenizer_init(&tok, ml->tokenizer_vocab, ml->vocab_size, 0, 1, 2, 3);
     
     u32* input_tokens = malloc(1024 * sizeof(u32));
     if (!input_tokens) return 0;

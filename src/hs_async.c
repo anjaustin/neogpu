@@ -21,6 +21,9 @@
 #define DBG_PRINT(...) ((void)0)
 #endif
 
+/* P0-4: Maximum path length for async operations */
+#define HS_ASYNC_MAX_PATH 1024
+
 static void* async_worker(void* arg) {
     HSAsync* async = (HSAsync*)arg;
     
@@ -118,10 +121,38 @@ void hs_async_shutdown(HSAsync* async) {
     pthread_mutex_destroy(&async->mutex);
 }
 
+/*
+ * P0-4: Safe path duplication with length limit
+ */
+static char* hs_async_safe_strdup(const char* path) {
+    if (!path) return NULL;
+    
+    size_t len = 0;
+    while (path[len] && len < HS_ASYNC_MAX_PATH) len++;
+    
+    if (len == 0 || len >= HS_ASYNC_MAX_PATH) return NULL;
+    
+    char* copy = malloc(len + 1);
+    if (!copy) return NULL;
+    
+    memcpy(copy, path, len);
+    copy[len] = 0;
+    return copy;
+}
+
 bool hs_async_load_texture(HSAsync* async, u8 slot, const char* path) {
+    if (!async || !path) return false;
+    
     pthread_mutex_lock(&async->mutex);
     
     if (async->pending_count >= HS_ASYNC_MAX_PENDING) {
+        pthread_mutex_unlock(&async->mutex);
+        return false;
+    }
+    
+    /* P0-4: Safe path duplication with length check */
+    char* path_copy = hs_async_safe_strdup(path);
+    if (!path_copy) {
         pthread_mutex_unlock(&async->mutex);
         return false;
     }
@@ -134,7 +165,7 @@ bool hs_async_load_texture(HSAsync* async, u8 slot, const char* path) {
         .success = 0,
         .size = 0,
         .result = NULL,
-        .user_data = strdup(path)
+        .user_data = path_copy
     };
     
     async->tasks[async->head] = task;
@@ -154,6 +185,8 @@ bool hs_async_load_texture(HSAsync* async, u8 slot, const char* path) {
 }
 
 bool hs_async_save_file(HSAsync* async, const char* path, const void* data, u32 size) {
+    if (!async || !path || !data || size == 0) return false;
+    
     pthread_mutex_lock(&async->mutex);
     
     if (async->pending_count >= HS_ASYNC_MAX_PENDING) {
@@ -161,7 +194,20 @@ bool hs_async_save_file(HSAsync* async, const char* path, const void* data, u32 
         return false;
     }
     
+    /* P0-4: Safe path duplication with length check */
+    char* path_copy = hs_async_safe_strdup(path);
+    if (!path_copy) {
+        pthread_mutex_unlock(&async->mutex);
+        return false;
+    }
+    
+    /* P0-4: Check malloc success before copying */
     void* copy = malloc(size);
+    if (!copy) {
+        free(path_copy);
+        pthread_mutex_unlock(&async->mutex);
+        return false;
+    }
     memcpy(copy, data, size);
     
     AsyncTask task = {
@@ -172,7 +218,7 @@ bool hs_async_save_file(HSAsync* async, const char* path, const void* data, u32 
         .success = 0,
         .size = size,
         .result = copy,
-        .user_data = strdup(path)
+        .user_data = path_copy
     };
     
     async->tasks[async->head] = task;

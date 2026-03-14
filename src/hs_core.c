@@ -244,7 +244,7 @@ static void hs_render_record(HSSystem* sys, const Message* msg) {
             break;
 
         case OP_DRAW_INSTANCE: {
-            if (msg->payload_len != 4 || msg->payload_idx >= sys->payload_capacity) return;
+            if (msg->payload_len != 8 || msg->payload_idx >= sys->payload_capacity) return;
             u8 b = 0, ib = 0;
             u32 count = 0;
             if (!hs_unpack_draw_instance(sys->payloads[msg->payload_idx].data, msg->payload_len, &b, &ib, &count)) return;
@@ -762,7 +762,7 @@ static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
 
     [OP_LOAD_BUFFER]   = {NODE_BUFFER, HS_PAYLOAD_NONE,   0, 0},
     [OP_DRAW]          = {NODE_BUFFER, HS_PAYLOAD_NONE,   0, 0},
-    [OP_DRAW_INSTANCE] = {NODE_BUFFER, HS_PAYLOAD_FIXED,  4,  4},
+    [OP_DRAW_INSTANCE] = {NODE_BUFFER, HS_PAYLOAD_FIXED,  8,  8},
     [OP_DRAW_TEXT]     = {NODE_BUFFER, HS_PAYLOAD_STRING, 1, HS_PAYLOAD_SIZE},
 
     [OP_LOAD_TEXTURE]  = {NODE_TEXTURE, HS_PAYLOAD_NONE,  0, 0},

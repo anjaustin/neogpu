@@ -51,11 +51,12 @@ static inline void hs_pack_depth_compare(u8 out[2], u8 compare, bool write) {
     out[1] = write ? 1 : 0;
 }
 
-static inline void hs_pack_draw_instance(u8 out[4], u8 buffer, u8 instance_buffer, u32 count) {
+static inline void hs_pack_draw_instance(u8 out[8], u8 buffer, u8 instance_buffer, u32 count) {
     out[0] = buffer;
     out[1] = instance_buffer;
-    out[2] = (u8)((count >> 0) & 0xFF);
-    out[3] = (u8)((count >> 8) & 0xFF);
+    out[2] = 0; out[3] = 0; /* reserved */
+    memcpy(&out[4], &count, 4);
+    /* count stored as u32 at offset 4 */
 }
 
 static inline void hs_pack_clear_ds(u8 out[8], f32 depth, u8 stencil) {
@@ -88,17 +89,17 @@ static inline bool hs_unpack_u16x4(const void* data, u32 len, u16 out_xywh[4]) {
 }
 
 static inline bool hs_unpack_u8x4(const void* data, u32 len, u8 out_vals[4]) {
-    if (!data || len < 4) return false;
+    if (!data || len < 8) return false;
     memcpy(out_vals, data, 4);
     return true;
 }
 
 static inline bool hs_unpack_draw_instance(const void* data, u32 len, u8* out_buffer, u8* out_instance_buffer, u32* out_count) {
-    if (!data || len < 4) return false;
+    if (!data || len < 8) return false;
     const u8* v = (const u8*)data;
     if (out_buffer) *out_buffer = v[0];
     if (out_instance_buffer) *out_instance_buffer = v[1];
-    if (out_count) *out_count = (u32)v[2] | ((u32)v[3] << 8);
+    if (out_count) memcpy(out_count, &v[4], 4);
     return true;
 }
 
@@ -204,7 +205,7 @@ static inline void hs_pack_set_record_mask(u8 out[4], u32 mask) {
 }
 
 static inline bool hs_unpack_set_record_mask(const void* data, u32 len, u32* out_mask) {
-    if (!data || len < 4) return false;
+    if (!data || len < 8) return false;
     if (out_mask) memcpy(out_mask, data, 4);
     return true;
 }

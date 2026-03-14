@@ -6,18 +6,31 @@
 void hs_gpu_init(HSGpu* gpu) {
     memset(gpu, 0, sizeof(*gpu));
     hs_init(&gpu->system, gpu->log_buffer, HS_MAX_MSG_LOG, gpu->payload_buffer);
-    hs_nodes_set_system(&gpu->system);
     gpu->system.render_list = &gpu->render;
 
     hs_memory_init(&gpu->memory);
-    
+
     gpu->shader_node.id = NODE_SHADER;
     gpu->buffer_node.id = NODE_BUFFER;
     gpu->texture_node.id = NODE_TEXTURE;
     gpu->output_node.id = NODE_OUTPUT;
     gpu->sound_node.id = NODE_SOUND;
     gpu->system_node.id = NODE_SYSTEM;
-    
+
+    gpu->shader_node.sys = &gpu->system;
+    gpu->buffer_node.sys = &gpu->system;
+    gpu->texture_node.sys = &gpu->system;
+    gpu->output_node.sys = &gpu->system;
+    gpu->sound_node.sys = &gpu->system;
+    gpu->system_node.sys = &gpu->system;
+
+    gpu->shader_node.state = &gpu->shader_state;
+    gpu->buffer_node.state = &gpu->buffer_state;
+    gpu->texture_node.state = &gpu->texture_state;
+    gpu->output_node.state = &gpu->output_state;
+    gpu->sound_node.state = &gpu->sound_state;
+    gpu->system_node.state = &gpu->system_state_data;
+
     shader_node_init(&gpu->shader_node);
     buffer_node_init(&gpu->buffer_node);
     texture_node_init(&gpu->texture_node);
@@ -165,13 +178,13 @@ void hs_gpu_clip(HSGpu* gpu, u16 x, u16 y, u16 w, u16 h) {
 }
 
 void hs_gpu_stencil(HSGpu* gpu, u8 op, u8 fail, u8 pass, u8 front) {
-    u8 data[4];
+    u8 data[8];
     hs_pack_stencil(data, op, fail, pass, front);
     hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_STENCIL, data, sizeof(data));
 }
 
 void hs_gpu_stencil_func(HSGpu* gpu, u8 compare, u8 ref, u8 read_mask, u8 write_mask) {
-    u8 data[4];
+    u8 data[8];
     hs_pack_stencil_func(data, compare, ref, read_mask, write_mask);
     hs_gpu_send_with_payload(gpu, NODE_SHADER, OP_STENCIL_FUNC, data, sizeof(data));
 }
@@ -191,7 +204,7 @@ void hs_gpu_draw(HSGpu* gpu, u8 buffer) {
 }
 
 void hs_gpu_draw_instance(HSGpu* gpu, u8 buffer, u8 instance_buffer, u32 count) {
-    u8 data[4];
+    u8 data[8];
     hs_pack_draw_instance(data, buffer, instance_buffer, count);
     hs_gpu_send_with_payload(gpu, NODE_BUFFER, OP_DRAW_INSTANCE, data, sizeof(data));
 }
