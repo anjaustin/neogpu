@@ -80,6 +80,7 @@ are all funneled through nearly the same queue discipline and routing structure.
 - semantic message class spec
 - migration plan from current opcode/channel model to class-aware routing
 - one candidate prototype target for structural implementation
+- initial spec recorded in `docs/SEMANTIC_MESSAGE_CLASSES.md`
 
 ### Success Criteria
 
