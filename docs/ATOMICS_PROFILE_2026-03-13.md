@@ -371,3 +371,69 @@ Promising alternatives:
 - increase SPSC burst size adaptively when a producer is clearly hot
 - reduce per-message work in `hs_route_immediate()` and node processing
 - revisit benchmark topology to reduce fallback MPSC pressure before adding more coordination state
+
+## Item 4 Result - Adaptive SPSC Burst Sizing
+
+### Change Attempted
+
+Attempted in:
+
+- `src/hs_core.c`
+
+Approach:
+
+- increase the SPSC drain burst size in `hs_step()` based on queue depth
+- use larger bursts for visibly hot producer lanes instead of the fixed `32` message chunk size
+
+### Red-Team Validation
+
+Validation steps:
+
+- rebuilt `neogpu_demo`
+- reran the producer benchmark suite
+- rebuilt `neogpu_prof`
+- reran `gprof`
+
+### Result
+
+This change regressed throughput severely and was reverted.
+
+Observed benchmark result for the attempted version:
+
+- 1 thr: 2.65M msg/s
+- 2 thr: 3.03M msg/s
+- 4 thr: 2.19M msg/s
+- 8 thr: 1.90M msg/s
+- 16 thr: 1.18M msg/s
+
+Profile signal from the rejected version:
+
+- `hs_step` rose to 21.8%
+- `hs_route_immediate` remained the dominant worker cost at 30.2%
+- fallback CAS pressure was still present, but the larger bursts made scheduling/fairness behavior much worse under this benchmark
+
+### Failure Analysis
+
+The larger SPSC bursts let hot producers monopolize more of the channel budget before fallback queues were drained.
+
+Net effect:
+
+- worse fairness across producers and queue sources
+- more time stranded in the step loop before competing work got service
+- significantly lower overall throughput under the benchmark topology used here
+
+### Conclusion
+
+Reject item 4 in this form.
+
+Do not keep adaptive burst sizing as a simple queue-depth-to-burst heuristic.
+
+## Next Investigation Direction
+
+The strongest remaining lever is likely inside `hs_route_immediate()` and nearby per-message work rather than queue-drain geometry.
+
+Promising next candidates:
+
+- reduce validation/logging/recording branches inside `hs_route_immediate()`
+- split the render fast path from the fully general path
+- reduce node inbox traffic or collapse trivial node processing for benchmark-style ops
