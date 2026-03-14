@@ -124,7 +124,6 @@ void output_node_reset(Node* node);
 void sound_node_reset(Node* node);
 void system_node_reset(Node* node);
 
-void hs_nodes_set_system(HSSystem* sys);
 const char* node_name(u8 id);
 
 #endif

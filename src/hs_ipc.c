@@ -524,7 +524,10 @@ static void* hs_ipc_thread_main(void* arg) {
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, srv->path, sizeof(addr.sun_path) - 1);
+        size_t pathlen = strlen(srv->path);
+        if (pathlen >= sizeof(addr.sun_path)) pathlen = sizeof(addr.sun_path) - 1;
+        memcpy(addr.sun_path, srv->path, pathlen);
+        addr.sun_path[pathlen] = '\0';
 
         (void)unlink(srv->path);
         if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {

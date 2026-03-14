@@ -100,7 +100,8 @@ static int read_float32(FILE* f, float* out) {
     return 0;
 }
 
-static int find_key(FILE* f, uint32_t num_kv, const char* key, void* value_out, GGUFType expected_type) {
+/* Reserved for future GGUF metadata parsing */
+static int __attribute__((unused)) find_key(FILE* f, uint32_t num_kv, const char* key, void* value_out, GGUFType expected_type) {
     for (uint32_t i = 0; i < num_kv; i++) {
         char* name = read_string(f);
         if (!name) return -1;
@@ -152,262 +153,41 @@ static int find_tensor_by_name(GGUFTensorInfo* tensors, uint32_t num_tensors, co
     return -1;
 }
 
-static int tensor_name_contains(GGUFTensorInfo* tensors, uint32_t num_tensors, const char* prefix, uint32_t layer) {
+/* Reserved for future layer-wise tensor lookup */
+static int __attribute__((unused)) tensor_name_contains(GGUFTensorInfo* tensors, uint32_t num_tensors, const char* prefix, uint32_t layer) {
     char name[256];
     snprintf(name, sizeof(name), "%s.%u.weight", prefix, layer);
     return find_tensor_by_name(tensors, num_tensors, name);
 }
 
 int hs_ml_load_gguf(HSMLSystem* ml, const char* path) {
+    if (!ml || !path) return -1;
+
+    hs_ml_free(ml);
+    hs_ml_init(ml);
+
     FILE* f = fopen(path, "rb");
     if (!f) {
         printf("Failed to open %s\n", path);
         return -1;
     }
-    
-    /* Read magic */
-    uint32_t magic;
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
     if (read_uint32(f, &magic) != 0 || magic != GGUF_MAGIC) {
         printf("Not a GGUF file\n");
         fclose(f);
         return -1;
     }
-    
-    /* Read version */
-    uint32_t version;
     if (read_uint32(f, &version) != 0) {
         fclose(f);
         return -1;
     }
-    printf("GGUF version: %u\n", version);
-    
-    /* Read counts */
-    uint32_t num_tensors, num_kv;
-    if (read_uint32(f, &num_tensors) != 0 || read_uint32(f, &num_kv) != 0) {
-        fclose(f);
-        return -1;
-    }
-    printf("Tensors: %u, KV: %u\n", num_tensors, num_kv);
-    
-    /* Find model metadata */
-    uint32_t vocab_size = 0, hidden_size = 0, num_layers = 0, num_heads = 0;
-    
-    find_key(f, num_kv, "vocab_size", &vocab_size, GGUF_TYPE_UINT32);
-    find_key(f, num_kv, "hidden_size", &hidden_size, GGUF_TYPE_UINT32);
-    find_key(f, num_kv, "num_hidden_layers", &num_layers, GGUF_TYPE_UINT32);
-    find_key(f, num_kv, "num_attention_heads", &num_heads, GGUF_TYPE_UINT32);
-    
-    /* mlp.hidden_dim for FFN size */
-    uint32_t ffn_hidden = hidden_size * 4;
-    find_key(f, num_kv, "mlp.hidden_dim", &ffn_hidden, GGUF_TYPE_UINT32);
-    
-    if (!vocab_size || !hidden_size || !num_layers || !num_heads) {
-        printf("Missing required metadata\n");
-        fclose(f);
-        return -1;
-    }
-    
-    uint32_t head_dim = hidden_size / num_heads;
-    
-    printf("Model: vocab=%u, hidden=%u, layers=%u, heads=%u, ffn=%u\n",
-           vocab_size, hidden_size, num_layers, num_heads, ffn_hidden);
-    
-    /* Read tensor info */
-    GGUFTensorInfo* tensors = calloc(num_tensors, sizeof(GGUFTensorInfo));
-    if (!tensors) {
-        fclose(f);
-        return -1;
-    }
-    
-    for (uint32_t i = 0; i < num_tensors; i++) {
-        tensors[i].name = read_string(f);
-        if (!tensors[i].name || read_uint32(f, &tensors[i].n_dims) != 0) {
-            for (uint32_t j = 0; j < i; j++) free(tensors[j].name);
-            free(tensors);
-            fclose(f);
-            return -1;
-        }
-        for (uint32_t d = 0; d < tensors[i].n_dims; d++) {
-            if (read_uint64(f, &tensors[i].shape[d]) != 0) {
-                free(tensors[i].name);
-                for (uint32_t j = 0; j < i; j++) free(tensors[j].name);
-                free(tensors);
-                fclose(f);
-                return -1;
-            }
-        }
-        uint32_t type;
-        if (read_uint32(f, &type) != 0 || read_uint64(f, &tensors[i].offset) != 0) {
-            free(tensors[i].name);
-            for (uint32_t j = 0; j < i; j++) free(tensors[j].name);
-            free(tensors);
-            fclose(f);
-            return -1;
-        }
-        tensors[i].type = (GGUFTensorType)type;
-        
-        /* Calculate size */
-        tensors[i].size = 4;  /* Default float32 */
-        for (uint32_t d = 0; d < tensors[i].n_dims; d++) {
-            tensors[i].size *= (uint64_t)tensors[i].shape[d];
-        }
-        /* Adjust for quantized types */
-        if (tensors[i].type >= GGUF_TYPE_Q4_0 && tensors[i].type <= GGUF_TYPE_Q8_1) {
-            tensors[i].size = (tensors[i].size + 1) / 2;
-        }
-    }
-    
-    /* Read actual tensor data */
-    uint8_t* file_data = NULL;
-    long file_size;
-    if (fseek(f, 0, SEEK_END) != 0) {
-        for (uint32_t i = 0; i < num_tensors; i++) free(tensors[i].name);
-        free(tensors);
-        fclose(f);
-        return -1;
-    }
-    file_size = ftell(f);
-    if (file_size < 0 || fseek(f, 0, SEEK_SET) != 0) {
-        for (uint32_t i = 0; i < num_tensors; i++) free(tensors[i].name);
-        free(tensors);
-        fclose(f);
-        return -1;
-    }
-    
-    /* Check for data section */
-    long data_offset = 0;
-    for (uint32_t i = 0; i < num_tensors; i++) {
-        if (tensors[i].offset + tensors[i].size > (uint64_t)data_offset) {
-            data_offset = tensors[i].offset + tensors[i].size;
-        }
-    }
-    
-    if (data_offset > 0 && data_offset < file_size) {
-        if (fseek(f, data_offset, SEEK_SET) != 0) {
-            for (uint32_t i = 0; i < num_tensors; i++) free(tensors[i].name);
-            free(tensors);
-            fclose(f);
-            return -1;
-        }
-        size_t data_size = file_size - data_offset;
-        file_data = malloc(data_size);
-        if (!file_data) {
-            for (uint32_t i = 0; i < num_tensors; i++) free(tensors[i].name);
-            free(tensors);
-            fclose(f);
-            return -1;
-        }
-        if (fread(file_data, 1, data_size, f) != data_size) {
-            free(file_data);
-            for (uint32_t i = 0; i < num_tensors; i++) free(tensors[i].name);
-            free(tensors);
-            fclose(f);
-            return -1;
-        }
-    }
-    
-    /* Allocate weights in model */
-    ml->vocab_size = vocab_size;
-    ml->hidden_size = hidden_size;
-    ml->num_layers = num_layers;
-    ml->num_heads = num_heads;
-    ml->head_dim = head_dim;
-    ml->ffn_hidden_size = ffn_hidden;
-    ml->max_context = 2048;
-    
-    /* Allocate memory for weights */
-    size_t embedding_size = (size_t)vocab_size * hidden_size * sizeof(float);
-    ml->embedding = malloc(embedding_size);
-    ml->lm_head = malloc(embedding_size);
-    ml->final_norm = malloc(hidden_size * sizeof(float));
-    if (!ml->embedding || !ml->lm_head || !ml->final_norm) {
-        fclose(f);
-        return -1;
-    }
-    
-    ml->attn_q_proj = malloc((size_t)num_layers * hidden_size * hidden_size * sizeof(float));
-    ml->attn_k_proj = malloc((size_t)num_layers * hidden_size * hidden_size * sizeof(float));
-    ml->attn_v_proj = malloc((size_t)num_layers * hidden_size * hidden_size * sizeof(float));
-    ml->attn_o_proj = malloc((size_t)num_layers * hidden_size * hidden_size * sizeof(float));
-    if (!ml->attn_q_proj || !ml->attn_k_proj || !ml->attn_v_proj || !ml->attn_o_proj) {
-        fclose(f);
-        return -1;
-    }
-    
-    size_t ffn_size_elements = (size_t)hidden_size * ffn_hidden;
-    ml->ffn_gate_proj = malloc((size_t)num_layers * ffn_size_elements * sizeof(float));
-    ml->ffn_up_proj = malloc((size_t)num_layers * ffn_size_elements * sizeof(float));
-    ml->ffn_down_proj = malloc((size_t)num_layers * ffn_size_elements * sizeof(float));
-    if (!ml->ffn_gate_proj || !ml->ffn_up_proj || !ml->ffn_down_proj) {
-        fclose(f);
-        return -1;
-    }
-    
-    ml->attn_norm = malloc((size_t)num_layers * hidden_size * sizeof(float));
-    ml->ffn_norm = malloc((size_t)num_layers * hidden_size * sizeof(float));
-    if (!ml->attn_norm || !ml->ffn_norm) {
-        fclose(f);
-        return -1;
-    }
-    
-    /* Initialize with small random values for testing */
-    printf("Initializing weights...\n");
-    for (size_t i = 0; i < embedding_size / sizeof(float); i++) {
-        ((float*)ml->embedding)[i] = (((float)(i % 100)) / 100.0f) - 0.5f;
-    }
-    for (size_t i = 0; i < embedding_size / sizeof(float); i++) {
-        ((float*)ml->lm_head)[i] = (((float)(i % 100)) / 100.0f) - 0.5f;
-    }
-    
-    for (size_t i = 0; i < (size_t)num_layers * hidden_size; i++) {
-        ((float*)ml->attn_norm)[i] = 1.0f;
-        ((float*)ml->ffn_norm)[i] = 1.0f;
-    }
-    
-    /* Initialize projection matrices with Xavier-like initialization */
-    float scale = 0.1f;
-    for (size_t l = 0; l < num_layers; l++) {
-        float* q = ml->attn_q_proj + l * hidden_size * hidden_size;
-        float* k = ml->attn_k_proj + l * hidden_size * hidden_size;
-        float* v = ml->attn_v_proj + l * hidden_size * hidden_size;
-        float* o = ml->attn_o_proj + l * hidden_size * hidden_size;
-        
-        for (size_t i = 0; i < (size_t)hidden_size * hidden_size; i++) {
-            q[i] = ((((float)(i % 100)) / 100.0f) - 0.5f) * scale;
-            k[i] = ((((float)(i % 100)) / 100.0f) - 0.5f) * scale;
-            v[i] = ((((float)(i % 100)) / 100.0f) - 0.5f) * scale;
-            o[i] = ((((float)(i % 100)) / 100.0f) - 0.5f) * scale;
-        }
-        
-        float* g = ml->ffn_gate_proj + l * hidden_size * ffn_hidden;
-        float* u = ml->ffn_up_proj + l * hidden_size * ffn_hidden;
-        float* d = ml->ffn_down_proj + l * ffn_hidden * hidden_size;
-        
-        for (size_t i = 0; i < (size_t)hidden_size * ffn_hidden; i++) {
-            g[i] = ((((float)(i % 100)) / 100.0f) - 0.5f) * scale;
-            u[i] = ((((float)(i % 100)) / 100.0f) - 0.5f) * scale;
-        }
-        for (size_t i = 0; i < (size_t)ffn_hidden * hidden_size; i++) {
-            d[i] = ((((float)(i % 100)) / 100.0f) - 0.5f) * scale;
-        }
-    }
-    
-    for (size_t i = 0; i < hidden_size; i++) {
-        ml->final_norm[i] = 1.0f;
-    }
-    
-    /* Free tensor info */
-    for (uint32_t i = 0; i < num_tensors; i++) {
-        free(tensors[i].name);
-    }
-    free(tensors);
-    free(file_data);
-    
+
     fclose(f);
-    
-    ml->loaded = true;
-    printf("Model loaded!\n");
-    return 0;
+    printf("GGUF version: %u\n", version);
+    printf("GGUF tensor loading is not implemented yet; refusing placeholder model load\n");
+    return -1;
 }
 
 void hs_ml_save_gguf(HSMLSystem* ml, const char* path) {

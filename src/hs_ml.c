@@ -254,6 +254,8 @@ void hs_ml_gemm_int8_neon_fallback(int32_t* C,
     
     const u32 BK = HS_ML_QK_I2_S;
     
+    (void)B_scale;  /* Reserved for future dequantization */
+    
     memset(C, 0, M * N * sizeof(int32_t));
     
     for (u32 m = 0; m < M; m++) {

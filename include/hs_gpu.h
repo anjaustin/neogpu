@@ -32,6 +32,13 @@ typedef struct HSGpu {
     Node        sound_node;
     Node        system_node;
 
+    ShaderState shader_state;
+    BufferState buffer_state;
+    TextureState texture_state;
+    OutputState output_state;
+    SoundState  sound_state;
+    SystemState system_state_data;
+
     HSBackend*   backend;
 
     HSRenderList render;

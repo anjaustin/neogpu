@@ -17,6 +17,7 @@
 #include <stdatomic.h>
 
 typedef struct HSRenderList HSRenderList;
+typedef struct HSSystem HSSystem;
 
 #define HS_MAX_NODES       16
 #define HS_MAX_MSG_LOG     65536
@@ -193,10 +194,11 @@ struct Node {
     NodeProcessFn  process_fn;
     NodeResetFn    reset_fn;
     void*          state;
+    HSSystem*      sys;
     Node*          next;
 };
 
-typedef struct {
+struct HSSystem {
     Node*       nodes[HS_MAX_NODES];
     Node*       node_map[256];
     u8          node_count;
@@ -261,7 +263,7 @@ typedef struct {
     u32             toolbus_count;
     u32             toolbus_dropped;
     HSToolbusEntry  toolbus[HS_TOOLBUS_SIZE];
-} HSSystem;
+};
 
 static inline u32 hs_channel_bit(HSChannel ch) {
     return (ch < CHAN_COUNT) ? (1u << (u32)ch) : 0u;
