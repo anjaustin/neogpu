@@ -48,6 +48,17 @@ typedef enum {
 
 static HSChannel hs_default_channel_for_op(OpCode op);
 
+#define HS_RING_MASK(size) ((size) - 1u)
+
+_Static_assert((HS_QUEUE_SIZE & (HS_QUEUE_SIZE - 1)) == 0, "HS_QUEUE_SIZE must be power of two");
+_Static_assert((HS_SUBMIT_SIZE & (HS_SUBMIT_SIZE - 1)) == 0, "HS_SUBMIT_SIZE must be power of two");
+_Static_assert((HS_SPSC_SIZE & (HS_SPSC_SIZE - 1)) == 0, "HS_SPSC_SIZE must be power of two");
+_Static_assert((HS_TOOLBUS_SIZE & (HS_TOOLBUS_SIZE - 1)) == 0, "HS_TOOLBUS_SIZE must be power of two");
+
+static inline u32 hs_ring_index(u32 pos, u32 size) {
+    return pos & HS_RING_MASK(size);
+}
+
 static inline Node* hs_node_by_id(HSSystem* sys, u8 id) {
     return sys ? sys->node_map[id] : NULL;
 }
@@ -275,7 +286,7 @@ static bool hs_submit_enqueue(HSSystem* sys, HSChannel ch, const Message* msg, c
     HSSubmitQueue* q = &sys->submit[(u32)ch];
     u32 pos = atomic_load_explicit(&q->enqueue_pos, memory_order_relaxed);
     for (;;) {
-        HSSubmitSlot* slot = &q->slots[pos % HS_SUBMIT_SIZE];
+        HSSubmitSlot* slot = &q->slots[hs_ring_index(pos, HS_SUBMIT_SIZE)];
         u32 seq = atomic_load_explicit(&slot->seq, memory_order_acquire);
         intptr_t dif = (intptr_t)seq - (intptr_t)pos;
         if (dif == 0) {
@@ -306,7 +317,7 @@ static bool hs_submit_dequeue(HSSystem* sys, HSChannel ch, Message* out_msg, u8 
     HSSubmitQueue* q = &sys->submit[(u32)ch];
     u32 pos = atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
     for (;;) {
-        HSSubmitSlot* slot = &q->slots[pos % HS_SUBMIT_SIZE];
+        HSSubmitSlot* slot = &q->slots[hs_ring_index(pos, HS_SUBMIT_SIZE)];
         u32 seq = atomic_load_explicit(&slot->seq, memory_order_acquire);
         intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
         if (dif == 0) {
@@ -339,7 +350,7 @@ static bool hs_spsc_push(HSSpscQueue* q, const Message* msg, const void* payload
     u32 head = atomic_load_explicit(&q->head.v, memory_order_acquire);
     if ((tail - head) >= HS_SPSC_SIZE) return false;
 
-    HSSpscSlot* s = &q->slots[tail % HS_SPSC_SIZE];
+    HSSpscSlot* s = &q->slots[hs_ring_index(tail, HS_SPSC_SIZE)];
     s->msg = *msg;
     s->payload_len = len;
     if (len && payload) memcpy(s->payload, payload, len);
@@ -563,7 +574,7 @@ void hs_toolbus_record_result(HSSystem* sys, const Message* result) {
     }
 
     u32 idx = sys->toolbus_head;
-    sys->toolbus_head = (sys->toolbus_head + 1) % HS_TOOLBUS_SIZE;
+    sys->toolbus_head = hs_ring_index(sys->toolbus_head + 1, HS_TOOLBUS_SIZE);
     sys->toolbus_seq++;
 
     HSToolbusEntry* e = &sys->toolbus[idx];
@@ -594,7 +605,7 @@ bool hs_toolbus_wait(HSSystem* sys, u32 after_seq, u32 cid, u8 result_op, u8* ou
 
     for (;;) {
         for (u32 i = 0; i < HS_TOOLBUS_SIZE; i++) {
-            u32 pos = (sys->toolbus_head + HS_TOOLBUS_SIZE - 1 - i) % HS_TOOLBUS_SIZE;
+            u32 pos = hs_ring_index(sys->toolbus_head + HS_TOOLBUS_SIZE - 1 - i, HS_TOOLBUS_SIZE);
             const HSToolbusEntry* e = &sys->toolbus[pos];
             if (e->seq == 0 || e->seq <= after_seq) break;
             if (e->cid == cid && e->result_op == result_op) {
@@ -913,7 +924,7 @@ void hs_set_channel_budget(HSSystem* sys, HSChannel ch, u32 budget) {
 bool mq_push(MessageQueue* q, Message* msg) {
     if (q->count >= HS_QUEUE_SIZE) return false;
     q->msgs[q->tail] = *msg;
-    q->tail = (q->tail + 1) % HS_QUEUE_SIZE;
+    q->tail = hs_ring_index(q->tail + 1, HS_QUEUE_SIZE);
     q->count++;
     return true;
 }
@@ -921,7 +932,7 @@ bool mq_push(MessageQueue* q, Message* msg) {
 bool mq_pop(MessageQueue* q, Message* msg) {
     if (q->count == 0) return false;
     *msg = q->msgs[q->head];
-    q->head = (q->head + 1) % HS_QUEUE_SIZE;
+    q->head = hs_ring_index(q->head + 1, HS_QUEUE_SIZE);
     q->count--;
     return true;
 }
@@ -1187,7 +1198,7 @@ u32 hs_step(HSSystem* sys) {
                 if (n > (budget - used)) n = (budget - used);
 
                 for (u32 i = 0; i < n; i++) {
-                    HSSpscSlot* s = &q->slots[(head + i) % HS_SPSC_SIZE];
+                    HSSpscSlot* s = &q->slots[hs_ring_index(head + i, HS_SPSC_SIZE)];
                     (void)hs_route_immediate(sys, &s->msg, s->payload_len ? s->payload : NULL, s->payload_len);
                 }
 

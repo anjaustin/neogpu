@@ -628,3 +628,84 @@ Do not keep the direct `OP_SET_SHADER` route-time apply shortcut.
 ## Updated Read
 
 The repeated failed heuristics strongly suggest the core bottleneck is still shared queue contention and generic per-message routing structure, not isolated node-side work for `OP_SET_SHADER` alone.
+
+## Item 8 Result - Power-of-Two Ring Indexing
+
+### Change
+
+Implemented in:
+
+- `src/hs_core.c`
+
+Details:
+
+- added compile-time assertions that the hot queue sizes remain powers of two
+- replaced `%` ring indexing in hot queue paths with mask-based indexing
+- covered:
+  - submit queue slot selection
+  - SPSC slot selection
+  - message queue head/tail wrap
+  - toolbus ring wrap
+
+This is branchless C and maps well to Pi 4 integer execution without requiring extra synchronization or extra queue state.
+
+### Red-Team Validation
+
+Validation steps:
+
+- rebuilt `neogpu_demo`
+- reran the producer benchmark suite
+- rebuilt `neogpu_prof`
+- reran `gprof`
+
+### Throughput Snapshot
+
+Recent reverted baseline before item 8:
+
+- 1 thr: 10.40M msg/s
+- 2 thr: 7.99M msg/s
+- 4 thr: 6.89M msg/s
+- 8 thr: 6.90M msg/s
+- 16 thr: 6.09M msg/s
+
+Item 8:
+
+- 1 thr: 10.67M msg/s
+- 2 thr: 12.78M msg/s
+- 4 thr: 7.91M msg/s
+- 8 thr: 6.91M msg/s
+- 16 thr: 6.36M msg/s
+
+Interpretation:
+
+- modest win at 1 thread
+- large win in the 2-thread case for this benchmark run
+- solid improvement at 4 threads
+- near-neutral at 8 threads
+- slight improvement at 16 threads
+
+### Profiling Delta
+
+Profile after item 8:
+
+- `__aarch64_cas4_relax`: 29.4%
+- `hs_route_immediate`: 28.5%
+- `__aarch64_ldadd4_relax`: 19.0%
+- `hs_step`: 12.4%
+
+Interpretation:
+
+- modulo removal does not change the architectural hotspots
+- but it does shave cost from queue bookkeeping without adding new atomic contention
+- unlike the recent heuristic experiments, this optimization does not distort scheduling behavior
+
+### Red-Team Conclusion
+
+Keep item 8.
+
+This is a low-risk, Pi-friendly win:
+
+- simpler arithmetic in hot rings
+- no semantic change
+- no new shared-state contention
+- measurable throughput improvement in the benchmark runs
