@@ -709,3 +709,54 @@ This is a low-risk, Pi-friendly win:
 - no semantic change
 - no new shared-state contention
 - measurable throughput improvement in the benchmark runs
+
+## Item 9 Result - Inbox Coalescing for Overwriteable State Ops
+
+### Change Attempted
+
+Attempted in:
+
+- `src/hs_core.c`
+
+Approach:
+
+- detect overwriteable, unacked, no-payload state ops before inbox enqueue
+- replace the newest pending inbox entry for the same destination/op/channel instead of appending another message
+- targeted ops included `OP_SET_SHADER` and other simple state setters
+
+### Red-Team Validation
+
+Validation steps:
+
+- rebuilt `neogpu_demo`
+- reran the producer benchmark suite
+- rebuilt `neogpu_prof`
+- reran `gprof`
+
+### Result
+
+This change regressed throughput and was reverted.
+
+Observed benchmark result for the attempted version:
+
+- 1 thr: 7.94M msg/s
+- 2 thr: 9.17M msg/s
+- 4 thr: 7.96M msg/s
+- 8 thr: 5.12M msg/s
+- 16 thr: 4.13M msg/s
+
+### Failure Analysis
+
+The inbox coalescing branch reduced some queue growth, but it did not reduce the dominant routing and contention costs enough to win overall.
+
+Likely reasons:
+
+- additional branch and inbox tail inspection on every candidate route
+- benchmark contention still dominated by enqueue/dequeue synchronization rather than duplicate semantic work
+- coalescing at the inbox boundary was too late to avoid much of the expensive fabric work
+
+### Conclusion
+
+Reject item 9 in this form.
+
+Do not keep inbox-bound overwriteable-state coalescing.
