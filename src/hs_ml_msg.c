@@ -17,19 +17,7 @@
 #endif
 
 /*============================================================================
- * External kernel declarations
- *============================================================================*/
-
-/* From hs_ml_binary.c */
-extern void hs_ml_route_binary_opt(int32_t* C, const uint8_t* A, const uint8_t* B,
-                                   uint32_t M, uint32_t N, uint32_t K);
-
-/* From hs_ml_ternary_mt.c */
-extern void hs_ml_gemm_ternary_mt(int32_t* C, const int8_t* A, const uint8_t* B_ternary,
-                                  uint32_t M, uint32_t N, uint32_t K, int num_threads);
-
-/*============================================================================
- * Timing helpers
+ * Kernel dispatch via routing abstraction (hs_ml_routing.h / hs_ml_routing.c)
  *============================================================================*/
 
 static inline u64 get_time_ns(void) {
@@ -154,39 +142,15 @@ bool ml_sys_submit_gemm(MLSystem* sys, int producer_id,
 
 static void dispatch_gemm(MLSystem* sys, MLMsg* msg) {
     u64 t0 = get_time_ns();
-    
-    switch ((HSRouteFormat)msg->format) {
-        case HS_ROUTE_BINARY:
-            hs_ml_route_binary_opt(
-                (int32_t*)msg->output,
-                (const uint8_t*)msg->input,
-                (const uint8_t*)msg->weights,
-                msg->M, msg->N, msg->K
-            );
-            break;
-            
-        case HS_ROUTE_TERNARY_2BIT:
-            /* Use 3 threads for large matrices, 1 for small */
-            {
-                int threads = (msg->N * msg->K > 1000000) ? 3 : 1;
-                hs_ml_gemm_ternary_mt(
-                    (int32_t*)msg->output,
-                    (const int8_t*)msg->input,
-                    (const uint8_t*)msg->weights,
-                    msg->M, msg->N, msg->K,
-                    threads
-                );
-            }
-            break;
-            
-        case HS_ROUTE_TERNARY_INT8:
-            /* TODO: Implement INT8 path */
-            break;
-            
-        case HS_ROUTE_SPARSE:
-            /* TODO: Implement sparse path */
-            break;
-    }
+
+    HSRouteDesc route;
+    route.format = (HSRouteFormat)msg->format;
+    route.K      = msg->K;
+    route.N      = msg->N;
+    route.routes = msg->weights;
+
+    int threads = hs_ml_route_optimal_threads(&route, msg->M);
+    hs_ml_route_mt((s32*)msg->output, msg->input, &route, msg->M, threads);
     
     u64 elapsed = get_time_ns() - t0;
     
