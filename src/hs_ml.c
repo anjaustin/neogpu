@@ -398,7 +398,8 @@ void hs_ml_gemm_int8(int32_t* C,
         return;
     }
 #endif
-    hs_ml_gemm_int8_neon_fallback(C, A, B_ternary, B_scale, M, N, K);
+    int threads = hs_ml_gemm_ternary_optimal_threads(M, N, K);
+    hs_ml_gemm_ternary_mt(C, A, B_ternary, M, N, K, threads);
 }
 
 /*

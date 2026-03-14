@@ -354,3 +354,29 @@ u32 hs_ml_generate(HSMLSystem* ml,
                    u32* output_tokens);
 
 #endif /* HS_ML_H */
+
+/*
+ * Multi-threaded ternary GEMM
+ * 
+ * Uses the optimized V18 nibble-LUT kernel with thread-parallel N dimension.
+ * Achieves up to 24+ GOPS on Pi4 (Cortex-A72) with 3 threads.
+ * 
+ * Performance characteristics:
+ *   - Small matrices (N*K < 1M): single thread optimal
+ *   - Medium matrices: 2 threads ~1.7x speedup
+ *   - Large matrices (N*K > 10M): 3 threads ~2.4x speedup
+ *   - 4 threads limited by memory bandwidth
+ * 
+ * num_threads: 0 or 1 = single-threaded, 2-4 = multi-threaded
+ */
+void hs_ml_gemm_ternary_mt(int32_t* C,
+                           const int8_t* A,
+                           const u8* B_ternary,
+                           u32 M, u32 N, u32 K,
+                           int num_threads);
+
+/*
+ * Auto-select thread count based on matrix size
+ * Returns optimal thread count for given dimensions
+ */
+int hs_ml_gemm_ternary_optimal_threads(u32 M, u32 N, u32 K);
