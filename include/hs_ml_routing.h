@@ -74,7 +74,7 @@ typedef struct {
         struct {
             const u32* row_offsets;   /* CSR-style row offsets [N+1] */
             const u32* col_indices;   /* Column indices */
-            const i8* signs;          /* Signs: +1 or -1 */
+            const s8* signs;          /* Signs: +1 or -1 */
             u32 nnz;                  /* Number of non-zero routes */
         } sparse;
         
@@ -99,7 +99,7 @@ typedef struct {
  * For ternary routes: input is int8_t values [M, K]
  * For sparse routes: input is int8_t values [M, K]
  */
-void hs_ml_route(i32* output,
+void hs_ml_route(s32* output,
                  const void* input,
                  const HSRouteDesc* route,
                  u32 M);
@@ -110,7 +110,7 @@ void hs_ml_route(i32* output,
  * Same as hs_ml_route but uses multiple threads.
  * num_threads: 0 or 1 = single-threaded, 2-4 = multi-threaded
  */
-void hs_ml_route_mt(i32* output,
+void hs_ml_route_mt(s32* output,
                     const void* input,
                     const HSRouteDesc* route,
                     u32 M,
@@ -131,7 +131,7 @@ void hs_ml_route_mt(i32* output,
  * 
  * K must be multiple of 128 for NEON alignment.
  */
-void hs_ml_route_binary(i32* output,
+void hs_ml_route_binary(s32* output,
                         const u8* input,
                         const u8* weights,
                         u32 M, u32 N, u32 K);
@@ -139,7 +139,7 @@ void hs_ml_route_binary(i32* output,
 /*
  * Binary routing optimized (4 columns at once)
  */
-void hs_ml_route_binary_opt(i32* output,
+void hs_ml_route_binary_opt(s32* output,
                             const u8* input,
                             const u8* weights,
                             u32 M, u32 N, u32 K);
@@ -160,7 +160,7 @@ void hs_ml_route_binary_opt(i32* output,
  * A_active, A_sign: [M, K/8] bitplanes for activations
  * B_active, B_sign: [N, K/8] bitplanes for weights
  */
-void hs_ml_route_ternary_x_ternary(i32* output,
+void hs_ml_route_ternary_x_ternary(s32* output,
                                    const u8* A_active,
                                    const u8* A_sign,
                                    const u8* B_active,
