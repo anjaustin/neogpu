@@ -60,6 +60,14 @@ void hs_mlt_free(HSMLTernary* m) {
     free(m->gemm_buf);
     free(m->hidden_buf);
     free(m->ffn_buf);
+    free(m->q_buf);
+    free(m->k_buf);
+    free(m->v_buf);
+    free(m->attn_buf);
+    free(m->gate_buf);
+    free(m->up_buf);
+    free(m->score_buf);
+    free(m->ffn_qbuf);
 
     memset(m, 0, sizeof(*m));
 }
@@ -162,13 +170,23 @@ int hs_mlt_alloc_random(HSMLTernary* m,
         for (u32 i = 0; i < H; i++) { lay->attn_norm[i] = 1.0f; lay->ffn_norm[i] = 1.0f; }
     }
 
-    /* Scratch buffers */
+    /* Scratch buffers — allocated once, never freed during inference */
     u32 max_dim = (hidden_size > ffn_hidden_size) ? hidden_size : ffn_hidden_size;
     m->quant_buf  = aligned_alloc(64, max_dim * sizeof(int8_t));
     m->gemm_buf   = aligned_alloc(64, max_dim * sizeof(int32_t));
     m->hidden_buf = malloc(hidden_size * sizeof(float));
     m->ffn_buf    = malloc(ffn_hidden_size * sizeof(float));
-    if (!m->quant_buf || !m->gemm_buf || !m->hidden_buf || !m->ffn_buf)
+    m->q_buf      = malloc(hidden_size * sizeof(float));
+    m->k_buf      = malloc(hidden_size * sizeof(float));
+    m->v_buf      = malloc(hidden_size * sizeof(float));
+    m->attn_buf   = calloc(hidden_size, sizeof(float));
+    m->gate_buf   = malloc(ffn_hidden_size * sizeof(float));
+    m->up_buf     = malloc(ffn_hidden_size * sizeof(float));
+    m->score_buf  = malloc(max_context * sizeof(float));
+    m->ffn_qbuf   = aligned_alloc(64, ffn_hidden_size * sizeof(int8_t));
+    if (!m->quant_buf || !m->gemm_buf || !m->hidden_buf || !m->ffn_buf ||
+        !m->q_buf || !m->k_buf || !m->v_buf || !m->attn_buf ||
+        !m->gate_buf || !m->up_buf || !m->score_buf || !m->ffn_qbuf)
         goto fail;
 
     m->loaded = true;
@@ -253,6 +271,45 @@ static void ternary_proj(int32_t* out, const int8_t* in,
  * Layer forward pass
  *============================================================================*/
 
+/* NEON dot product: q[hd] . k[hd] -> float */
+#ifdef __ARM_NEON
+static inline float dot_f32_neon(const float* a, const float* b, u32 n) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    u32 n4 = n & ~3u;
+    for (u32 i = 0; i < n4; i += 4)
+        acc = vfmaq_f32(acc, vld1q_f32(a+i), vld1q_f32(b+i));
+    float s = vaddvq_f32(acc);
+    for (u32 i = n4; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+/* NEON scalar*vector accumulate: out[n] += scalar * v[n] */
+static inline void axpy_f32_neon(float* out, float scalar, const float* v, u32 n) {
+    float32x4_t sc = vdupq_n_f32(scalar);
+    u32 n4 = n & ~3u;
+    for (u32 i = 0; i < n4; i += 4)
+        vst1q_f32(out+i, vfmaq_f32(vld1q_f32(out+i), sc, vld1q_f32(v+i)));
+    for (u32 i = n4; i < n; i++) out[i] += scalar * v[i];
+}
+/* Fast exp approximation using NEON — Schraudolph method, ~3 ULP */
+static inline float32x4_t fast_expq_f32(float32x4_t x) {
+    /* Clamp to avoid overflow */
+    x = vmaxq_f32(x, vdupq_n_f32(-88.0f));
+    x = vminq_f32(x, vdupq_n_f32(88.0f));
+    /* exp(x) = 2^(x/ln2) = 2^(x*1.4427) */
+    float32x4_t t = vfmaq_f32(vdupq_n_f32(127.0f), x, vdupq_n_f32(1.4426950408f));
+    /* Convert to int and reinterpret as float */
+    int32x4_t ti = vcvtq_s32_f32(t);
+    return vreinterpretq_f32_s32(vshlq_n_s32(ti, 23));
+}
+#else
+static inline float dot_f32_neon(const float* a, const float* b, u32 n) {
+    float s = 0; for (u32 i = 0; i < n; i++) s += a[i]*b[i]; return s;
+}
+static inline void axpy_f32_neon(float* out, float sc, const float* v, u32 n) {
+    for (u32 i = 0; i < n; i++) out[i] += sc * v[i];
+}
+#endif
+
 void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
                           HSKVCache* cache, HSMLTernary* m) {
     if (layer_idx >= m->num_layers) return;
@@ -262,11 +319,19 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     u32 nh = m->num_heads;
     u32 hd = m->head_dim;
 
-    /* Scratch */
+    /* Scratch — all pre-allocated, zero hot malloc */
     int8_t*  qbuf  = m->quant_buf;
     int32_t* gbuf  = m->gemm_buf;
-    float*   fbuf  = m->hidden_buf;  /* reused for Q, K, V, O, FFN outputs */
+    float*   fbuf  = m->hidden_buf;
     float*   ffbuf = m->ffn_buf;
+    float*   q     = m->q_buf;
+    float*   k     = m->k_buf;
+    float*   v     = m->v_buf;
+    float*   attn_out = m->attn_buf;
+    float*   gate_out = m->gate_buf;
+    float*   up_out   = m->up_buf;
+    float*   scores   = m->score_buf;
+    int8_t*  fqbuf    = m->ffn_qbuf;
 
     /* ── 1. Attention RMSNorm ── */
     rmsnorm(fbuf, hidden, lay->attn_norm, 1e-5f, H);
@@ -274,21 +339,11 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     /* ── 2. Quantise normed hidden ── */
     float act_scale = hs_mlt_quantize(qbuf, fbuf, H);
 
-    /* ── 3. Q projection ── */
-    float* q = malloc(H * sizeof(float));
-    if (!q) return;
+    /* ── 3-5. Q, K, V projections (no malloc) ── */
     ternary_proj(gbuf, qbuf, lay->q_proj, H, H);
     hs_mlt_dequantize(q, gbuf, H, act_scale, lay->q_scale);
-
-    /* ── 4. K projection ── */
-    float* k = malloc(H * sizeof(float));
-    if (!k) { free(q); return; }
     ternary_proj(gbuf, qbuf, lay->k_proj, H, H);
     hs_mlt_dequantize(k, gbuf, H, act_scale, lay->k_scale);
-
-    /* ── 5. V projection ── */
-    float* v = malloc(H * sizeof(float));
-    if (!v) { free(q); free(k); return; }
     ternary_proj(gbuf, qbuf, lay->v_proj, H, H);
     hs_mlt_dequantize(v, gbuf, H, act_scale, lay->v_scale);
 
@@ -304,54 +359,59 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
         cache->cache_len = seq_pos + 1;
     }
 
-    /* ── 8. Attention (float32, per-head) ── */
-    float* attn_out = calloc(H, sizeof(float));
-    if (!attn_out) { free(q); free(k); free(v); return; }
-
+    /* ── 8. Attention — NEON dot products, no malloc ── */
+    memset(attn_out, 0, H * sizeof(float));
     if (cache && cache->cache_len > 0) {
         u32 ctx = cache->cache_len;
-        float scale = 1.0f / sqrtf((float)hd);
-        float* scores = malloc(ctx * sizeof(float));
-        if (scores) {
-            for (u32 h = 0; h < nh; h++) {
-                float* qh = q + h * hd;
-                float* out_h = attn_out + h * hd;
-                /* Scores */
-                float max_s = -1e30f;
-                for (u32 t = 0; t < ctx; t++) {
-                    float* kh = cache->k_cache + t * nh * hd + h * hd;
-                    float s = 0;
-                    for (u32 d = 0; d < hd; d++) s += qh[d] * kh[d];
-                    scores[t] = s * scale;
-                    if (scores[t] > max_s) max_s = scores[t];
-                }
-                /* Softmax */
-                float sum = 0;
-                for (u32 t = 0; t < ctx; t++) {
-                    scores[t] = expf(scores[t] - max_s);
-                    sum += scores[t];
-                }
-                for (u32 t = 0; t < ctx; t++) scores[t] /= sum;
-                /* Weighted sum */
-                for (u32 d = 0; d < hd; d++) {
-                    float val = 0;
-                    for (u32 t = 0; t < ctx; t++) {
-                        float* vh = cache->v_cache + t * nh * hd + h * hd;
-                        val += scores[t] * vh[d];
-                    }
-                    out_h[d] = val;
-                }
+        float inv_sq = 1.0f / sqrtf((float)hd);
+        for (u32 h = 0; h < nh; h++) {
+            float* qh   = q + h * hd;
+            float* outh = attn_out + h * hd;
+            /* Score: NEON dot product q . k_t */
+            float max_s = -1e30f;
+            for (u32 t = 0; t < ctx; t++) {
+                float* kh = cache->k_cache + t * nh * hd + h * hd;
+                float s = dot_f32_neon(qh, kh, hd) * inv_sq;
+                scores[t] = s;
+                if (s > max_s) max_s = s;
             }
-            free(scores);
+            /* Online softmax */
+            float sum = 0.0f;
+#ifdef __ARM_NEON
+            /* Vectorised exp for blocks of 4 */
+            u32 ctx4 = ctx & ~3u;
+            float32x4_t vmax = vdupq_n_f32(max_s);
+            float32x4_t vsum = vdupq_n_f32(0.0f);
+            for (u32 t = 0; t < ctx4; t += 4) {
+                float32x4_t vs = vsubq_f32(vld1q_f32(scores+t), vmax);
+                float32x4_t ve = fast_expq_f32(vs);
+                vst1q_f32(scores+t, ve);
+                vsum = vaddq_f32(vsum, ve);
+            }
+            sum = vaddvq_f32(vsum);
+            for (u32 t = ctx4; t < ctx; t++) {
+                scores[t] = expf(scores[t] - max_s);
+                sum += scores[t];
+            }
+#else
+            for (u32 t = 0; t < ctx; t++) {
+                scores[t] = expf(scores[t] - max_s);
+                sum += scores[t];
+            }
+#endif
+            float inv_sum = 1.0f / sum;
+            /* Weighted sum: NEON axpy */
+            for (u32 t = 0; t < ctx; t++) {
+                float* vh = cache->v_cache + t * nh * hd + h * hd;
+                axpy_f32_neon(outh, scores[t] * inv_sum, vh, hd);
+            }
         }
     }
-    free(q); free(k); free(v);
 
     /* ── 9. O projection ── */
     act_scale = hs_mlt_quantize(qbuf, attn_out, H);
     ternary_proj(gbuf, qbuf, lay->o_proj, H, H);
     hs_mlt_dequantize(fbuf, gbuf, H, act_scale, lay->o_scale);
-    free(attn_out);
 
     /* ── 10. Residual (attention) + FFN RMSNorm ── */
     for (u32 i = 0; i < H; i++) hidden[i] += fbuf[i];
@@ -360,29 +420,40 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     /* ── 11. Quantise for FFN ── */
     act_scale = hs_mlt_quantize(qbuf, fbuf, H);
 
-    /* ── 12. Gate and Up projections ── */
-    float* gate_out = malloc(F * sizeof(float));
-    float* up_out   = malloc(F * sizeof(float));
-    if (!gate_out || !up_out) {
-        free(gate_out); free(up_out); return;
-    }
-
+    /* ── 12. Gate and Up projections (no malloc) ── */
     ternary_proj(gbuf, qbuf, lay->gate_proj, F, H);
     hs_mlt_dequantize(gate_out, gbuf, F, act_scale, lay->gate_scale);
-
     ternary_proj(gbuf, qbuf, lay->up_proj, F, H);
     hs_mlt_dequantize(up_out, gbuf, F, act_scale, lay->up_scale);
 
-    /* ── 13. SwiGLU ── */
-    for (u32 i = 0; i < F; i++) {
-        float silu = gate_out[i] / (1.0f + expf(-gate_out[i]));
-        ffbuf[i] = silu * up_out[i];
+    /* ── 13. SwiGLU — fused: SiLU(gate) * up, NEON vectorised ── */
+#ifdef __ARM_NEON
+    {
+        u32 F4 = F & ~3u;
+        float32x4_t one = vdupq_n_f32(1.0f);
+        for (u32 i = 0; i < F4; i += 4) {
+            float32x4_t g = vld1q_f32(gate_out + i);
+            float32x4_t u = vld1q_f32(up_out + i);
+            /* SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x)) */
+            float32x4_t neg_g = vnegq_f32(g);
+            float32x4_t sig = vrecpeq_f32(vaddq_f32(one, fast_expq_f32(neg_g)));
+            vst1q_f32(ffbuf + i, vmulq_f32(vmulq_f32(g, sig), u));
+        }
+        for (u32 i = F4; i < F; i++) {
+            float sg = gate_out[i] / (1.0f + expf(-gate_out[i]));
+            ffbuf[i] = sg * up_out[i];
+        }
     }
-    free(gate_out); free(up_out);
+#else
+    for (u32 i = 0; i < F; i++) {
+        float sg = gate_out[i] / (1.0f + expf(-gate_out[i]));
+        ffbuf[i] = sg * up_out[i];
+    }
+#endif
 
-    /* ── 14. Down projection ── */
-    act_scale = hs_mlt_quantize(qbuf, ffbuf, F);
-    ternary_proj(gbuf, qbuf, lay->down_proj, H, F);
+    /* ── 14. Down projection (use ffn_qbuf — pre-allocated for F elements) ── */
+    act_scale = hs_mlt_quantize(fqbuf, ffbuf, F);
+    ternary_proj(gbuf, fqbuf, lay->down_proj, H, F);
     hs_mlt_dequantize(fbuf, gbuf, H, act_scale, lay->down_scale);
 
     /* ── 15. Residual (FFN) ── */

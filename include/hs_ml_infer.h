@@ -108,11 +108,19 @@ typedef struct {
     /* Per-layer ternary weights */
     HSTernaryLayer* layers; /* [num_layers] */
 
-    /* Runtime scratch (allocated once) */
+    /* Runtime scratch (allocated once — no hot malloc in forward pass) */
     int8_t*  quant_buf;  /* [max(hidden, ffn_hidden)] quantized activations */
     int32_t* gemm_buf;   /* [max(hidden, ffn_hidden)] GEMM output */
-    float*   hidden_buf; /* [hidden] scratch */
-    float*   ffn_buf;    /* [ffn_hidden] scratch */
+    float*   hidden_buf; /* [hidden] */
+    float*   ffn_buf;    /* [ffn_hidden] */
+    float*   q_buf;      /* [hidden] Q projection output */
+    float*   k_buf;      /* [hidden] K projection output */
+    float*   v_buf;      /* [hidden] V projection output */
+    float*   attn_buf;   /* [hidden] attention output */
+    float*   gate_buf;   /* [ffn_hidden] gate projection output */
+    float*   up_buf;     /* [ffn_hidden] up projection output */
+    float*   score_buf;  /* [max_context] attention scores */
+    int8_t*  ffn_qbuf;   /* [ffn_hidden] quantized FFN activations */
 
     bool loaded;
 } HSMLTernary;
