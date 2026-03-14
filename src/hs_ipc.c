@@ -1,5 +1,6 @@
 #include "hs_ipc.h"
 #include "hs_nodes.h"
+#include "hs_ml.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -53,6 +54,120 @@ typedef struct {
     /* result bytes follow */
 } __attribute__((packed)) HSIpcResp;
 
+static HSMLSystem g_ml_system;
+static bool g_ml_initialized = false;
+
+static int hs_ipc_handle_ml_op(u8 op, const u8* payload, u32 payload_len, u8* out, u32* out_len) {
+    if (!g_ml_initialized) {
+        hs_ml_init(&g_ml_system);
+        g_ml_initialized = true;
+    }
+    
+    switch ((OpCode)op) {
+        case OP_ML_LOAD: {
+            /* payload: model path string */
+            if (payload_len > 255) payload_len = 255;
+            char path[256];
+            memcpy(path, payload, payload_len);
+            path[payload_len] = '\0';
+            
+            int ret = hs_ml_load_gguf(&g_ml_system, path);
+            
+            if (ret == 0) {
+                out[0] = 1;  /* success */
+                *out_len = 1;
+            } else {
+                out[0] = 0;  /* failure */
+                *out_len = 1;
+            }
+            break;
+        }
+        
+        case OP_ML_UNLOAD: {
+            hs_ml_free(&g_ml_system);
+            g_ml_initialized = false;
+            out[0] = 1;
+            *out_len = 1;
+            break;
+        }
+        
+        case OP_ML_FORWARD: {
+            /* payload: seq_len (4 bytes) + tokens */
+            if (payload_len < 4) {
+                out[0] = 0;
+                *out_len = 1;
+                break;
+            }
+            u32 seq_len;
+            memcpy(&seq_len, payload, 4);
+            
+            if (seq_len > 1024) seq_len = 1024;
+            
+            float* logits = malloc(g_ml_system.vocab_size * sizeof(float));
+            
+            int ret = hs_ml_forward(&g_ml_system, (const u32*)(payload + 4), seq_len, logits);
+            
+            if (ret == 0) {
+                out[0] = 1;
+                /* Copy top 10 logits for result */
+                u32 copy_len = g_ml_system.vocab_size;
+                if (copy_len > 40) copy_len = 40;
+                memcpy(out + 1, logits, copy_len * sizeof(float));
+                *out_len = 1 + copy_len * sizeof(float);
+            } else {
+                out[0] = 0;
+                *out_len = 1;
+            }
+            free(logits);
+            break;
+        }
+        
+        case OP_ML_GENERATE: {
+            /* payload: prompt_len(4) + max_new(4) + temp(4) + top_k(4) + prompt */
+            if (payload_len < 16) {
+                out[0] = 0;
+                *out_len = 1;
+                break;
+            }
+            
+            u32 prompt_len, max_new;
+            float temperature;
+            u32 top_k;
+            memcpy(&prompt_len, payload, 4);
+            memcpy(&max_new, payload + 4, 4);
+            memcpy(&temperature, payload + 8, 4);
+            memcpy(&top_k, payload + 12, 4);
+            
+            if (prompt_len > 1024) prompt_len = 1024;
+            if (max_new > 256) max_new = 256;
+            
+            char prompt[1025];
+            memcpy(prompt, payload + 16, prompt_len);
+            prompt[prompt_len] = '\0';
+            
+            u32* output = malloc((prompt_len + max_new + 10) * sizeof(u32));
+            u32 num_gen = hs_ml_generate(&g_ml_system, prompt, max_new, temperature, top_k, output);
+            
+            out[0] = 1;
+            memcpy(out + 1, &num_gen, 4);
+            u32 copy_len = num_gen;
+            if (copy_len > 32) copy_len = 32;
+            memcpy(out + 5, output, copy_len * sizeof(u32));
+            *out_len = 5 + copy_len * sizeof(u32);
+            
+            free(output);
+            break;
+        }
+        
+        default:
+            out[0] = 0;
+            *out_len = 1;
+            break;
+    }
+    
+    return 0;
+}
+
 static bool hs_ipc_op_allowed(u8 op) {
     switch ((OpCode)op) {
         case OP_QUERY_STATS:
@@ -61,6 +176,12 @@ static bool hs_ipc_op_allowed(u8 op) {
         case OP_SET_CHAN_BUDGET:
         case OP_SET_BLOCK_POLICY:
         case OP_FENCE:
+        case OP_ML_LOAD:
+        case OP_ML_UNLOAD:
+        case OP_ML_FORWARD:
+        case OP_ML_GENERATE:
+        case OP_ML_TOKENIZE:
+        case OP_ML_DETOKENIZE:
             return true;
         default:
             return false;
@@ -75,7 +196,13 @@ static u32 hs_ipc_expected_payload_len(u8 op) {
         case OP_QUERY_STATS:
         case OP_QUERY_FABRIC:
         case OP_FENCE:
+        case OP_ML_UNLOAD:
+        case OP_ML_TOKENIZE:
+        case OP_ML_DETOKENIZE:
             return 0;
+        case OP_ML_LOAD:         return 256;  /* path string */
+        case OP_ML_FORWARD:      return 4;     /* seq_len */
+        case OP_ML_GENERATE:     return 12;    /* prompt_len + max_new + temperature */
         default:
             return 0xFFFFFFFFu;
     }
@@ -159,7 +286,42 @@ static int hs_ipc_handle_req(HSIpcServer* srv, int cfd, const HSIpcHdr* hdr) {
         hs_ipc_send_error(cfd, hdr->cid, HS_IPC_ERR_BAD_LEN);
         return 0;
     }
-
+    
+    /* Handle ML ops directly without going through toolbus */
+    switch ((OpCode)req->op) {
+        case OP_ML_LOAD:
+        case OP_ML_UNLOAD:
+        case OP_ML_FORWARD:
+        case OP_ML_GENERATE: {
+            u8 ml_out[HS_TOOLBUS_PAYLOAD_MAX];
+            u32 ml_out_len = 0;
+            
+            hs_ipc_handle_ml_op(req->op, payload, req->payload_len, ml_out, &ml_out_len);
+            
+            HSIpcHdr rh = {
+                .magic = HS_IPC_MAGIC,
+                .version = HS_IPC_VERSION,
+                .type = HS_IPC_TYPE_RESP,
+                .len = (u32)(sizeof(HSIpcResp) + ml_out_len),
+                .cid = hdr->cid,
+            };
+            HSIpcResp rr = {
+                .status = HS_IPC_OK,
+                .result_op = req->op,
+                .result_len = ml_out_len,
+            };
+            
+            if (hs_write_full(cfd, &rh, sizeof(rh)) != 0) return -1;
+            if (hs_write_full(cfd, &rr, sizeof(rr)) != 0) return -1;
+            if (ml_out_len) {
+                if (hs_write_full(cfd, ml_out, ml_out_len) != 0) return -1;
+            }
+            return 0;
+        }
+        default:
+            break;  /* Continue with normal toolbus handling */
+    }
+    
     HSSystem* sys = srv->sys;
     if (!sys) {
         hs_ipc_send_error(cfd, hdr->cid, HS_IPC_ERR_INTERNAL);

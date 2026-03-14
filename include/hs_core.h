@@ -81,6 +81,15 @@ typedef enum {
     OP_SET_RECORD_MASK,
     OP_SET_CHAN_BUDGET,
     OP_SET_BLOCK_POLICY,
+    
+    /* ML inference */
+    OP_ML_LOAD,
+    OP_ML_UNLOAD,
+    OP_ML_FORWARD,
+    OP_ML_GENERATE,
+    OP_ML_TOKENIZE,
+    OP_ML_DETOKENIZE,
+    
     OP_COUNT
 } OpCode;
 
