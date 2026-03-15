@@ -51,7 +51,9 @@ void hs_mlt_free(HSMLTernary* m) {
             free(lay->up_proj);  free(lay->up_scale);
             free(lay->down_proj);free(lay->down_scale);
             free(lay->attn_norm);
+            free(lay->attn_sub_norm);
             free(lay->ffn_norm);
+            free(lay->ffn_sub_norm);
         }
         free(m->layers);
     }
@@ -107,9 +109,11 @@ int hs_mlt_alloc_random(HSMLTernary* m,
     m->hidden_size     = hidden_size;
     m->num_layers      = num_layers;
     m->num_heads       = num_heads;
+    m->num_kv_heads    = num_heads;  /* alloc_random: always MHA */
     m->head_dim        = hidden_size / num_heads;
     m->ffn_hidden_size = ffn_hidden_size;
     m->max_context     = max_context;
+    m->rope_theta      = 10000.0f;
 
     unsigned int rng = seed;
 
@@ -164,10 +168,13 @@ int hs_mlt_alloc_random(HSMLTernary* m,
 
         /* Norms (float32, initialised to 1) */
         lay->attn_norm = malloc(H * sizeof(float));
+        lay->attn_sub_norm = malloc(H * sizeof(float));
         lay->ffn_norm  = malloc(H * sizeof(float));
-        if (!lay->attn_norm || !lay->ffn_norm) goto fail;
+        lay->ffn_sub_norm = malloc(F * sizeof(float));
+        if (!lay->attn_norm || !lay->attn_sub_norm || !lay->ffn_norm || !lay->ffn_sub_norm) goto fail;
 
-        for (u32 i = 0; i < H; i++) { lay->attn_norm[i] = 1.0f; lay->ffn_norm[i] = 1.0f; }
+        for (u32 i = 0; i < H; i++) { lay->attn_norm[i] = 1.0f; lay->attn_sub_norm[i] = 1.0f; lay->ffn_norm[i] = 1.0f; }
+        for (u32 i = 0; i < F; i++) lay->ffn_sub_norm[i] = 1.0f;
     }
 
     /* Scratch buffers — allocated once, never freed during inference */
@@ -272,6 +279,25 @@ static void ternary_proj(int32_t* out, const int8_t* in,
  *============================================================================*/
 
 /* NEON dot product: q[hd] . k[hd] -> float */
+static inline void rope_apply_one(float* x, u32 num_heads, u32 head_dim, u32 position, float theta) {
+    u32 half_dim = head_dim / 2;
+    float* freqs = malloc(half_dim * sizeof(float));
+    if (!freqs) return;
+    for (u32 d = 0; d < half_dim; d++)
+        freqs[d] = powf(theta, (float)(-2.0f * d) / (float)head_dim);
+    for (u32 h = 0; h < num_heads; h++) {
+        for (u32 d = 0; d < half_dim; d++) {
+            float angle = (float)position * freqs[d];
+            float c = cosf(angle), s = sinf(angle);
+            float x0 = x[h * head_dim + d];
+            float x1 = x[h * head_dim + d + half_dim];
+            x[h * head_dim + d]            = x0 * c - x1 * s;
+            x[h * head_dim + d + half_dim] = x0 * s + x1 * c;
+        }
+    }
+    free(freqs);
+}
+
 #ifdef __ARM_NEON
 static inline float dot_f32_neon(const float* a, const float* b, u32 n) {
     float32x4_t acc = vdupq_n_f32(0.0f);
@@ -316,8 +342,10 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     HSTernaryLayer* lay = &m->layers[layer_idx];
     u32 H = m->hidden_size;
     u32 F = m->ffn_hidden_size;
-    u32 nh = m->num_heads;
+    u32 nh    = m->num_heads;
+    u32 nkv   = m->num_kv_heads ? m->num_kv_heads : m->num_heads;
     u32 hd = m->head_dim;
+    u32 kv = nkv * hd;
 
     /* Scratch — all pre-allocated, zero hot malloc */
     int8_t*  qbuf  = m->quant_buf;
@@ -342,20 +370,21 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     /* ── 3-5. Q, K, V projections (no malloc) ── */
     ternary_proj(gbuf, qbuf, lay->q_proj, H, H);
     hs_mlt_dequantize(q, gbuf, H, act_scale, lay->q_scale);
-    ternary_proj(gbuf, qbuf, lay->k_proj, H, H);
-    hs_mlt_dequantize(k, gbuf, H, act_scale, lay->k_scale);
-    ternary_proj(gbuf, qbuf, lay->v_proj, H, H);
-    hs_mlt_dequantize(v, gbuf, H, act_scale, lay->v_scale);
+    ternary_proj(gbuf, qbuf, lay->k_proj, kv, H);
+    hs_mlt_dequantize(k, gbuf, kv, act_scale, lay->k_scale);
+    ternary_proj(gbuf, qbuf, lay->v_proj, kv, H);
+    hs_mlt_dequantize(v, gbuf, kv, act_scale, lay->v_scale);
 
     /* ── 6. RoPE ── */
     u32 seq_pos = cache ? cache->cache_len : 0;
-    hs_rope_apply(q, k, nh, hd, seq_pos, 10000.0f);
+    rope_apply_one(q, nh,  hd, seq_pos, m->rope_theta);
+    rope_apply_one(k, nkv, hd, seq_pos, m->rope_theta);
 
     /* ── 7. KV cache update ── */
     if (cache && cache->k_cache && cache->v_cache) {
-        u32 kv_off = seq_pos * nh * hd;
-        memcpy(cache->k_cache + kv_off, k, H * sizeof(float));
-        memcpy(cache->v_cache + kv_off, v, H * sizeof(float));
+        u32 kv_off = seq_pos * nkv * hd;
+        memcpy(cache->k_cache + kv_off, k, nkv * hd * sizeof(float));
+        memcpy(cache->v_cache + kv_off, v, nkv * hd * sizeof(float));
         cache->cache_len = seq_pos + 1;
     }
 
@@ -367,10 +396,11 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
         for (u32 h = 0; h < nh; h++) {
             float* qh   = q + h * hd;
             float* outh = attn_out + h * hd;
+            u32 kv_h = (nkv < nh) ? (h * nkv / nh) : h;
             /* Score: NEON dot product q . k_t */
             float max_s = -1e30f;
             for (u32 t = 0; t < ctx; t++) {
-                float* kh = cache->k_cache + t * nh * hd + h * hd;
+                float* kh = cache->k_cache + t * nkv * hd + kv_h * hd;
                 float s = dot_f32_neon(qh, kh, hd) * inv_sq;
                 scores[t] = s;
                 if (s > max_s) max_s = s;
@@ -402,11 +432,14 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
             float inv_sum = 1.0f / sum;
             /* Weighted sum: NEON axpy */
             for (u32 t = 0; t < ctx; t++) {
-                float* vh = cache->v_cache + t * nh * hd + h * hd;
+                float* vh = cache->v_cache + t * nkv * hd + kv_h * hd;
                 axpy_f32_neon(outh, scores[t] * inv_sum, vh, hd);
             }
         }
     }
+
+    /* ── 8.5. Attention sub-layer norm (BitNet subln) ── */
+    rmsnorm(attn_out, attn_out, lay->attn_sub_norm, 1e-5f, H);
 
     /* ── 9. O projection ── */
     act_scale = hs_mlt_quantize(qbuf, attn_out, H);
@@ -426,30 +459,28 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     ternary_proj(gbuf, qbuf, lay->up_proj, F, H);
     hs_mlt_dequantize(up_out, gbuf, F, act_scale, lay->up_scale);
 
-    /* ── 13. SwiGLU — fused: SiLU(gate) * up, NEON vectorised ── */
+    /* ── 13. BitNet FFN: ReLU^2(gate) * up, then ffn_sub_norm ── */
 #ifdef __ARM_NEON
     {
         u32 F4 = F & ~3u;
-        float32x4_t one = vdupq_n_f32(1.0f);
+        float32x4_t zero = vdupq_n_f32(0.0f);
         for (u32 i = 0; i < F4; i += 4) {
-            float32x4_t g = vld1q_f32(gate_out + i);
+            float32x4_t g = vmaxq_f32(vld1q_f32(gate_out + i), zero);
             float32x4_t u = vld1q_f32(up_out + i);
-            /* SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x)) */
-            float32x4_t neg_g = vnegq_f32(g);
-            float32x4_t sig = vrecpeq_f32(vaddq_f32(one, fast_expq_f32(neg_g)));
-            vst1q_f32(ffbuf + i, vmulq_f32(vmulq_f32(g, sig), u));
+            vst1q_f32(ffbuf + i, vmulq_f32(vmulq_f32(g, g), u));
         }
         for (u32 i = F4; i < F; i++) {
-            float sg = gate_out[i] / (1.0f + expf(-gate_out[i]));
-            ffbuf[i] = sg * up_out[i];
+            float rg = gate_out[i] > 0.0f ? gate_out[i] : 0.0f;
+            ffbuf[i] = (rg * rg) * up_out[i];
         }
     }
 #else
     for (u32 i = 0; i < F; i++) {
-        float sg = gate_out[i] / (1.0f + expf(-gate_out[i]));
-        ffbuf[i] = sg * up_out[i];
+        float rg = gate_out[i] > 0.0f ? gate_out[i] : 0.0f;
+        ffbuf[i] = (rg * rg) * up_out[i];
     }
 #endif
+    rmsnorm(ffbuf, ffbuf, lay->ffn_sub_norm, 1e-5f, F);
 
     /* ── 14. Down projection (use ffn_qbuf — pre-allocated for F elements) ── */
     act_scale = hs_mlt_quantize(fqbuf, ffbuf, F);
@@ -481,7 +512,7 @@ int hs_mlt_forward(HSMLTernary* m, const u32* tokens, u32 seq_len,
     if (!caches) { free(hidden); return -1; }
     for (u32 l = 0; l < m->num_layers; l++) {
         hs_kv_cache_init(&caches[l], m->max_context,
-                         m->num_heads, m->num_heads, m->head_dim);
+                         m->num_heads, m->num_kv_heads, m->head_dim);
     }
 
     for (u32 pos = 0; pos < seq_len; pos++) {
@@ -559,7 +590,7 @@ int hs_mlt_session_init(HSMLTernarySession* sess, HSMLTernary* model) {
         hs_kv_cache_init(&sess->caches[l],
                          model->max_context,
                          model->num_heads,
-                         model->num_heads,
+                         model->num_kv_heads,
                          model->head_dim);
     }
 

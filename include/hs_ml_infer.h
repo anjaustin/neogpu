@@ -83,8 +83,10 @@ typedef struct {
     float* down_scale;
 
     /* Learned norms (float — not quantized) */
-    float* attn_norm;   /* [hidden] */
-    float* ffn_norm;    /* [hidden] */
+    float* attn_norm;      /* [hidden] */
+    float* attn_sub_norm;  /* [hidden] post-attention subln */
+    float* ffn_norm;       /* [hidden] */
+    float* ffn_sub_norm;   /* [ffn_hidden] post-activation subln */
 } HSTernaryLayer;
 
 /*
@@ -96,9 +98,11 @@ typedef struct {
     u32 hidden_size;
     u32 num_layers;
     u32 num_heads;
+    u32 num_kv_heads;  /* KV heads for GQA (may differ from num_heads) */
     u32 head_dim;
     u32 ffn_hidden_size;
     u32 max_context;
+    float rope_theta;
 
     /* Non-quantized weights */
     float* embedding;   /* [vocab, hidden] float32 */
