@@ -82,7 +82,7 @@ typedef struct {
     u8*    down_proj;   /* [hidden, ffn_hidden/4] */
     float* down_scale;
 
-    /* Learned norms (float — not quantized) */
+    /* Learned norms (float -- not quantized) */
     float* attn_norm;      /* [hidden] */
     float* attn_sub_norm;  /* [hidden] post-attention subln */
     float* ffn_norm;       /* [hidden] */
@@ -98,7 +98,7 @@ typedef struct {
     u32 hidden_size;
     u32 num_layers;
     u32 num_heads;
-    u32 num_kv_heads;  /* KV heads for GQA (may differ from num_heads) */
+    u32 num_kv_heads;  /* KV heads for GQA */
     u32 head_dim;
     u32 ffn_hidden_size;
     u32 max_context;
@@ -108,6 +108,14 @@ typedef struct {
     float* embedding;   /* [vocab, hidden] float32 */
     float* lm_head;     /* [vocab, hidden] float32 */
     float* final_norm;  /* [hidden] float32 */
+
+    /* Tokenizer metadata from GGUF */
+    char** tokenizer_vocab;
+    u32    tokenizer_bos;
+    u32    tokenizer_eos;
+    u32    tokenizer_pad;
+    char** tokenizer_merges;
+    u32    num_merges;
 
     /* Per-layer ternary weights */
     HSTernaryLayer* layers; /* [num_layers] */
@@ -126,6 +134,7 @@ typedef struct {
     float*   score_buf;  /* [max_context] attention scores */
     int8_t*  ffn_qbuf;   /* [ffn_hidden] quantized FFN activations */
 
+    bool use_i2s;
     bool loaded;
 } HSMLTernary;
 
@@ -214,79 +223,20 @@ extern HSMLTernaryStats g_mlt_stats;  /* global, reset on each forward pass */
 
 #endif /* HS_ML_INFER_H */
 
-/*============================================================================
- * Stateful decode session
- *
- * Owns:
- *   - hidden state vector (persists across decode steps)
- *   - per-layer KV caches (accumulate across steps)
- *
- * Usage:
- *   hs_mlt_session_init(&sess, model)   -- allocate
- *   hs_mlt_prefill(&sess, tokens, n)    -- process context, fills KV caches
- *   hs_mlt_decode(&sess, token, logits) -- one decode step, O(ctx*hd) attention
- *   hs_mlt_session_free(&sess)          -- release
- *
- * The hidden state is preserved between decode steps — callers must not
- * modify it. Reset with hs_mlt_session_reset() to start a new sequence.
- *============================================================================*/
 
+/* Stateful decode session */
 typedef struct {
-    HSMLTernary* model;      /* non-owning pointer */
-
-    float*      hidden;      /* [hidden_size] current hidden state */
-    HSKVCache*  caches;      /* [num_layers] per-layer KV caches */
-
-    u32  seq_len;            /* tokens processed so far */
-    bool ready;              /* true after init */
+    HSMLTernary* model;
+    float* hidden;
+    HSKVCache* caches;
+    u32 seq_len;
+    bool ready;
 } HSMLTernarySession;
 
-/* Allocate session for model. model must outlive session. */
+int  hs_mlt_load_gguf(HSMLTernary* m, const char* path);
 int  hs_mlt_session_init(HSMLTernarySession* sess, HSMLTernary* model);
-
-/* Free session resources (does not free model). */
 void hs_mlt_session_free(HSMLTernarySession* sess);
-
-/* Clear KV caches and reset position — ready for a new sequence. */
 void hs_mlt_session_reset(HSMLTernarySession* sess);
-
-/*
- * Prefill: process a prompt token sequence.
- * Fills KV caches for all tokens. Hidden state reflects the last token.
- * Call before the first hs_mlt_decode().
- *
- * tokens:  [seq_len] input token IDs
- * seq_len: number of prompt tokens
- * Returns 0 on success.
- */
-int hs_mlt_prefill(HSMLTernarySession* sess,
-                   const u32* tokens, u32 seq_len);
-
-/*
- * Decode: process one new token.
- * Uses KV caches populated by prefill (or prior decode steps).
- * Updates caches with the new K/V for this position.
- * Writes logits for the next token prediction.
- *
- * token:  the new input token (last predicted token)
- * logits: [vocab_size] output — caller-allocated
- * Returns 0 on success.
- */
-int hs_mlt_decode(HSMLTernarySession* sess, u32 token, float* logits);
-
-/*============================================================================
- * GGUF loader
- *============================================================================*/
-
-/*
- * Load a GGUF model file into HSMLTernary.
- *
- * Supports the format produced by tools/write_test_gguf.py:
- *   - F32 projection weights (converted to 2-bit packed ternary on load)
- *   - F32 per-row scales (companion tensor <name>_scale)
- *   - F32 embeddings, norms, lm_head
- *   - Standard GGUF metadata keys (llama.* namespace)
- *
- * Returns 0 on success, -1 on error.
- */
-int hs_mlt_load_gguf(HSMLTernary* m, const char* path);
+int  hs_mlt_prefill(HSMLTernarySession* sess, const u32* tokens, u32 seq_len);
+int  hs_mlt_decode(HSMLTernarySession* sess, u32 token, float* logits);
+int  hs_mlt_session_logits(HSMLTernarySession* sess, float* logits);

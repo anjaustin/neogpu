@@ -39,6 +39,14 @@ void hs_mlt_free(HSMLTernary* m) {
     free(m->embedding);
     free(m->lm_head);
     free(m->final_norm);
+    if (m->tokenizer_vocab) {
+        for (u32 i = 0; i < m->vocab_size; i++) free(m->tokenizer_vocab[i]);
+        free(m->tokenizer_vocab);
+    }
+    if (m->tokenizer_merges) {
+        for (u32 i = 0; i < m->num_merges; i++) free(m->tokenizer_merges[i]);
+        free(m->tokenizer_merges);
+    }
 
     if (m->layers) {
         for (u32 l = 0; l < m->num_layers; l++) {
@@ -229,6 +237,10 @@ float hs_mlt_quantize(int8_t* output, const float* input, u32 n) {
 
 void hs_mlt_dequantize(float* output, const int32_t* input, u32 n,
                        float act_scale, const float* weight_scales) {
+    if (!weight_scales) {
+        for (u32 i = 0; i < n; i++) output[i] = (float)input[i] / act_scale;
+        return;
+    }
     for (u32 i = 0; i < n; i++) {
         output[i] = (float)input[i] / (act_scale * weight_scales[i]);
     }
@@ -259,15 +271,80 @@ extern void hs_ml_gemm_ternary_mt(int32_t* C, const int8_t* A,
                                    const u8* B, u32 M, u32 N, u32 K,
                                    int num_threads);
 
-static void ternary_proj(int32_t* out, const int8_t* in,
+#define I2S_QK 64u
+
+static void i2s_proj_neon(int32_t* out, const int8_t* in,
+                          const u8* W, u32 N, u32 K) {
+#ifdef __ARM_NEON
+    const uint8x16_t mask = vdupq_n_u8(3);
+    const u32 nblk = K / I2S_QK;
+    const u32 row_bytes = K / 4;
+    int32_t sum_x = 0;
+    for (u32 i = 0; i < K; i++) sum_x += (int32_t)in[i];
+
+    for (u32 n = 0; n < N; n++) {
+        const uint8_t* wrow = W + n * row_bytes;
+        int32x4_t acc = vdupq_n_s32(0);
+        for (u32 b = 0; b < nblk; b++) {
+            uint8x16_t x3 = vld1q_u8(wrow + b * 16);
+            uint8x16_t x2 = vshrq_n_u8(x3, 2);
+            uint8x16_t x1 = vshrq_n_u8(x3, 4);
+            uint8x16_t x0 = vshrq_n_u8(x3, 6);
+
+            int8x16_t q0 = vreinterpretq_s8_u8(vandq_u8(x0, mask));
+            int8x16_t q1 = vreinterpretq_s8_u8(vandq_u8(x1, mask));
+            int8x16_t q2 = vreinterpretq_s8_u8(vandq_u8(x2, mask));
+            int8x16_t q3 = vreinterpretq_s8_u8(vandq_u8(x3, mask));
+
+            const int8x16_t y0 = vld1q_s8(in + b * 64 +  0);
+            const int8x16_t y1 = vld1q_s8(in + b * 64 + 16);
+            const int8x16_t y2 = vld1q_s8(in + b * 64 + 32);
+            const int8x16_t y3 = vld1q_s8(in + b * 64 + 48);
+
+            int16x8_t acc16 = vdupq_n_s16(0);
+            acc16 = vmlal_s8(acc16, vget_low_s8(q0), vget_low_s8(y0));
+            acc16 = vmlal_s8(acc16, vget_high_s8(q0), vget_high_s8(y0));
+            acc16 = vmlal_s8(acc16, vget_low_s8(q1), vget_low_s8(y1));
+            acc16 = vmlal_s8(acc16, vget_high_s8(q1), vget_high_s8(y1));
+            acc16 = vmlal_s8(acc16, vget_low_s8(q2), vget_low_s8(y2));
+            acc16 = vmlal_s8(acc16, vget_high_s8(q2), vget_high_s8(y2));
+            acc16 = vmlal_s8(acc16, vget_low_s8(q3), vget_low_s8(y3));
+            acc16 = vmlal_s8(acc16, vget_high_s8(q3), vget_high_s8(y3));
+
+            acc = vaddq_s32(acc, vmovl_s16(vget_low_s16(acc16)));
+            acc = vaddq_s32(acc, vmovl_high_s16(acc16));
+        }
+        out[n] = vaddvq_s32(acc) - sum_x;
+    }
+#else
+    const u32 row_bytes = K / 4;
+    int32_t sum_x = 0;
+    for (u32 i = 0; i < K; i++) sum_x += (int32_t)in[i];
+    for (u32 n = 0; n < N; n++) {
+        const uint8_t* wrow = W + n * row_bytes;
+        int32_t acc = 0;
+        for (u32 k = 0; k < K; k++) {
+            uint8_t byte = wrow[k / 4];
+            uint8_t code = (byte >> ((k % 4) * 2)) & 0x3;
+            acc += (int32_t)code * (int32_t)in[k];
+        }
+        out[n] = acc - sum_x;
+    }
+#endif
+}
+
+static void ternary_proj(HSMLTernary* m, int32_t* out, const int8_t* in,
                          const u8* W, u32 N, u32 K) {
     u64 t0 = now_ns();
-    /* Use routing abstraction — thread count auto-selected */
-    HSRouteDesc route;
-    route.format = HS_ROUTE_TERNARY_2BIT;
-    route.K = K; route.N = N; route.routes = W;
-    int threads = hs_ml_route_optimal_threads(&route, 1);
-    hs_ml_route_mt(out, in, &route, 1, threads);
+    if (m->use_i2s) {
+        i2s_proj_neon(out, in, W, N, K);
+    } else {
+        HSRouteDesc route;
+        route.format = HS_ROUTE_TERNARY_2BIT;
+        route.K = K; route.N = N; route.routes = W;
+        int threads = hs_ml_route_optimal_threads(&route, 1);
+        hs_ml_route_mt(out, in, &route, 1, threads);
+    }
 
     g_mlt_stats.total_gemm_calls++;
     g_mlt_stats.total_gemm_ops += (u64)N * K;
@@ -368,12 +445,12 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     float act_scale = hs_mlt_quantize(qbuf, fbuf, H);
 
     /* ── 3-5. Q, K, V projections (no malloc) ── */
-    ternary_proj(gbuf, qbuf, lay->q_proj, H, H);
-    hs_mlt_dequantize(q, gbuf, H, act_scale, lay->q_scale);
-    ternary_proj(gbuf, qbuf, lay->k_proj, kv, H);
-    hs_mlt_dequantize(k, gbuf, kv, act_scale, lay->k_scale);
-    ternary_proj(gbuf, qbuf, lay->v_proj, kv, H);
-    hs_mlt_dequantize(v, gbuf, kv, act_scale, lay->v_scale);
+    ternary_proj(m, gbuf, qbuf, lay->q_proj, H, H);
+    hs_mlt_dequantize(q, gbuf, H, act_scale, m->use_i2s ? NULL : lay->q_scale);
+    ternary_proj(m, gbuf, qbuf, lay->k_proj, kv, H);
+    hs_mlt_dequantize(k, gbuf, kv, act_scale, m->use_i2s ? NULL : lay->k_scale);
+    ternary_proj(m, gbuf, qbuf, lay->v_proj, kv, H);
+    hs_mlt_dequantize(v, gbuf, kv, act_scale, m->use_i2s ? NULL : lay->v_scale);
 
     /* ── 6. RoPE ── */
     u32 seq_pos = cache ? cache->cache_len : 0;
@@ -443,8 +520,8 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
 
     /* ── 9. O projection ── */
     act_scale = hs_mlt_quantize(qbuf, attn_out, H);
-    ternary_proj(gbuf, qbuf, lay->o_proj, H, H);
-    hs_mlt_dequantize(fbuf, gbuf, H, act_scale, lay->o_scale);
+    ternary_proj(m, gbuf, qbuf, lay->o_proj, H, H);
+    hs_mlt_dequantize(fbuf, gbuf, H, act_scale, m->use_i2s ? NULL : lay->o_scale);
 
     /* ── 10. Residual (attention) + FFN RMSNorm ── */
     for (u32 i = 0; i < H; i++) hidden[i] += fbuf[i];
@@ -454,10 +531,10 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     act_scale = hs_mlt_quantize(qbuf, fbuf, H);
 
     /* ── 12. Gate and Up projections (no malloc) ── */
-    ternary_proj(gbuf, qbuf, lay->gate_proj, F, H);
-    hs_mlt_dequantize(gate_out, gbuf, F, act_scale, lay->gate_scale);
-    ternary_proj(gbuf, qbuf, lay->up_proj, F, H);
-    hs_mlt_dequantize(up_out, gbuf, F, act_scale, lay->up_scale);
+    ternary_proj(m, gbuf, qbuf, lay->gate_proj, F, H);
+    hs_mlt_dequantize(gate_out, gbuf, F, act_scale, m->use_i2s ? NULL : lay->gate_scale);
+    ternary_proj(m, gbuf, qbuf, lay->up_proj, F, H);
+    hs_mlt_dequantize(up_out, gbuf, F, act_scale, m->use_i2s ? NULL : lay->up_scale);
 
     /* ── 13. BitNet FFN: ReLU^2(gate) * up, then ffn_sub_norm ── */
 #ifdef __ARM_NEON
@@ -484,8 +561,8 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
 
     /* ── 14. Down projection (use ffn_qbuf — pre-allocated for F elements) ── */
     act_scale = hs_mlt_quantize(fqbuf, ffbuf, F);
-    ternary_proj(gbuf, fqbuf, lay->down_proj, H, F);
-    hs_mlt_dequantize(fbuf, gbuf, H, act_scale, lay->down_scale);
+    ternary_proj(m, gbuf, fqbuf, lay->down_proj, H, F);
+    hs_mlt_dequantize(fbuf, gbuf, H, act_scale, m->use_i2s ? NULL : lay->down_scale);
 
     /* ── 15. Residual (FFN) ── */
     for (u32 i = 0; i < H; i++) hidden[i] += fbuf[i];
@@ -670,6 +747,12 @@ int hs_mlt_prefill(HSMLTernarySession* sess,
     if (!sess || !sess->ready || !tokens || seq_len == 0) return -1;
     for (u32 i = 0; i < seq_len; i++)
         session_step(sess, tokens[i]);
+    return 0;
+}
+
+int hs_mlt_session_logits(HSMLTernarySession* sess, float* logits) {
+    if (!sess || !sess->ready || !logits) return -1;
+    session_logits(sess, logits);
     return 0;
 }
 
