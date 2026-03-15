@@ -664,72 +664,43 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
     /* Load real BF16 norms from sidecar file (extracted from HF checkpoint).
      * The GGUF norm tensors are corrupt (upstream converter bug).
      * Sidecar format: u32 header_len + JSON header + BF16 data */
+    /* Load real BF16 norms from v2 sidecar (simple binary, no JSON) */
     if (m->use_i2s) {
-        const char *norm_path = "/home/ztflynn/001/neogpu/models/norms_bf16.bin";
-        FILE *nf = fopen(norm_path, "rb");
+        const char *np = "/home/ztflynn/001/neogpu/models/norms_v2.bin";
+        FILE *nf = fopen(np, "rb");
         if (nf) {
-            uint32_t hlen;
-            if (fread(&hlen, 4, 1, nf) == 1 && hlen < 100000) {
-                char *hjson = malloc(hlen + 1);
-                if (hjson && fread(hjson, 1, hlen, nf) == hlen) {
-                    hjson[hlen] = 0;
-                    long norm_data_base = 4 + hlen;
-                    /* Parse JSON minimally: find tensor offsets by name */
-                    /* For each layer, load 4 norms; plus final_norm */
-                    char search[256];
-                    char *found;
-                    for (u32 l = 0; l < n_layers; l++) {
-                        HSTernaryLayer *lay = &m->layers[l];
-
-                        /* Helper macro: find "NAME":..."offset":N,"size":M and read BF16 */
-#define LOAD_NORM_BF16(field, field_size, hf_name) do { \
-    snprintf(search, sizeof(search), "\"%s\"", hf_name); \
-    found = strstr(hjson, search); \
-    if (found) { \
-        char *op = strstr(found, "\"offset\": "); \
-        char *sp = strstr(found, "\"size\": "); \
-        if (!op) op = strstr(found, "\"offset\":"); \
-        if (!sp) sp = strstr(found, "\"size\":"); \
-        if (op && sp) { \
-            long off = atol(op + (strchr(op, ':') - op) + 1); \
-            long sz = atol(sp + (strchr(sp, ':') - sp) + 1); \
-            uint16_t *buf = malloc(sz); \
-            if (buf) { \
-                fseek(nf, norm_data_base + off, SEEK_SET); \
-                if (fread(buf, 1, sz, nf) == (size_t)sz) { \
-                    for (u32 _i = 0; _i < (u32)(field_size); _i++) { \
-                        uint32_t bits = (uint32_t)buf[_i] << 16; \
-                        float fv; memcpy(&fv, &bits, 4); \
-                        (field)[_i] = fv; \
-                    } \
-                } \
-                free(buf); \
-            } \
-        } \
-    } \
-} while(0)
-
-                        snprintf(search, sizeof(search), "model.layers.%u.input_layernorm.weight", l);
-                        LOAD_NORM_BF16(lay->attn_norm, hidden_size, search);
-
-                        snprintf(search, sizeof(search), "model.layers.%u.self_attn.attn_sub_norm.weight", l);
-                        LOAD_NORM_BF16(lay->attn_sub_norm, hidden_size, search);
-
-                        snprintf(search, sizeof(search), "model.layers.%u.post_attention_layernorm.weight", l);
-                        LOAD_NORM_BF16(lay->ffn_norm, hidden_size, search);
-
-                        snprintf(search, sizeof(search), "model.layers.%u.mlp.ffn_sub_norm.weight", l);
-                        LOAD_NORM_BF16(lay->ffn_sub_norm, ffn_size, search);
+            uint32_t magic, nt;
+            fread(&magic, 4, 1, nf); fread(&nt, 4, 1, nf);
+            if (magic == 0x4E524D32) {
+                for (uint32_t ti = 0; ti < nt; ti++) {
+                    uint32_t nl, nv;
+                    fread(&nl, 4, 1, nf);
+                    char tname[256]; fread(tname, 1, nl, nf); tname[nl] = 0;
+                    fread(&nv, 4, 1, nf);
+                    uint16_t *buf = malloc(nv * 2);
+                    fread(buf, 2, nv, nf);
+                    /* Match name to field */
+                    u32 layer = 0; int matched = 0;
+                    if (sscanf(tname, "model.layers.%u.", &layer) == 1 && layer < n_layers) {
+                        HSTernaryLayer *lay = &m->layers[layer];
+                        float *dst = NULL; u32 dsz = 0;
+                        if (strstr(tname, ".input_layernorm.")) { dst = lay->attn_norm; dsz = hidden_size; }
+                        else if (strstr(tname, ".attn_sub_norm.")) { dst = lay->attn_sub_norm; dsz = hidden_size; }
+                        else if (strstr(tname, ".post_attention_layernorm.")) { dst = lay->ffn_norm; dsz = hidden_size; }
+                        else if (strstr(tname, ".ffn_sub_norm.")) { dst = lay->ffn_sub_norm; dsz = ffn_size; }
+                        if (dst && dsz <= nv) {
+                            for (u32 i = 0; i < dsz; i++) { uint32_t bits = (uint32_t)buf[i] << 16; memcpy(&dst[i], &bits, 4); }
+                            matched = 1;
+                        }
+                    } else if (strcmp(tname, "model.norm.weight") == 0 && nv >= hidden_size) {
+                        for (u32 i = 0; i < hidden_size; i++) { uint32_t bits = (uint32_t)buf[i] << 16; memcpy(&m->final_norm[i], &bits, 4); }
+                        matched = 1;
                     }
-                    LOAD_NORM_BF16(m->final_norm, hidden_size, "model.norm.weight");
-#undef LOAD_NORM_BF16
-                    printf("loader: loaded real BF16 norms from %s\n", norm_path);
+                    free(buf);
                 }
-                free(hjson);
+                printf("loader: loaded real BF16 norms from %s\n", np);
             }
             fclose(nf);
-        } else {
-            fprintf(stderr, "loader: norm sidecar not found at %s, using defaults\n", norm_path);
         }
     }
 
