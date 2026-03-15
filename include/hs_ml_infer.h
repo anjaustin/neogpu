@@ -269,3 +269,20 @@ int hs_mlt_prefill(HSMLTernarySession* sess,
  * Returns 0 on success.
  */
 int hs_mlt_decode(HSMLTernarySession* sess, u32 token, float* logits);
+
+/*============================================================================
+ * GGUF loader
+ *============================================================================*/
+
+/*
+ * Load a GGUF model file into HSMLTernary.
+ *
+ * Supports the format produced by tools/write_test_gguf.py:
+ *   - F32 projection weights (converted to 2-bit packed ternary on load)
+ *   - F32 per-row scales (companion tensor <name>_scale)
+ *   - F32 embeddings, norms, lm_head
+ *   - Standard GGUF metadata keys (llama.* namespace)
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int hs_mlt_load_gguf(HSMLTernary* m, const char* path);
