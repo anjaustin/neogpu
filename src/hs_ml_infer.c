@@ -317,16 +317,22 @@ static void i2s_proj_neon(int32_t* out, const int8_t* in,
         out[n] = vaddvq_s32(acc) - sum_x;
     }
 #else
-    const u32 row_bytes = K / 4;
     int32_t sum_x = 0;
     for (u32 i = 0; i < K; i++) sum_x += (int32_t)in[i];
+    u32 nblk = K / I2S_QK;
+    u32 row_bytes = K / 4;
     for (u32 n = 0; n < N; n++) {
         const uint8_t* wrow = W + n * row_bytes;
         int32_t acc = 0;
-        for (u32 k = 0; k < K; k++) {
-            uint8_t byte = wrow[k / 4];
-            uint8_t code = (byte >> ((k % 4) * 2)) & 0x3;
-            acc += (int32_t)code * (int32_t)in[k];
+        for (u32 bi = 0; bi < nblk; bi++) {
+            const uint8_t* block = wrow + bi * (I2S_QK / 4);
+            for (u32 j = 0; j < I2S_QK; j++) {
+                u32 k = bi * I2S_QK + j;
+                u32 group_idx = j / 16;
+                u32 group_pos = j % 16;
+                uint8_t raw = (block[group_pos] >> (6 - 2 * group_idx)) & 0x3;
+                acc += (int32_t)raw * (int32_t)in[k];
+            }
         }
         out[n] = acc - sum_x;
     }
