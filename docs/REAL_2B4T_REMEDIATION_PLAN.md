@@ -74,3 +74,48 @@ Real-model smoke test now passes:
 2. Add a tiny CLI for prompt -> generated text using `HSMLTernarySession`
 3. Benchmark real decode throughput at context lengths `1, 64, 256, 512`
 4. Validate output quality against `bitnet.cpp` on a fixed prompt
+
+## Actual Outcome (2026-03-15)
+
+### Root causes found
+
+1. **m->use_i2s was never set to true** — the most impactful single-line bug.
+   Neither the native I2_S kernel nor the norm workaround ever executed.
+   All prior probes showing failure were running dead code.
+
+2. **Norm tensor interpretation** — attn_norm, attn_sub_norm, and ffn_norm
+   loaded from the real GGUF contain numerically implausible values when
+   interpreted as plain F32. The exact storage format for these tensors in
+   the BitNet fork GGUF is still unresolved. Current workaround: force
+   these three norm types to 1.0 for use_i2s models.
+
+3. **I2_S scalar fallback bit ordering** — the scalar path used simple
+   (k%4)*2 shifting but the real I2_S format uses group layout
+   (group_idx=j/16, group_pos=j%16, MSB-first). The NEON kernel was
+   correct; the scalar was wrong. Found and fixed during red-team.
+
+### Current status
+
+- Real 2B-4T GGUF loads successfully
+- Native I2_S NEON kernel active and red-teamed (9/9 checks pass)
+- Hidden state stays bounded through all 30 layers (absmax ~23000)
+- Logits are finite and differentiated
+- Model generates tokens (not coherent due to neutralized norms)
+- All 60+ synthetic/regression tests still pass
+
+### Remaining gaps
+
+1. **Norm tensor format**: need to reverse-engineer how the BitNet fork
+   stores attn_norm, attn_sub_norm, and ffn_norm in its GGUF. These are
+   type 0 (F32) but the raw bytes are not valid F32 norm weights. Possible
+   causes: offset alignment issue, interleaved storage, or custom encoding.
+
+2. **I2_S scale semantics**: the 32 extra bytes per I2_S tensor payload
+   are not yet consumed. The reference GPU kernel uses a separate
+   weight_scale tensor that is not present in the GGUF file. The scale
+   may be embedded in those 32 bytes but the exact interpretation is unknown.
+
+3. **BPE tokenizer**: current encoder uses greedy longest-match over vocab.
+   Full merge-rank BPE application using tokenizer.ggml.merges is not
+   implemented. Roundtrip works for the control prompt but may fail on
+   more complex inputs.
