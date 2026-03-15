@@ -507,6 +507,7 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
     m->rope_theta      = rope_freq;
     m->use_i2s         = true;
     m->use_i2s         = true;
+    m->use_i2s         = true;
     m->tokenizer_vocab  = tokenizer_vocab;
     m->tokenizer_bos    = tokenizer_bos;
     m->tokenizer_eos    = tokenizer_eos;
@@ -660,92 +661,75 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
        !m->gate_buf || !m->up_buf || !m->score_buf || !m->ffn_qbuf) {
         free(tis); goto fail;
     }
-    /* BitNet 2B-4T GGUF: norm tensors stored as F16 in F32-typed slots.
-     * attn_norm slot: F16 pair (attn_norm + attn_sub_norm)
-     * ffn_sub_norm slot: F16 (first half)
-     * ffn_norm, output_norm: also read as F16 */
+    /* Load real BF16 norms from sidecar file (extracted from HF checkpoint).
+     * The GGUF norm tensors are corrupt (upstream converter bug).
+     * Sidecar format: u32 header_len + JSON header + BF16 data */
     if (m->use_i2s) {
-        for (u32 l = 0; l < n_layers; l++) {
-            HSTernaryLayer *lay = &m->layers[l];
-            char wname[256];
-            int ni;
+        const char *norm_path = "/home/ztflynn/001/neogpu/models/norms_bf16.bin";
+        FILE *nf = fopen(norm_path, "rb");
+        if (nf) {
+            uint32_t hlen;
+            if (fread(&hlen, 4, 1, nf) == 1 && hlen < 100000) {
+                char *hjson = malloc(hlen + 1);
+                if (hjson && fread(hjson, 1, hlen, nf) == hlen) {
+                    hjson[hlen] = 0;
+                    long norm_data_base = 4 + hlen;
+                    /* Parse JSON minimally: find tensor offsets by name */
+                    /* For each layer, load 4 norms; plus final_norm */
+                    char search[256];
+                    char *found;
+                    for (u32 l = 0; l < n_layers; l++) {
+                        HSTernaryLayer *lay = &m->layers[l];
 
-            /* attn_norm slot -> attn_norm + attn_sub_norm as F16 pair */
-            snprintf(wname, sizeof(wname), "blk.%u.attn_norm.weight", l);
-            ni = find_tensor(tis, (int)tensor_count, wname);
-            if (ni >= 0) {
-                uint16_t *buf = malloc(hidden_size * 2 * sizeof(uint16_t));
-                if (buf) {
-                    fseek(f, data_start + (long)tis[ni].offset, SEEK_SET);
-                    if (fread(buf, 2, hidden_size * 2, f) == hidden_size * 2) {
-                        for (u32 i = 0; i < hidden_size; i++)
-                            lay->attn_norm[i] = fp16_to_f32(buf[i]);
-                        for (u32 i = 0; i < hidden_size; i++)
-                            lay->attn_sub_norm[i] = fp16_to_f32(buf[hidden_size + i]);
-                    }
-                    free(buf);
-                }
-            }
+                        /* Helper macro: find "NAME":..."offset":N,"size":M and read BF16 */
+#define LOAD_NORM_BF16(field, field_size, hf_name) do { \
+    snprintf(search, sizeof(search), "\"%s\"", hf_name); \
+    found = strstr(hjson, search); \
+    if (found) { \
+        char *op = strstr(found, "\"offset\": "); \
+        char *sp = strstr(found, "\"size\": "); \
+        if (!op) op = strstr(found, "\"offset\":"); \
+        if (!sp) sp = strstr(found, "\"size\":"); \
+        if (op && sp) { \
+            long off = atol(op + (strchr(op, ':') - op) + 1); \
+            long sz = atol(sp + (strchr(sp, ':') - sp) + 1); \
+            uint16_t *buf = malloc(sz); \
+            if (buf) { \
+                fseek(nf, norm_data_base + off, SEEK_SET); \
+                if (fread(buf, 1, sz, nf) == (size_t)sz) { \
+                    for (u32 _i = 0; _i < (u32)(field_size); _i++) { \
+                        uint32_t bits = (uint32_t)buf[_i] << 16; \
+                        float fv; memcpy(&fv, &bits, 4); \
+                        (field)[_i] = fv; \
+                    } \
+                } \
+                free(buf); \
+            } \
+        } \
+    } \
+} while(0)
 
-            /* ffn_sub_norm slot -> ffn_sub_norm as F16 (first half) */
-            snprintf(wname, sizeof(wname), "blk.%u.ffn_sub_norm.weight", l);
-            ni = find_tensor(tis, (int)tensor_count, wname);
-            if (ni >= 0) {
-                uint16_t *buf = malloc(ffn_size * sizeof(uint16_t));
-                if (buf) {
-                    fseek(f, data_start + (long)tis[ni].offset, SEEK_SET);
-                    if (fread(buf, 2, ffn_size, f) == (size_t)ffn_size) {
-                        for (u32 i = 0; i < ffn_size; i++)
-                            lay->ffn_sub_norm[i] = fp16_to_f32(buf[i]);
-                    }
-                    free(buf);
-                }
-            }
+                        snprintf(search, sizeof(search), "model.layers.%u.input_layernorm.weight", l);
+                        LOAD_NORM_BF16(lay->attn_norm, hidden_size, search);
 
-            /* ffn_norm slot -> try as F16 */
-            snprintf(wname, sizeof(wname), "blk.%u.ffn_norm.weight", l);
-            ni = find_tensor(tis, (int)tensor_count, wname);
-            if (ni >= 0) {
-                uint16_t *buf = malloc(hidden_size * sizeof(uint16_t));
-                if (buf) {
-                    fseek(f, data_start + (long)tis[ni].offset, SEEK_SET);
-                    if (fread(buf, 2, hidden_size, f) == hidden_size) {
-                        int sane = 1;
-                        for (u32 i = 0; i < hidden_size && sane; i++) {
-                            float v = fp16_to_f32(buf[i]);
-                            if (v != v || v > 100.0f || v < -100.0f) sane = 0;
-                        }
-                        if (sane) {
-                            for (u32 i = 0; i < hidden_size; i++)
-                                lay->ffn_norm[i] = fp16_to_f32(buf[i]);
-                        }
-                    }
-                    free(buf);
-                }
-            }
-        }
+                        snprintf(search, sizeof(search), "model.layers.%u.self_attn.attn_sub_norm.weight", l);
+                        LOAD_NORM_BF16(lay->attn_sub_norm, hidden_size, search);
 
-        /* output_norm -> try as F16 */
-        {
-            int ni = find_tensor(tis, (int)tensor_count, "output_norm.weight");
-            if (ni >= 0) {
-                uint16_t *buf = malloc(hidden_size * sizeof(uint16_t));
-                if (buf) {
-                    fseek(f, data_start + (long)tis[ni].offset, SEEK_SET);
-                    if (fread(buf, 2, hidden_size, f) == hidden_size) {
-                        int sane = 1;
-                        for (u32 i = 0; i < hidden_size && sane; i++) {
-                            float v = fp16_to_f32(buf[i]);
-                            if (v != v || v > 100.0f || v < -100.0f) sane = 0;
-                        }
-                        if (sane) {
-                            for (u32 i = 0; i < hidden_size; i++)
-                                m->final_norm[i] = fp16_to_f32(buf[i]);
-                        }
+                        snprintf(search, sizeof(search), "model.layers.%u.post_attention_layernorm.weight", l);
+                        LOAD_NORM_BF16(lay->ffn_norm, hidden_size, search);
+
+                        snprintf(search, sizeof(search), "model.layers.%u.mlp.ffn_sub_norm.weight", l);
+                        LOAD_NORM_BF16(lay->ffn_sub_norm, ffn_size, search);
                     }
-                    free(buf);
+                    LOAD_NORM_BF16(m->final_norm, hidden_size, "model.norm.weight");
+#undef LOAD_NORM_BF16
+                    printf("loader: loaded real BF16 norms from %s\n", norm_path);
                 }
+                free(hjson);
             }
+            fclose(nf);
+        } else {
+            fprintf(stderr, "loader: norm sidecar not found at %s, using defaults\n", norm_path);
         }
     }
 
