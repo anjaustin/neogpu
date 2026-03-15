@@ -119,3 +119,22 @@ Real-model smoke test now passes:
    Full merge-rank BPE application using tokenizer.ggml.merges is not
    implemented. Roundtrip works for the control prompt but may fail on
    more complex inputs.
+
+## Root Cause: Corrupt Norm Tensors (2026-03-15 final)
+
+The norm tensor garbage is NOT caused by:
+- Truncated file (file is complete, 1.197 GB, all tensors within bounds)
+- Wrong byte interpretation (not F32, not F16, not BF16 at any layer)
+- Our loader code (the raw bytes are genuinely not valid floats)
+
+The root cause is the upstream BitNet GGUF converter itself:
+- convert-hf-to-gguf-bitnet.py forces norms to F32 (extra_f32=True)
+- But the written bytes are not valid IEEE 754 F32 values
+- Layer 0 attn_norm happened to be interpretable as F16 by coincidence
+- Layers 1-29 norms are garbage in every float interpretation
+
+Layer 0 attn_norm working as F16 was a red herring that consumed
+significant debugging time. The real fix requires either:
+1. Extracting norms from the original HuggingFace checkpoint (needs torch)
+2. A corrected GGUF converter
+3. Using the non-GGUF model files directly
