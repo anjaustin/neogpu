@@ -357,6 +357,19 @@ static void ternary_proj(HSMLTernary* m, int32_t* out, const int8_t* in,
     g_mlt_stats.total_ns += now_ns() - t0;
 }
 
+/* Pure float32 ternary projection — no int8 quantization */
+extern void hs_ml_ternary_f32_proj(float* out, const float* in,
+                                    const u8* W, u32 N, u32 K);
+
+static void f32_proj(HSMLTernary* m, float* out, const float* in,
+                     const u8* W, u32 N, u32 K) {
+    u64 t0 = now_ns();
+    hs_ml_ternary_f32_proj(out, in, W, N, K);
+    g_mlt_stats.total_gemm_calls++;
+    g_mlt_stats.total_gemm_ops += (u64)N * K;
+    g_mlt_stats.total_ns += now_ns() - t0;
+}
+
 /*============================================================================
  * Layer forward pass
  *============================================================================*/
@@ -447,16 +460,21 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     /* ── 1. Attention RMSNorm ── */
     rmsnorm(fbuf, hidden, lay->attn_norm, 1e-5f, H);
 
-    /* ── 2. Quantise normed hidden ── */
-    float act_scale = hs_mlt_quantize(qbuf, fbuf, H);
-
-    /* ── 3-5. Q, K, V projections (no malloc) ── */
-    ternary_proj(m, gbuf, qbuf, lay->q_proj, H, H);
-    hs_mlt_dequantize(q, gbuf, H, act_scale, m->use_i2s ? NULL : lay->q_scale);
-    ternary_proj(m, gbuf, qbuf, lay->k_proj, kv, H);
-    hs_mlt_dequantize(k, gbuf, kv, act_scale, m->use_i2s ? NULL : lay->k_scale);
-    ternary_proj(m, gbuf, qbuf, lay->v_proj, kv, H);
-    hs_mlt_dequantize(v, gbuf, kv, act_scale, m->use_i2s ? NULL : lay->v_scale);
+    /* ── 2-5. Q, K, V projections ── */
+    if (m->use_i2s) {
+        /* Pure f32 path: no quantize/dequantize */
+        f32_proj(m, q, fbuf, lay->q_proj, H, H);
+        f32_proj(m, k, fbuf, lay->k_proj, kv, H);
+        f32_proj(m, v, fbuf, lay->v_proj, kv, H);
+    } else {
+        float act_scale = hs_mlt_quantize(qbuf, fbuf, H);
+        ternary_proj(m, gbuf, qbuf, lay->q_proj, H, H);
+        hs_mlt_dequantize(q, gbuf, H, act_scale, lay->q_scale);
+        ternary_proj(m, gbuf, qbuf, lay->k_proj, kv, H);
+        hs_mlt_dequantize(k, gbuf, kv, act_scale, lay->k_scale);
+        ternary_proj(m, gbuf, qbuf, lay->v_proj, kv, H);
+        hs_mlt_dequantize(v, gbuf, kv, act_scale, lay->v_scale);
+    }
 
     /* ── 6. RoPE ── */
     u32 seq_pos = cache ? cache->cache_len : 0;
@@ -525,22 +543,29 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     rmsnorm(attn_out, attn_out, lay->attn_sub_norm, 1e-5f, H);
 
     /* ── 9. O projection ── */
-    act_scale = hs_mlt_quantize(qbuf, attn_out, H);
-    ternary_proj(m, gbuf, qbuf, lay->o_proj, H, H);
-    hs_mlt_dequantize(fbuf, gbuf, H, act_scale, m->use_i2s ? NULL : lay->o_scale);
+    if (m->use_i2s) {
+        f32_proj(m, fbuf, attn_out, lay->o_proj, H, H);
+    } else {
+        float act_scale = hs_mlt_quantize(qbuf, attn_out, H);
+        ternary_proj(m, gbuf, qbuf, lay->o_proj, H, H);
+        hs_mlt_dequantize(fbuf, gbuf, H, act_scale, lay->o_scale);
+    }
 
     /* ── 10. Residual (attention) + FFN RMSNorm ── */
     for (u32 i = 0; i < H; i++) hidden[i] += fbuf[i];
     rmsnorm(fbuf, hidden, lay->ffn_norm, 1e-5f, H);
 
-    /* ── 11. Quantise for FFN ── */
-    act_scale = hs_mlt_quantize(qbuf, fbuf, H);
-
-    /* ── 12. Gate and Up projections (no malloc) ── */
-    ternary_proj(m, gbuf, qbuf, lay->gate_proj, F, H);
-    hs_mlt_dequantize(gate_out, gbuf, F, act_scale, m->use_i2s ? NULL : lay->gate_scale);
-    ternary_proj(m, gbuf, qbuf, lay->up_proj, F, H);
-    hs_mlt_dequantize(up_out, gbuf, F, act_scale, m->use_i2s ? NULL : lay->up_scale);
+    /* ── 12. Gate and Up projections ── */
+    if (m->use_i2s) {
+        f32_proj(m, gate_out, fbuf, lay->gate_proj, F, H);
+        f32_proj(m, up_out, fbuf, lay->up_proj, F, H);
+    } else {
+        float act_scale = hs_mlt_quantize(qbuf, fbuf, H);
+        ternary_proj(m, gbuf, qbuf, lay->gate_proj, F, H);
+        hs_mlt_dequantize(gate_out, gbuf, F, act_scale, lay->gate_scale);
+        ternary_proj(m, gbuf, qbuf, lay->up_proj, F, H);
+        hs_mlt_dequantize(up_out, gbuf, F, act_scale, lay->up_scale);
+    }
 
     /* ── 13. BitNet FFN: ReLU^2(gate) * up, then ffn_sub_norm ── */
 #ifdef __ARM_NEON
@@ -565,10 +590,14 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
 #endif
     rmsnorm(ffbuf, ffbuf, lay->ffn_sub_norm, 1e-5f, F);
 
-    /* ── 14. Down projection (use ffn_qbuf — pre-allocated for F elements) ── */
-    act_scale = hs_mlt_quantize(fqbuf, ffbuf, F);
-    ternary_proj(m, gbuf, fqbuf, lay->down_proj, H, F);
-    hs_mlt_dequantize(fbuf, gbuf, H, act_scale, m->use_i2s ? NULL : lay->down_scale);
+    /* ── 14. Down projection ── */
+    if (m->use_i2s) {
+        f32_proj(m, fbuf, ffbuf, lay->down_proj, H, F);
+    } else {
+        float act_scale = hs_mlt_quantize(fqbuf, ffbuf, F);
+        ternary_proj(m, gbuf, fqbuf, lay->down_proj, H, F);
+        hs_mlt_dequantize(fbuf, gbuf, H, act_scale, lay->down_scale);
+    }
 
     /* ── 15. Residual (FFN) ── */
     for (u32 i = 0; i < H; i++) hidden[i] += fbuf[i];
