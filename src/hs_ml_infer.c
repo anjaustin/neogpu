@@ -12,6 +12,33 @@
 #include <time.h>
 #include <stdio.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
+/* Inline F16 → F32 for scalar fallback */
+static inline float fp16_to_f32_inline(u16 h) {
+    u32 sign = ((u32)h & 0x8000) << 16;
+    u32 exp  = (h >> 10) & 0x1F;
+    u32 mant = h & 0x03FF;
+    u32 f;
+    if (exp == 0)      f = sign; /* zero/denorm → zero */
+    else if (exp == 31) f = sign | 0x7F800000u | (mant << 13);
+    else                f = sign | ((exp + 112) << 23) | (mant << 13);
+    float out; memcpy(&out, &f, 4); return out;
+}
+
+/* Inline F32 → F16 */
+static inline u16 f32_to_f16_inline(float v) {
+    u32 u; memcpy(&u, &v, 4);
+    u32 sign = (u >> 16) & 0x8000;
+    int exp = ((u >> 23) & 0xFF) - 127 + 15;
+    u32 mant = (u >> 13) & 0x03FF;
+    if (exp <= 0) return (u16)sign;
+    if (exp >= 31) return (u16)(sign | 0x7C00);
+    return (u16)(sign | ((u32)exp << 10) | mant);
+}
+
 /* Global stats */
 HSMLTernaryStats g_mlt_stats;
 
@@ -37,7 +64,7 @@ void hs_mlt_free(HSMLTernary* m) {
     if (!m) return;
 
     free(m->embedding);
-    free(m->lm_head);
+    free(m->lm_head_f16);
     free(m->final_norm);
 
     if (m->tokenizer_vocab) {
@@ -127,16 +154,18 @@ int hs_mlt_alloc_random(HSMLTernary* m,
 
     unsigned int rng = seed;
 
-    /* Embeddings and head (float32) */
-    m->embedding  = malloc((size_t)vocab_size * hidden_size * sizeof(float));
-    m->lm_head    = malloc((size_t)vocab_size * hidden_size * sizeof(float));
-    m->final_norm = malloc(hidden_size * sizeof(float));
-    if (!m->embedding || !m->lm_head || !m->final_norm) goto fail;
+    /* Embeddings and head */
+    size_t emb_n = (size_t)vocab_size * hidden_size;
+    m->embedding   = malloc(emb_n * sizeof(float));
+    m->lm_head_f16 = malloc(emb_n * sizeof(u16));
+    m->final_norm  = malloc(hidden_size * sizeof(float));
+    if (!m->embedding || !m->lm_head_f16 || !m->final_norm) goto fail;
 
     for (u32 i = 0; i < vocab_size * hidden_size; i++)
         m->embedding[i] = ((float)(rand_r(&rng) % 200) - 100.0f) / 100.0f;
     for (u32 i = 0; i < vocab_size * hidden_size; i++)
-        m->lm_head[i] = ((float)(rand_r(&rng) % 200) - 100.0f) / 100.0f;
+        m->lm_head_f16[i] = f32_to_f16_inline(
+            ((float)(rand_r(&rng) % 200) - 100.0f) / 100.0f);
     for (u32 i = 0; i < hidden_size; i++)
         m->final_norm[i] = 1.0f;
 
@@ -642,11 +671,12 @@ int hs_mlt_forward(HSMLTernary* m, const u32* tokens, u32 seq_len,
     float* normed = malloc(H * sizeof(float));
     if (normed) {
         rmsnorm(normed, hidden, m->final_norm, 1e-5f, H);
-        /* LM head: float matmul [V, H] x [H] -> [V] */
+        /* LM head: F16 matmul [V, H] x [H] -> [V] */
         for (u32 v = 0; v < V; v++) {
             float s = 0;
+            const u16* row = m->lm_head_f16 + (size_t)v * H;
             for (u32 i = 0; i < H; i++)
-                s += m->lm_head[v * H + i] * normed[i];
+                s += fp16_to_f32_inline(row[i]) * normed[i];
             logits[v] = s;
         }
         free(normed);
@@ -936,20 +966,44 @@ static void session_logits(HSMLTernarySession* sess, float* logits) {
     u32 V = m->vocab_size;
     float* normed = m->hidden_buf;  /* borrow model scratch — safe, not in use */
     rmsnorm(normed, sess->hidden, m->final_norm, 1e-5f, H);
+
+    /* Logits = lm_head_f16 @ normed.
+     * lm_head is F16 — load 8 at a time, convert to F32, FMA.
+     * This halves memory bandwidth vs F32 lm_head. */
+    const u16* head = m->lm_head_f16;
 #ifdef __ARM_NEON
+    u32 H8 = H & ~7u;
     for (u32 v = 0; v < V; v++) {
-        float32x4_t acc = vdupq_n_f32(0.0f);
-        u32 H4 = H & ~3u;
-        for (u32 i = 0; i < H4; i += 4)
-            acc = vfmaq_f32(acc, vld1q_f32(m->lm_head + v*H + i), vld1q_f32(normed + i));
-        float s = vaddvq_f32(acc);
-        for (u32 i = H4; i < H; i++) s += m->lm_head[v*H + i] * normed[i];
+        const u16* row = head + (size_t)v * H;
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+
+        for (u32 i = 0; i < H8; i += 8) {
+            /* Load 8 F16 values (128 bits) */
+            float16x8_t h8 = vld1q_f16((const __fp16*)(row + i));
+            /* Convert to 2 × F32x4 */
+            float32x4_t h_lo = vcvt_f32_f16(vget_low_f16(h8));
+            float32x4_t h_hi = vcvt_f32_f16(vget_high_f16(h8));
+            /* FMA with normed hidden */
+            acc0 = vfmaq_f32(acc0, h_lo, vld1q_f32(normed + i));
+            acc1 = vfmaq_f32(acc1, h_hi, vld1q_f32(normed + i + 4));
+        }
+        float s = vaddvq_f32(vaddq_f32(acc0, acc1));
+        /* Tail */
+        for (u32 i = H8; i < H; i++) {
+            float hv = fp16_to_f32_inline(row[i]);
+            s += hv * normed[i];
+        }
         logits[v] = s;
     }
 #else
     for (u32 v = 0; v < V; v++) {
+        const u16* row = head + (size_t)v * H;
         float s = 0;
-        for (u32 i = 0; i < H; i++) s += m->lm_head[v*H + i] * normed[i];
+        for (u32 i = 0; i < H; i++) {
+            float hv = fp16_to_f32_inline(row[i]);
+            s += hv * normed[i];
+        }
         logits[v] = s;
     }
 #endif

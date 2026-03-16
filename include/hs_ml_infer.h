@@ -76,9 +76,9 @@ typedef struct {
     bool  use_i2s;          /* true = raw I2_S bytes + f32 activation path */
 
     /* Non-quantized weights */
-    float* embedding;   /* [vocab, hidden] float32 */
-    float* lm_head;     /* [vocab, hidden] float32 (tied to embedding if no output.weight) */
-    float* final_norm;  /* [hidden] float32 */
+    float* embedding;      /* [vocab, hidden] float32 (for embedding lookup) */
+    u16*   lm_head_f16;    /* [vocab, hidden] float16 (for logit computation) */
+    float* final_norm;     /* [hidden] float32 */
 
     /* Per-layer ternary weights */
     HSTernaryLayer* layers; /* [num_layers] */

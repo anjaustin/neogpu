@@ -519,12 +519,13 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
     tok_merges          = NULL;
 
     /* Non-quantized weights */
-    m->embedding  = malloc((size_t)vocab_size * hidden_size * sizeof(float));
-    m->lm_head    = malloc((size_t)vocab_size * hidden_size * sizeof(float));
-    m->final_norm = malloc(hidden_size * sizeof(float));
-    if(!m->embedding || !m->lm_head || !m->final_norm) { free(tis); goto fail; }
+    size_t emb_n = (size_t)vocab_size * hidden_size;
+    m->embedding   = malloc(emb_n * sizeof(float));
+    m->lm_head_f16 = malloc(emb_n * sizeof(uint16_t));
+    m->final_norm  = malloc(hidden_size * sizeof(float));
+    if(!m->embedding || !m->lm_head_f16 || !m->final_norm) { free(tis); goto fail; }
 
-    /* Load embedding (F16 in real model) */
+    /* Load embedding (F16 in real model → F32 for embedding lookup) */
     {
         int idx = find_tensor(tis, (int)tensor_count, "token_embd.weight");
         if(idx < 0) {
@@ -533,30 +534,50 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
         }
         float* raw = load_as_f32(f, data_start, &tis[idx], vocab_size * hidden_size);
         if(!raw) { free(tis); goto fail; }
-        memcpy(m->embedding, raw, (size_t)vocab_size * hidden_size * sizeof(float));
+        memcpy(m->embedding, raw, emb_n * sizeof(float));
         free(raw);
         printf("loader: embedding loaded (type=%u)\n", tis[idx].type);
     }
 
-    /* Load lm_head (or weight tying) */
+    /* Load lm_head as F16 (for logit computation — halves memory bandwidth).
+     * With weight tying, convert the F32 embedding back to F16.
+     * With separate output.weight, load it directly as F16. */
     {
         int idx = find_tensor(tis, (int)tensor_count, "output.weight");
-        if(idx >= 0) {
-            float* raw = load_as_f32(f, data_start, &tis[idx], vocab_size * hidden_size);
-            if(raw) {
-                memcpy(m->lm_head, raw, (size_t)vocab_size * hidden_size * sizeof(float));
-                free(raw);
-                printf("loader: lm_head loaded (type=%u)\n", tis[idx].type);
+        if(idx >= 0 && tis[idx].type == GGML_TYPE_F16) {
+            /* Direct F16 load */
+            long pos = data_start + (long)tis[idx].offset;
+            if(fseek(f, pos, SEEK_SET) == 0 &&
+               fread(m->lm_head_f16, sizeof(uint16_t), emb_n, f) == emb_n) {
+                printf("loader: lm_head loaded as F16\n");
             } else {
-                memcpy(m->lm_head, m->embedding,
-                       (size_t)vocab_size * hidden_size * sizeof(float));
-                printf("loader: lm_head load failed, using embedding (weight tying)\n");
+                /* Fallback: convert embedding F32 → F16 */
+                for(size_t i = 0; i < emb_n; i++) {
+                    float v = m->embedding[i];
+                    /* F32 → F16 via bit manipulation */
+                    uint32_t u; memcpy(&u, &v, 4);
+                    uint32_t sign = (u >> 16) & 0x8000;
+                    int32_t exp = ((u >> 23) & 0xFF) - 127 + 15;
+                    uint32_t mant = (u >> 13) & 0x03FF;
+                    if(exp <= 0) m->lm_head_f16[i] = (uint16_t)sign;
+                    else if(exp >= 31) m->lm_head_f16[i] = (uint16_t)(sign | 0x7C00);
+                    else m->lm_head_f16[i] = (uint16_t)(sign | (exp << 10) | mant);
+                }
+                printf("loader: lm_head F16 from embedding (conversion)\n");
             }
         } else {
-            /* Weight tying: tie_word_embeddings = True */
-            memcpy(m->lm_head, m->embedding,
-                   (size_t)vocab_size * hidden_size * sizeof(float));
-            printf("loader: no output.weight, using embedding (weight tying)\n");
+            /* Weight tying: convert embedding F32 → F16 for lm_head */
+            for(size_t i = 0; i < emb_n; i++) {
+                float v = m->embedding[i];
+                uint32_t u; memcpy(&u, &v, 4);
+                uint32_t sign = (u >> 16) & 0x8000;
+                int32_t exp = ((u >> 23) & 0xFF) - 127 + 15;
+                uint32_t mant = (u >> 13) & 0x03FF;
+                if(exp <= 0) m->lm_head_f16[i] = (uint16_t)sign;
+                else if(exp >= 31) m->lm_head_f16[i] = (uint16_t)(sign | 0x7C00);
+                else m->lm_head_f16[i] = (uint16_t)(sign | (exp << 10) | mant);
+            }
+            printf("loader: no output.weight, lm_head F16 from embedding (weight tying)\n");
         }
     }
 
