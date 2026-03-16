@@ -58,22 +58,40 @@
 
 #ifdef __ARM_NEON
 
-/* Decode 4 sequential codes from one byte into 4 uint32 mask values.
- * Returns mask_pos (1 where code==2) and mask_neg (1 where code==0)
- * as uint32x4 (all-ones or all-zeros per lane). */
-static inline void decode_byte_masks(uint8_t b,
-                                      uint32x4_t *mask_pos,
-                                      uint32x4_t *mask_neg) {
-    /* Extract 4 codes */
-    uint32_t c0 = (b >> 0) & 3;
-    uint32_t c1 = (b >> 2) & 3;
-    uint32_t c2 = (b >> 4) & 3;
-    uint32_t c3 = (b >> 6) & 3;
+/*============================================================================
+ * NEON batch decode: process 4 bytes (16 weights) per call.
+ *
+ * Input:  4 weight bytes from wrow
+ * Output: 4 float32x4 mask vectors for pos, 4 for neg
+ *
+ * Decodes all 16 codes using integer NEON:
+ *   1. Splat each byte to a uint32x4 (replicate across lanes)
+ *   2. Shift by [0,2,4,6] to align each code to bits[1:0]
+ *   3. Mask with 0x3 to isolate the 2-bit code
+ *   4. Compare: code==2 for +1 mask, code==0 for -1 mask
+ *============================================================================*/
 
-    /* Build code vector and compare */
-    uint32x4_t codes = {c0, c1, c2, c3};
-    *mask_pos = vceqq_u32(codes, vdupq_n_u32(2));  /* +1 weights */
-    *mask_neg = vceqq_u32(codes, vdupq_n_u32(0));  /* -1 weights */
+/* Shift constants: extract codes at bit positions 0,2,4,6 */
+static const int32_t SHIFTS[4] = {0, 2, 4, 6};
+
+static inline void decode_4bytes_masks(
+    const uint8_t *w,
+    uint32x4_t mp[4],   /* 4 pos masks, one per byte */
+    uint32x4_t mn[4])   /* 4 neg masks, one per byte */
+{
+    const uint32x4_t vshift = vld1q_u32((const uint32_t *)SHIFTS);
+    const uint32x4_t vmask  = vdupq_n_u32(3);
+    const uint32x4_t vtwo   = vdupq_n_u32(2);
+    const uint32x4_t vzero  = vdupq_n_u32(0);
+
+    for (int i = 0; i < 4; i++) {
+        /* Splat byte to all 4 lanes, shift by [0,2,4,6], mask */
+        uint32x4_t codes = vandq_u32(
+            vshlq_u32(vdupq_n_u32(w[i]), vnegq_s32(vreinterpretq_s32_u32(vshift))),
+            vmask);
+        mp[i] = vceqq_u32(codes, vtwo);   /* +1 mask */
+        mn[i] = vceqq_u32(codes, vzero);  /* -1 mask */
+    }
 }
 
 void hs_ml_ternary_neon_proj(float *out, const float *in,
@@ -82,55 +100,77 @@ void hs_ml_ternary_neon_proj(float *out, const float *in,
 
     for (uint32_t n = 0; n < N; n++) {
         const uint8_t *wrow = W + n * row_bytes;
-        float32x4_t pos_acc = vdupq_n_f32(0.0f);
-        float32x4_t neg_acc = vdupq_n_f32(0.0f);
 
-        /* Process 4 bytes (16 weights) per iteration */
-        uint32_t b4 = row_bytes & ~3u;
-        for (uint32_t bi = 0; bi < b4; bi += 4) {
-            /* Prefetch next cache line of weights */
+        /* Use 4 pos/neg accumulator pairs to reduce dependency chains */
+        float32x4_t pos0 = vdupq_n_f32(0.0f), neg0 = vdupq_n_f32(0.0f);
+        float32x4_t pos1 = vdupq_n_f32(0.0f), neg1 = vdupq_n_f32(0.0f);
+        float32x4_t pos2 = vdupq_n_f32(0.0f), neg2 = vdupq_n_f32(0.0f);
+        float32x4_t pos3 = vdupq_n_f32(0.0f), neg3 = vdupq_n_f32(0.0f);
+
+        /* Main loop: 16 bytes (64 weights) per iteration */
+        uint32_t b16 = row_bytes & ~15u;
+        for (uint32_t bi = 0; bi < b16; bi += 16) {
             __builtin_prefetch(wrow + bi + 64, 0, 3);
+            __builtin_prefetch(in + (bi + 16) * 4, 0, 3);
 
-            for (uint32_t j = 0; j < 4; j++) {
-                uint8_t b = wrow[bi + j];
-                uint32_t k_base = (bi + j) * 4;
+            /* Decode 4 groups of 4 bytes each */
+            for (uint32_t g = 0; g < 4; g++) {
+                uint32x4_t mp[4], mn[4];
+                decode_4bytes_masks(wrow + bi + g * 4, mp, mn);
 
-                uint32x4_t mp, mn;
-                decode_byte_masks(b, &mp, &mn);
+                uint32_t k_base = (bi + g * 4) * 4;
 
-                /* Load 4 activations */
-                float32x4_t act = vld1q_f32(in + k_base);
+                /* Load 4 × float32x4 activations and route */
+                float32x4_t a0 = vld1q_f32(in + k_base);
+                float32x4_t a1 = vld1q_f32(in + k_base + 4);
+                float32x4_t a2 = vld1q_f32(in + k_base + 8);
+                float32x4_t a3 = vld1q_f32(in + k_base + 12);
 
-                /* Masked accumulate: branchless ternary routing
-                 * pos_acc += act where weight == +1
-                 * neg_acc += act where weight == -1 */
-                pos_acc = vaddq_f32(pos_acc,
-                    vreinterpretq_f32_u32(vandq_u32(
-                        vreinterpretq_u32_f32(act), mp)));
-                neg_acc = vaddq_f32(neg_acc,
-                    vreinterpretq_f32_u32(vandq_u32(
-                        vreinterpretq_u32_f32(act), mn)));
+                /* Branchless masked accumulate */
+                pos0 = vaddq_f32(pos0, vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(a0), mp[0])));
+                neg0 = vaddq_f32(neg0, vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(a0), mn[0])));
+
+                pos1 = vaddq_f32(pos1, vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(a1), mp[1])));
+                neg1 = vaddq_f32(neg1, vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(a1), mn[1])));
+
+                pos2 = vaddq_f32(pos2, vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(a2), mp[2])));
+                neg2 = vaddq_f32(neg2, vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(a2), mn[2])));
+
+                pos3 = vaddq_f32(pos3, vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(a3), mp[3])));
+                neg3 = vaddq_f32(neg3, vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(a3), mn[3])));
             }
         }
 
-        /* Handle remaining bytes */
-        for (uint32_t bi = b4; bi < row_bytes; bi++) {
+        /* Remaining bytes (< 16) */
+        for (uint32_t bi = b16; bi < row_bytes; bi++) {
             uint8_t b = wrow[bi];
             uint32_t k_base = bi * 4;
-            uint32x4_t mp, mn;
-            decode_byte_masks(b, &mp, &mn);
+            uint32_t c0 = (b >> 0) & 3, c1 = (b >> 2) & 3;
+            uint32_t c2 = (b >> 4) & 3, c3 = (b >> 6) & 3;
+            uint32x4_t codes = {c0, c1, c2, c3};
+            uint32x4_t mp = vceqq_u32(codes, vdupq_n_u32(2));
+            uint32x4_t mn = vceqq_u32(codes, vdupq_n_u32(0));
             float32x4_t act = vld1q_f32(in + k_base);
-            pos_acc = vaddq_f32(pos_acc,
-                vreinterpretq_f32_u32(vandq_u32(
-                    vreinterpretq_u32_f32(act), mp)));
-            neg_acc = vaddq_f32(neg_acc,
-                vreinterpretq_f32_u32(vandq_u32(
-                    vreinterpretq_u32_f32(act), mn)));
+            pos0 = vaddq_f32(pos0, vreinterpretq_f32_u32(
+                vandq_u32(vreinterpretq_u32_f32(act), mp)));
+            neg0 = vaddq_f32(neg0, vreinterpretq_f32_u32(
+                vandq_u32(vreinterpretq_u32_f32(act), mn)));
         }
 
-        /* Final reduction: output = sum(pos) - sum(neg) */
-        float32x4_t diff = vsubq_f32(pos_acc, neg_acc);
-        out[n] = vaddvq_f32(diff);
+        /* Reduce: merge 4 accumulator pairs, then horizontal sum */
+        float32x4_t pos_sum = vaddq_f32(vaddq_f32(pos0, pos1),
+                                         vaddq_f32(pos2, pos3));
+        float32x4_t neg_sum = vaddq_f32(vaddq_f32(neg0, neg1),
+                                         vaddq_f32(neg2, neg3));
+        out[n] = vaddvq_f32(vsubq_f32(pos_sum, neg_sum));
     }
 }
 
