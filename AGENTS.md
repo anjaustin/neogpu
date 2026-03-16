@@ -26,6 +26,20 @@
 - Before changing cleanup rules, verify that patterns do not match source files.
 - If a cleanup pattern could match both binaries and source files, do not use it; replace it with an explicit list of generated outputs.
 
+## File Placement
+
+- Do not write test programs, scratch files, or one-off diagnostics to .
+- All test programs and diagnostic tools belong in  or  under the project root.
+- This keeps the working tree self-contained, version-trackable, and safe from OS eviction.
+- When writing a new test or probe to the Pi, SCP it directly into  or , compile in-tree, and add it to git if it is worth keeping.
+
+## File Placement
+
+- Do not write test programs, scratch files, or one-off diagnostics to /tmp/.
+- All test programs and diagnostic tools belong in tests/ or tools/ under the project root.
+- This keeps the working tree self-contained, version-trackable, and safe from OS eviction.
+- When writing a new test or probe to the Pi, place it in ~/001/neogpu/tests/ or tools/, compile in-tree, and add to git if it is worth keeping.
+
 ## Execution Discipline
 
 - Restore invariants before layering fixes on top of broken state.
