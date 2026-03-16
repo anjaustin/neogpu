@@ -393,6 +393,8 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
     /* Tokenizer vocab storage */
     char**   tok_vocab   = NULL;
     uint32_t tok_vocab_n = 0;
+    char**   tok_merges  = NULL;
+    uint32_t tok_merges_n = 0;
 
     for(uint64_t i = 0; i < kv_count; i++) {
         char* key = rd_string(f);
@@ -434,6 +436,20 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
                 char* tok = rd_string(f);
                 if(tok_vocab && j < tok_vocab_n) tok_vocab[j] = tok;
                 else free(tok);
+            }
+        }
+        else if(strcmp(key, "tokenizer.ggml.merges") == 0 && vtype == GGUF_TYPE_ARRAY) {
+            /* Load BPE merge rules */
+            uint32_t elem_type;
+            uint64_t arr_len;
+            rd_u32(f, &elem_type);
+            rd_u64(f, &arr_len);
+            tok_merges_n = (uint32_t)arr_len;
+            tok_merges = calloc(tok_merges_n, sizeof(char*));
+            for(uint64_t j = 0; j < arr_len; j++) {
+                char* mg = rd_string(f);
+                if(tok_merges && j < tok_merges_n) tok_merges[j] = mg;
+                else free(mg);
             }
         }
 #undef HAS_SUFFIX
@@ -496,9 +512,11 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
     m->use_i2s         = false;  /* set true below when I2_S tensors found */
     m->tokenizer_bos   = tokenizer_bos;
     m->tokenizer_eos   = tokenizer_eos;
-    m->tokenizer_vocab = tok_vocab;
-    m->num_merges      = 0;
-    tok_vocab          = NULL;  /* model owns it now */
+    m->tokenizer_vocab  = tok_vocab;
+    m->tokenizer_merges = tok_merges;
+    m->num_merges       = tok_merges_n;
+    tok_vocab           = NULL;  /* model owns it now */
+    tok_merges          = NULL;
 
     /* Non-quantized weights */
     m->embedding  = malloc((size_t)vocab_size * hidden_size * sizeof(float));
@@ -687,6 +705,10 @@ fail:
     if(tok_vocab) {
         for(uint32_t i = 0; i < tok_vocab_n; i++) free(tok_vocab[i]);
         free(tok_vocab);
+    }
+    if(tok_merges) {
+        for(uint32_t i = 0; i < tok_merges_n; i++) free(tok_merges[i]);
+        free(tok_merges);
     }
     fclose(f);
     hs_mlt_free(m);

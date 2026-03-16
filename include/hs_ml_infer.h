@@ -104,8 +104,19 @@ typedef struct {
     u32     tokenizer_bos;      /* BOS token ID */
     u32     tokenizer_eos;      /* EOS token ID */
 
+    /* BPE merge rank lookup (built from tokenizer_merges on first use) */
+    u32*    merge_ranks;        /* hash table: merge pair → rank */
+    u32     merge_hash_size;
+
     bool loaded;
 } HSMLTernary;
+
+/*
+ * BPE tokenizer encode (uses tokenizer_vocab + tokenizer_merges).
+ * Returns number of tokens written to output.
+ */
+u32 hs_mlt_bpe_encode(HSMLTernary* m, const char* text, u32 text_len,
+                      u32* output, u32 max_tokens);
 
 /*============================================================================
  * Lifecycle

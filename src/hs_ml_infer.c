@@ -517,30 +517,14 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
                 scores[t] = s;
                 if (s > max_s) max_s = s;
             }
-            /* Online softmax */
+            /* Online softmax — use precise expf, not fast approximation.
+             * The Schraudolph fast_expq_f32 only has ~3 bits of mantissa
+             * which corrupts attention weights when scores are close. */
             float sum = 0.0f;
-#ifdef __ARM_NEON
-            /* Vectorised exp for blocks of 4 */
-            u32 ctx4 = ctx & ~3u;
-            float32x4_t vmax = vdupq_n_f32(max_s);
-            float32x4_t vsum = vdupq_n_f32(0.0f);
-            for (u32 t = 0; t < ctx4; t += 4) {
-                float32x4_t vs = vsubq_f32(vld1q_f32(scores+t), vmax);
-                float32x4_t ve = fast_expq_f32(vs);
-                vst1q_f32(scores+t, ve);
-                vsum = vaddq_f32(vsum, ve);
-            }
-            sum = vaddvq_f32(vsum);
-            for (u32 t = ctx4; t < ctx; t++) {
-                scores[t] = expf(scores[t] - max_s);
-                sum += scores[t];
-            }
-#else
             for (u32 t = 0; t < ctx; t++) {
                 scores[t] = expf(scores[t] - max_s);
                 sum += scores[t];
             }
-#endif
             float inv_sum = 1.0f / sum;
             /* Weighted sum: NEON axpy */
             for (u32 t = 0; t < ctx; t++) {
@@ -687,6 +671,189 @@ u32 hs_mlt_sample_greedy(const float* logits, u32 vocab_size) {
         if (logits[i] > best_val) { best_val = logits[i]; best = i; }
     }
     return best;
+}
+
+/*============================================================================
+ * BPE Tokenizer
+ *
+ * GPT-2 / Llama 3 byte-level BPE.
+ * Uses the merge rules from tokenizer.ggml.merges in the GGUF.
+ *============================================================================*/
+
+/* Hash a merge pair string "A B" to look up rank */
+static u32 bpe_hash(const char* s, u32 len, u32 mask) {
+    u32 h = 5381;
+    for (u32 i = 0; i < len; i++) h = ((h << 5) + h) ^ (u8)s[i];
+    return h & mask;
+}
+
+/* Build merge rank hash table (lazy, called once) */
+static void bpe_build_ranks(HSMLTernary* m) {
+    if (m->merge_ranks || !m->tokenizer_merges || m->num_merges == 0) return;
+    
+    /* Size hash table at 2x entries */
+    u32 sz = 1;
+    while (sz < m->num_merges * 2) sz *= 2;
+    m->merge_hash_size = sz;
+    m->merge_ranks = calloc(sz * 2, sizeof(u32));  /* pairs: [hash_key_idx, rank+1] */
+    if (!m->merge_ranks) return;
+    
+    for (u32 i = 0; i < m->num_merges; i++) {
+        const char* mg = m->tokenizer_merges[i];
+        u32 len = 0;
+        while (mg[len]) len++;
+        u32 h = bpe_hash(mg, len, sz - 1);
+        /* Open addressing */
+        while (m->merge_ranks[h * 2 + 1] != 0) h = (h + 1) & (sz - 1);
+        m->merge_ranks[h * 2]     = i;       /* index into merges array */
+        m->merge_ranks[h * 2 + 1] = i + 1;   /* rank (1-based, 0 = empty) */
+    }
+}
+
+/* Look up merge rank for pair "left right". Returns rank (0-based) or UINT32_MAX if not found. */
+static u32 bpe_rank(HSMLTernary* m, const char* left, u32 llen, const char* right, u32 rlen) {
+    if (!m->merge_ranks) return (u32)-1;
+    
+    /* Build "left right" string */
+    char buf[256];
+    if (llen + 1 + rlen >= sizeof(buf)) return (u32)-1;
+    memcpy(buf, left, llen);
+    buf[llen] = ' ';
+    memcpy(buf + llen + 1, right, rlen);
+    u32 total = llen + 1 + rlen;
+    
+    u32 mask = m->merge_hash_size - 1;
+    u32 h = bpe_hash(buf, total, mask);
+    for (u32 probe = 0; probe < m->merge_hash_size; probe++) {
+        u32 idx = (h + probe) & mask;
+        u32 rank1 = m->merge_ranks[idx * 2 + 1];
+        if (rank1 == 0) return (u32)-1;  /* empty slot */
+        u32 mi = m->merge_ranks[idx * 2];
+        const char* mg = m->tokenizer_merges[mi];
+        /* Compare */
+        u32 mlen = 0;
+        while (mg[mlen]) mlen++;
+        if (mlen == total && memcmp(mg, buf, total) == 0)
+            return mi;  /* rank = merge index (lower = higher priority) */
+    }
+    return (u32)-1;
+}
+
+/* Find vocab ID for a token string. Returns vocab_size if not found. */
+static u32 bpe_find_token(HSMLTernary* m, const char* s, u32 len) {
+    for (u32 i = 0; i < m->vocab_size; i++) {
+        const char* v = m->tokenizer_vocab[i];
+        u32 vl = 0;
+        while (v[vl]) vl++;
+        if (vl == len && memcmp(v, s, len) == 0) return i;
+    }
+    return m->vocab_size;
+}
+
+/* Encode text with BPE merges. */
+u32 hs_mlt_bpe_encode(HSMLTernary* m, const char* text, u32 text_len,
+                      u32* output, u32 max_tokens) {
+    if (!m || !text || !output || !m->tokenizer_vocab || !m->tokenizer_merges)
+        return 0;
+    
+    bpe_build_ranks(m);
+    
+    u32 n_out = 0;
+    u32 pos = 0;
+    
+    while (pos < text_len && n_out < max_tokens) {
+        /* Pre-tokenize: find next word boundary.
+         * GPT-2 BPE: spaces become Ġ prefix on the FOLLOWING token.
+         * Collect chars until next space boundary. */
+        
+        /* Collect one "word" (space + letters or just punctuation) */
+        char word[512];
+        u32 wlen = 0;
+        
+        /* If at a space, add Ġ prefix and consume space */
+        if (pos < text_len && text[pos] == ' ') {
+            word[wlen++] = (char)0xC4;  /* Ġ = UTF-8 0xC4 0xA0 */
+            word[wlen++] = (char)0xA0;
+            pos++;
+        }
+        
+        /* Consume non-space characters until next space or end */
+        while (pos < text_len && text[pos] != ' ' && wlen < sizeof(word) - 4) {
+            word[wlen++] = text[pos++];
+        }
+        
+        if (wlen == 0) continue;
+        
+        /* Initialize token list: each UTF-8 character is one token.
+         * We store them as (start_offset, length) pairs within 'word'. */
+        u32 tok_start[256], tok_len[256];
+        u32 ntok = 0;
+        
+        for (u32 i = 0; i < wlen && ntok < 256; ) {
+            tok_start[ntok] = i;
+            /* Determine UTF-8 char length */
+            u8 c = (u8)word[i];
+            u32 clen = 1;
+            if (c >= 0xC0 && c < 0xE0) clen = 2;
+            else if (c >= 0xE0 && c < 0xF0) clen = 3;
+            else if (c >= 0xF0) clen = 4;
+            if (i + clen > wlen) clen = wlen - i;
+            tok_len[ntok] = clen;
+            ntok++;
+            i += clen;
+        }
+        
+        /* BPE merge loop */
+        while (ntok > 1) {
+            /* Find the pair with the lowest merge rank */
+            u32 best_rank = (u32)-1;
+            u32 best_idx = 0;
+            
+            for (u32 i = 0; i + 1 < ntok; i++) {
+                u32 r = bpe_rank(m,
+                                 word + tok_start[i], tok_len[i],
+                                 word + tok_start[i+1], tok_len[i+1]);
+                if (r < best_rank) {
+                    best_rank = r;
+                    best_idx = i;
+                }
+            }
+            
+            if (best_rank == (u32)-1) break;  /* no more merges */
+            
+            /* Merge: combine tokens at best_idx and best_idx+1 */
+            tok_len[best_idx] = tok_len[best_idx] + tok_len[best_idx + 1];
+            /* Shift remaining tokens left */
+            for (u32 i = best_idx + 1; i + 1 < ntok; i++) {
+                tok_start[i] = tok_start[i + 1];
+                tok_len[i] = tok_len[i + 1];
+            }
+            ntok--;
+        }
+        
+        /* Map each merged token to vocab ID */
+        for (u32 i = 0; i < ntok && n_out < max_tokens; i++) {
+            u32 id = bpe_find_token(m, word + tok_start[i], tok_len[i]);
+            if (id < m->vocab_size)
+                output[n_out++] = id;
+            else {
+                /* Unknown token — encode as individual bytes */
+                for (u32 b = 0; b < tok_len[i] && n_out < max_tokens; b++) {
+                    u8 byte_val = (u8)word[tok_start[i] + b];
+                    /* Byte tokens in Llama 3: token IDs for bytes 0x00-0xFF
+                     * are typically at specific positions in the vocab.
+                     * For now, try the byte value directly or search. */
+                    char byte_str[4];
+                    byte_str[0] = (char)byte_val;
+                    byte_str[1] = '\0';
+                    u32 bid = bpe_find_token(m, byte_str, 1);
+                    if (bid < m->vocab_size) output[n_out++] = bid;
+                }
+            }
+        }
+    }
+    
+    return n_out;
 }
 
 void hs_mlt_reset_stats(HSMLTernary* m) {

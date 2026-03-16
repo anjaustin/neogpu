@@ -208,55 +208,65 @@ int main(int argc, char **argv) {
         fprintf(stderr, "tokenizer vocab not loaded from GGUF\n");
         return 2;
     }
-
-    GPT2ByteMap map;
-    gpt2_bytemap_init(&map);
-    char *xform = gpt2_transform_input(prompt, &map);
-    if (!xform) return 3;
-
-    HSTokenizer tok;
-    hs_tokenizer_init(&tok, m.tokenizer_vocab, m.vocab_size, 0, m.tokenizer_bos, m.tokenizer_eos, 0);
+    if (!m.tokenizer_merges || m.num_merges == 0) {
+        fprintf(stderr, "warning: no BPE merges loaded, tokenization may be wrong\n");
+    }
 
     u32 *tokens = malloc((4096 + n_predict) * sizeof(u32));
     float *logits = malloc(m.vocab_size * sizeof(float));
-    char *decoded = malloc(1 << 20);
-    if (!tokens || !logits || !decoded) return 4;
+    if (!tokens || !logits) return 4;
 
+    /* BPE encode prompt */
     u32 n = 0;
-    if (m.tokenizer_bos) tokens[n++] = m.tokenizer_bos;
-    n += hs_tokenizer_encode(&tok, xform, (u32)strlen(xform), tokens + n, 4096 - n);
+    tokens[n++] = m.tokenizer_bos;  /* BOS = 128000 */
+    n += hs_mlt_bpe_encode(&m, prompt, (u32)strlen(prompt), tokens + n, 4096 - n);
 
     printf("prompt: %s\n", prompt);
     printf("encoded_tokens=%u\n", n);
+    printf("token_ids:");
+    for (u32 i = 0; i < n; i++) printf(" %u", tokens[i]);
+    printf("\n");
 
     HSMLTernarySession s;
     if (hs_mlt_session_init(&s, &m) != 0) return 5;
     if (hs_mlt_prefill(&s, tokens, n) != 0) return 6;
 
+    /* Get logits after prefill */
+    if (hs_mlt_session_logits(&s, logits) != 0) return 7;
+
+    /* Decode loop */
     u32 total = n;
-    u32 tok_id = m.tokenizer_eos ? m.tokenizer_eos : tokens[n - 1];
     srand(42);
+    printf("\nresponse:\n");
     for (int i = 0; i < n_predict; i++) {
-        if (hs_mlt_decode(&s, tok_id, logits) != 0) break;
-        tok_id = sample_with_controls(logits, m.vocab_size, tokens, total, temp, top_k, top_p, rep_penalty);
+        u32 tok_id = sample_with_controls(logits, m.vocab_size,
+                                          tokens, total, temp, top_k, top_p, rep_penalty);
         tokens[total++] = tok_id;
         if (tok_id == m.tokenizer_eos) break;
+
+        /* Print token (decode Ġ back to space) */
+        if (tok_id < m.vocab_size && m.tokenizer_vocab[tok_id]) {
+            const char *s_tok = m.tokenizer_vocab[tok_id];
+            while (*s_tok) {
+                if ((u8)s_tok[0] == 0xC4 && (u8)s_tok[1] == 0xA0) {
+                    putchar(' ');
+                    s_tok += 2;
+                } else {
+                    putchar(*s_tok++);
+                }
+            }
+        }
+        fflush(stdout);
+
+        /* Run decode step for next token */
+        if (hs_mlt_decode(&s, tok_id, logits) != 0) break;
     }
 
-    u32 out_len = hs_tokenizer_decode(&tok, tokens + n, total - n, decoded, 1 << 20);
-    decoded[out_len] = '\0';
-    char *final = gpt2_inverse_output(decoded, &map);
-
-    printf("\nresponse:\n%s\n", final ? final : decoded);
-    printf("\nmeta: temp=%.4f top_k=%u top_p=%.4f rep_penalty=%.4f generated=%u\n",
+    printf("\n\nmeta: temp=%.4f top_k=%u top_p=%.4f rep_penalty=%.4f generated=%u\n",
            temp, top_k, top_p, rep_penalty, total - n);
 
-    free(final);
-    free(decoded);
     free(logits);
     free(tokens);
-    free(xform);
-    hs_tokenizer_free(&tok);
     hs_mlt_session_free(&s);
     hs_mlt_free(&m);
     return 0;
