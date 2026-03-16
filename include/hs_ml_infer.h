@@ -77,8 +77,26 @@ typedef struct {
 
     /* Non-quantized weights */
     float* embedding;      /* [vocab, hidden] float32 (for embedding lookup) */
-    u16*   lm_head_f16;    /* [vocab, hidden] float16 (for logit computation) */
+    u16*   lm_head_f16;    /* [vocab, hidden] float16 — freed after trit encode if use_trit_lmhead */
     float* final_norm;     /* [hidden] float32 */
+
+    /* Ternary spline lm_head (two-stage, replaces scalar F16 loop when use_trit_lmhead=true)
+     *
+     * Encoding: for each vocab row v, row_scale[v] = max(|emb[v,:]|).
+     * 8 I2_S planes encode the row as a balanced ternary residual series:
+     *   plane[0] = round(clip(row/scale,      -1,+1))        weight 1
+     *   plane[1] = round(clip(residual*3,     -1,+1))        weight 1/3
+     *   ...
+     *   plane[k] = round(clip(residual*3^k,   -1,+1))        weight (1/3)^k
+     *
+     * Inference:
+     *   Stage 1: accumulate planes 0..3 over all V rows   -> coarse logits
+     *   Stage 2: accumulate planes 4..7 over top-C rows   -> residual refinement
+     *   Final:   logit[v] = row_scale[v] * (coarse[v] + residual[v])
+     */
+    bool   use_trit_lmhead;           /* true after hs_mlt_lmhead_encode() */
+    u8*    lm_head_planes[8];         /* [vocab * hidden/4] each, I2_S packed */
+    u16*   lm_head_row_scale;         /* [vocab] F16 per-row scale */
 
     /* Per-layer ternary weights */
     HSTernaryLayer* layers; /* [num_layers] */
@@ -145,6 +163,35 @@ int hs_mlt_alloc_random(HSMLTernary* m,
 int hs_mlt_load_gguf(HSMLTernary* m, const char* path);
 
 /*
+ * Fused 4-plane lm_head Stage 1 kernel (NEON + pthreads), float input.
+ * out[n] = row_scale[n] * sum_{k=0..3} (1/3)^k * dot(in, Pk[n])
+ */
+void hs_ml_lmhead_stage1(float *out, const float *in,
+                          const u8 *P0, const u8 *P1,
+                          const u8 *P2, const u8 *P3,
+                          const u16 *row_scale,
+                          u32 N, u32 K);
+
+/*
+ * Fused 4-plane lm_head Stage 1 kernel — int8 activation path (fastest).
+ * Pre-quantize hidden to int8 (act_scale = 127/max(|h|)), then call this.
+ * Uses vmull_s8 integer multiply — 3.4× faster than F16 baseline.
+ * out[n] = (1/act_scale) * row_scale[n] * sum_{k=0..3} (1/3)^k * dot_i8(in_i8, Pk[n])
+ */
+void hs_ml_lmhead_stage1_i8(float *out, const int8_t *in_i8, float act_scale,
+                              const u8 *P0, const u8 *P1,
+                              const u8 *P2, const u8 *P3,
+                              const u16 *row_scale,
+                              u32 N, u32 K);
+
+/*
+ * Encode lm_head F16 weights into 8 ternary spline planes.
+ * Called once after hs_mlt_load_gguf(). Frees lm_head_f16 on success.
+ * Sets m->use_trit_lmhead = true.
+ */
+int hs_mlt_lmhead_encode(HSMLTernary* m);
+
+/*
  * Load BF16 norm weights from sidecar binary.
  * Overwrites layer norms and final_norm loaded from GGUF.
  * Format: magic(u32) + n_tensors(u32) + [name_len(u32) + name + n_values(u32) + bf16_data]*
@@ -189,12 +236,25 @@ u32 hs_mlt_sample_greedy(const float* logits, u32 vocab_size);
  * Stateful decode session
  *============================================================================*/
 
+/* Candidate set size for two-stage lm_head.
+ * Stage 1 nominates this many rows; Stage 2 refines them.
+ * 200 gives 100% top-42 recall on measured data with a safety margin. */
+#define LMH_CANDIDATES 200
+
 typedef struct {
     HSMLTernary*  model;
     float*        hidden;    /* [hidden_size] current hidden state */
     HSKVCache*    caches;    /* [num_layers] KV caches */
     u32           seq_len;
     bool          ready;
+
+    /* Scratch for two-stage ternary spline lm_head (allocated in session_init) */
+    float*   lmh_coarse;      /* [vocab_size] coarse logit accumulator (Stage 1) */
+    float*   lmh_tmp;         /* [vocab_size] single-plane projection scratch     */
+    u32*     lmh_candidates;  /* [LMH_CANDIDATES] top-C vocab indices             */
+    u8*      lmh_plane_buf;   /* [LMH_CANDIDATES * hidden/4] Stage 2 row copy buf */
+    float*   lmh_tmp_c;       /* [LMH_CANDIDATES] Stage 2 projection scratch      */
+    int8_t*  lmh_in_i8;       /* [hidden_size] int8 quantized normed hidden       */
 } HSMLTernarySession;
 
 int  hs_mlt_session_init(HSMLTernarySession* sess, HSMLTernary* model);

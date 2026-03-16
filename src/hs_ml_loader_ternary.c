@@ -869,3 +869,137 @@ int hs_mlt_load_norms_sidecar(HSMLTernary* m, const char* path) {
     }
     return (loaded > 0) ? 0 : -1;
 }
+
+/*============================================================================
+ * hs_mlt_lmhead_encode — Ternary Spline LM Head Encoder
+ *
+ * Converts m->lm_head_f16 [V x H] into 8 I2_S ternary planes plus a
+ * per-row F16 scale vector.  After encoding, lm_head_f16 is freed and
+ * m->use_trit_lmhead is set to true.
+ *
+ * Encoding (per row v):
+ *   scale    = max(|row|)
+ *   remainder = row / scale          (float, in [-1, +1])
+ *   For k = 0..7:
+ *     plane[k][v] = I2_S_encode( round(clip(remainder, -1, +1)) )
+ *     remainder   = remainder - decode(plane[k][v])
+ *     remainder  *= 3                (magnify residual for next plane)
+ *
+ * I2_S packing: 4 ternary values per byte.
+ *   Code 0 → -1,  code 1 → 0,  code 2 → +1
+ *   byte = (c0 & 3) | ((c1 & 3) << 2) | ((c2 & 3) << 4) | ((c3 & 3) << 6)
+ *============================================================================*/
+
+/* Inline F16 helpers (duplicated from hs_ml_infer.c to avoid header exposure) */
+static inline float ldr_fp16_to_f32(u16 h) {
+    u32 sign = ((u32)h & 0x8000u) << 16;
+    u32 exp  = (h >> 10) & 0x1Fu;
+    u32 mant = h & 0x03FFu;
+    u32 f;
+    if (exp == 0)        f = sign;
+    else if (exp == 31)  f = sign | 0x7F800000u | (mant << 13);
+    else                 f = sign | ((exp + 112u) << 23) | (mant << 13);
+    float out; memcpy(&out, &f, 4); return out;
+}
+
+static inline u16 ldr_f32_to_fp16(float v) {
+    u32 u; memcpy(&u, &v, 4);
+    u32 sign = (u >> 16) & 0x8000u;
+    int  exp  = (int)((u >> 23) & 0xFFu) - 127 + 15;
+    u32 mant = (u >> 13) & 0x03FFu;
+    if (exp <= 0)  return (u16)sign;
+    if (exp >= 31) return (u16)(sign | 0x7C00u);
+    return (u16)(sign | ((u32)exp << 10) | mant);
+}
+
+int hs_mlt_lmhead_encode(HSMLTernary* m) {
+    if (!m || !m->loaded || !m->lm_head_f16) return -1;
+    if (m->use_trit_lmhead) return 0;  /* already encoded */
+
+    u32 V = m->vocab_size;
+    u32 H = m->hidden_size;
+    u32 row_bytes = H / 4;            /* I2_S bytes per row */
+    size_t plane_size = (size_t)V * row_bytes;
+
+    /* Allocate 8 planes and the row scale array */
+    for (int k = 0; k < 8; k++) {
+        m->lm_head_planes[k] = malloc(plane_size);
+        if (!m->lm_head_planes[k]) {
+            for (int j = 0; j < k; j++) { free(m->lm_head_planes[j]); m->lm_head_planes[j] = NULL; }
+            fprintf(stderr, "lmhead_encode: OOM allocating plane %d\n", k);
+            return -1;
+        }
+    }
+    m->lm_head_row_scale = malloc((size_t)V * sizeof(u16));
+    if (!m->lm_head_row_scale) {
+        for (int k = 0; k < 8; k++) { free(m->lm_head_planes[k]); m->lm_head_planes[k] = NULL; }
+        fprintf(stderr, "lmhead_encode: OOM allocating row_scale\n");
+        return -1;
+    }
+
+    /* Working buffer: one row of floats */
+    float* row_f = malloc(H * sizeof(float));
+    if (!row_f) {
+        for (int k = 0; k < 8; k++) { free(m->lm_head_planes[k]); m->lm_head_planes[k] = NULL; }
+        free(m->lm_head_row_scale);
+        return -1;
+    }
+
+    printf("lmhead_encode: encoding %u rows x %u dims into 8 trit planes...\n", V, H);
+
+    for (u32 v = 0; v < V; v++) {
+        const u16* src = m->lm_head_f16 + (size_t)v * H;
+
+        /* Convert F16 row to F32 and find row scale */
+        float scale = 0.0f;
+        for (u32 h = 0; h < H; h++) {
+            row_f[h] = ldr_fp16_to_f32(src[h]);
+            float av = row_f[h] < 0.0f ? -row_f[h] : row_f[h];
+            if (av > scale) scale = av;
+        }
+        if (scale == 0.0f) scale = 1.0f;
+        m->lm_head_row_scale[v] = ldr_f32_to_fp16(scale);
+
+        /* Normalise to [-1, +1] */
+        float inv_scale = 1.0f / scale;
+        for (u32 h = 0; h < H; h++) row_f[h] *= inv_scale;
+
+        /* Encode 8 planes */
+        for (int k = 0; k < 8; k++) {
+            u8* plane_row = m->lm_head_planes[k] + (size_t)v * row_bytes;
+
+            /* Pack 4 ternary codes per byte */
+            for (u32 bi = 0; bi < row_bytes; bi++) {
+                u8 byte = 0;
+                for (int s = 0; s < 4; s++) {
+                    u32 hi = bi * 4 + s;
+                    float r = row_f[hi];
+                    /* Clip and round to {-1, 0, +1} */
+                    int8_t t;
+                    if      (r >  0.5f) t =  1;
+                    else if (r < -0.5f) t = -1;
+                    else                t =  0;
+                    /* I2_S code: -1→0, 0→1, +1→2 */
+                    u8 code = (u8)(t + 1);
+                    byte |= (code & 3u) << (s * 2);
+                    /* Subtract trit, magnify residual for next plane */
+                    row_f[hi] = (row_f[hi] - (float)t) * 3.0f;
+                }
+                plane_row[bi] = byte;
+            }
+        }
+
+        if (v % 16384 == 0)
+            printf("lmhead_encode:   %u/%u rows\n", v, V);
+    }
+
+    free(row_f);
+
+    /* Free the F16 lm_head — planes replace it */
+    free(m->lm_head_f16);
+    m->lm_head_f16 = NULL;
+    m->use_trit_lmhead = true;
+
+    printf("lmhead_encode: done. 8 planes encoded, lm_head_f16 freed.\n");
+    return 0;
+}

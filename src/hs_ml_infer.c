@@ -66,6 +66,8 @@ void hs_mlt_free(HSMLTernary* m) {
     free(m->embedding);
     free(m->lm_head_f16);
     free(m->final_norm);
+    for (int k = 0; k < 8; k++) { free(m->lm_head_planes[k]); m->lm_head_planes[k] = NULL; }
+    free(m->lm_head_row_scale);
 
     if (m->tokenizer_vocab) {
         for (u32 i = 0; i < m->vocab_size; i++) free(m->tokenizer_vocab[i]);
@@ -914,6 +916,26 @@ int hs_mlt_session_init(HSMLTernarySession* sess, HSMLTernary* model) {
                          model->head_dim);
     }
 
+    /* Allocate two-stage lm_head scratch if model uses trit lm_head */
+    if (model->use_trit_lmhead) {
+        u32 V  = model->vocab_size;
+        u32 H  = model->hidden_size;
+        sess->lmh_coarse     = malloc(V * sizeof(float));
+        sess->lmh_tmp        = malloc(V * sizeof(float));
+        sess->lmh_candidates = malloc(LMH_CANDIDATES * sizeof(u32));
+        sess->lmh_plane_buf  = malloc((size_t)LMH_CANDIDATES * (H / 4));
+        sess->lmh_tmp_c      = malloc(LMH_CANDIDATES * sizeof(float));
+        sess->lmh_in_i8      = malloc(H * sizeof(int8_t));
+        if (!sess->lmh_coarse || !sess->lmh_tmp || !sess->lmh_candidates ||
+            !sess->lmh_plane_buf || !sess->lmh_tmp_c || !sess->lmh_in_i8) {
+            free(sess->hidden); free(sess->caches);
+            free(sess->lmh_coarse); free(sess->lmh_tmp);
+            free(sess->lmh_candidates); free(sess->lmh_plane_buf);
+            free(sess->lmh_tmp_c); free(sess->lmh_in_i8);
+            return -1;
+        }
+    }
+
     sess->seq_len = 0;
     sess->ready   = true;
     return 0;
@@ -922,6 +944,12 @@ int hs_mlt_session_init(HSMLTernarySession* sess, HSMLTernary* model) {
 void hs_mlt_session_free(HSMLTernarySession* sess) {
     if (!sess) return;
     free(sess->hidden);
+    free(sess->lmh_coarse);
+    free(sess->lmh_tmp);
+    free(sess->lmh_candidates);
+    free(sess->lmh_plane_buf);
+    free(sess->lmh_tmp_c);
+    free(sess->lmh_in_i8);
     if (sess->caches && sess->model) {
         for (u32 l = 0; l < sess->model->num_layers; l++)
             hs_kv_cache_free(&sess->caches[l]);
@@ -959,9 +987,147 @@ static void session_step(HSMLTernarySession* sess, u32 token) {
     sess->seq_len++;
 }
 
+/* ============================================================
+ * Two-stage ternary spline lm_head
+ *
+ * Stage 1: accumulate planes 0..3 over all V rows → coarse logits.
+ *          Plane weights: 1, 1/3, 1/9, 1/27.
+ *          Apply F16 row_scale. Partial-sort → top-LMH_CANDIDATES indices.
+ *
+ * Stage 2: accumulate planes 4..7 over top-C rows only → residual.
+ *          Plane weights: 1/81, 1/243, 1/729, 1/2187.
+ *          Add residual (already scaled) to coarse.
+ *
+ * Final logit[v] = coarse[v]  for all v  (row_scale already applied in stage 1).
+ * logits[] is filled with -1e30 for non-candidates, exact value for top-C.
+ * ============================================================ */
+
+extern void hs_ml_ternary_f32_proj(float* out, const float* in,
+                                    const u8* W, u32 N, u32 K);
+extern void hs_ml_lmhead_stage1(float* out, const float* in,
+                                 const u8* P0, const u8* P1,
+                                 const u8* P2, const u8* P3,
+                                 const u16* row_scale,
+                                 u32 N, u32 K);
+extern void hs_ml_lmhead_stage1_i8(float* out, const int8_t* in_i8, float act_scale,
+                                    const u8* P0, const u8* P1,
+                                    const u8* P2, const u8* P3,
+                                    const u16* row_scale,
+                                    u32 N, u32 K);
+
+static const float lmh_plane_w[8] = {
+    1.0f,
+    1.0f/3.0f,
+    1.0f/9.0f,
+    1.0f/27.0f,
+    1.0f/81.0f,
+    1.0f/243.0f,
+    1.0f/729.0f,
+    1.0f/2187.0f
+};
+
+/* Partial sort: write indices of top-C largest values in src[0..N) into out[].
+ * Simple selection for C=200 over 128K floats: O(N*C/block) — fast enough. */
+static void partial_top_c(const float* src, u32 N, u32* out, u32 C) {
+    /* Use a min-heap of size C */
+    float heap_val[LMH_CANDIDATES];
+    u32   heap_idx[LMH_CANDIDATES];
+    u32   heap_sz = 0;
+
+    for (u32 i = 0; i < N; i++) {
+        if (heap_sz < C) {
+            heap_val[heap_sz] = src[i];
+            heap_idx[heap_sz] = i;
+            heap_sz++;
+            if (heap_sz == C) {
+                /* Build min-heap */
+                for (int j = (int)(C/2) - 1; j >= 0; j--) {
+                    u32 p = (u32)j;
+                    while (1) {
+                        u32 l = 2*p+1, r = 2*p+2, m = p;
+                        if (l < C && heap_val[l] < heap_val[m]) m = l;
+                        if (r < C && heap_val[r] < heap_val[m]) m = r;
+                        if (m == p) break;
+                        float tv = heap_val[p]; heap_val[p] = heap_val[m]; heap_val[m] = tv;
+                        u32   ti = heap_idx[p]; heap_idx[p] = heap_idx[m]; heap_idx[m] = ti;
+                        p = m;
+                    }
+                }
+            }
+        } else if (src[i] > heap_val[0]) {
+            heap_val[0] = src[i];
+            heap_idx[0] = i;
+            /* Sift down */
+            u32 p = 0;
+            while (1) {
+                u32 l = 2*p+1, r = 2*p+2, m = p;
+                if (l < C && heap_val[l] < heap_val[m]) m = l;
+                if (r < C && heap_val[r] < heap_val[m]) m = r;
+                if (m == p) break;
+                float tv = heap_val[p]; heap_val[p] = heap_val[m]; heap_val[m] = tv;
+                u32   ti = heap_idx[p]; heap_idx[p] = heap_idx[m]; heap_idx[m] = ti;
+                p = m;
+            }
+        }
+    }
+    for (u32 i = 0; i < heap_sz; i++) out[i] = heap_idx[i];
+}
+
+static void session_logits_trit(HSMLTernarySession* sess, float* logits) {
+    HSMLTernary* m  = sess->model;
+    u32 H = m->hidden_size;
+    u32 V = m->vocab_size;
+    u32 C = LMH_CANDIDATES;
+    u32 row_bytes = H / 4;
+
+    float* normed    = m->hidden_buf;
+    float* coarse    = sess->lmh_coarse;
+    float* tmp       = sess->lmh_tmp;
+    u32*   cands     = sess->lmh_candidates;
+    u8*    plane_buf = sess->lmh_plane_buf;
+    float* tmp_c     = sess->lmh_tmp_c;
+
+    rmsnorm(normed, sess->hidden, m->final_norm, 1e-5f, H);
+
+    /* Stage 1: fused 4-plane LUT kernel — pure ternary float32, no quantization */
+    hs_ml_lmhead_stage1(coarse, normed,
+                        m->lm_head_planes[0], m->lm_head_planes[1],
+                        m->lm_head_planes[2], m->lm_head_planes[3],
+                        m->lm_head_row_scale, V, H);
+
+    /* Identify top-C candidates */
+    partial_top_c(coarse, V, cands, C);
+
+    /* Stage 2: planes 4..7, top-C rows only */
+    for (int k = 4; k < 8; k++) {
+        /* Copy C rows into contiguous buffer */
+        for (u32 i = 0; i < C; i++)
+            memcpy(plane_buf + (size_t)i * row_bytes,
+                   m->lm_head_planes[k] + (size_t)cands[i] * row_bytes,
+                   row_bytes);
+        hs_ml_ternary_f32_proj(tmp_c, normed, plane_buf, C, H);
+        float w = lmh_plane_w[k];
+        for (u32 i = 0; i < C; i++)
+            /* row_scale already applied to coarse[] by stage1; apply here too
+             * since stage2 adds raw ternary dot products (no scale yet) */
+            coarse[cands[i]] += tmp_c[i] * w * fp16_to_f32_inline(m->lm_head_row_scale[cands[i]]);
+    }
+
+    /* Fill output logits: -1e30 for non-candidates, exact for candidates */
+    for (u32 v = 0; v < V; v++) logits[v] = -1e30f;
+    for (u32 i = 0; i < C; i++) logits[cands[i]] = coarse[cands[i]];
+}
+
 /* Write logits from current hidden state. */
 static void session_logits(HSMLTernarySession* sess, float* logits) {
     HSMLTernary* m = sess->model;
+
+    /* Dispatch to two-stage ternary spline path if available */
+    if (m->use_trit_lmhead) {
+        session_logits_trit(sess, logits);
+        return;
+    }
+
     u32 H = m->hidden_size;
     u32 V = m->vocab_size;
     float* normed = m->hidden_buf;  /* borrow model scratch — safe, not in use */
@@ -979,31 +1145,21 @@ static void session_logits(HSMLTernarySession* sess, float* logits) {
         float32x4_t acc1 = vdupq_n_f32(0.0f);
 
         for (u32 i = 0; i < H8; i += 8) {
-            /* Load 8 F16 values (128 bits) */
             float16x8_t h8 = vld1q_f16((const __fp16*)(row + i));
-            /* Convert to 2 × F32x4 */
             float32x4_t h_lo = vcvt_f32_f16(vget_low_f16(h8));
             float32x4_t h_hi = vcvt_f32_f16(vget_high_f16(h8));
-            /* FMA with normed hidden */
             acc0 = vfmaq_f32(acc0, h_lo, vld1q_f32(normed + i));
             acc1 = vfmaq_f32(acc1, h_hi, vld1q_f32(normed + i + 4));
         }
         float s = vaddvq_f32(vaddq_f32(acc0, acc1));
-        /* Tail */
-        for (u32 i = H8; i < H; i++) {
-            float hv = fp16_to_f32_inline(row[i]);
-            s += hv * normed[i];
-        }
+        for (u32 i = H8; i < H; i++) s += fp16_to_f32_inline(head[(size_t)v*H+i]) * normed[i];
         logits[v] = s;
     }
 #else
     for (u32 v = 0; v < V; v++) {
         const u16* row = head + (size_t)v * H;
         float s = 0;
-        for (u32 i = 0; i < H; i++) {
-            float hv = fp16_to_f32_inline(row[i]);
-            s += hv * normed[i];
-        }
+        for (u32 i = 0; i < H; i++) s += fp16_to_f32_inline(row[i]) * normed[i];
         logits[v] = s;
     }
 #endif

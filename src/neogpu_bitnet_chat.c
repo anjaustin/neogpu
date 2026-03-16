@@ -180,158 +180,72 @@ static u32 sample_with_controls(float *logits, u32 vocab_size,
     return pick;
 }
 
-static void usage(const char *prog) {
-    fprintf(stderr,
-        "Usage: %s --model <path> [options]\n"
-        "  --model <path>        GGUF model file (required)\n"
-        "  --prompt <text>       Input prompt (default: control prompt)\n"
-        "  --norms <path>        Norms sidecar .bin (optional)\n"
-        "  --temp <float>        Sampling temperature (default: 0.432)\n"
-        "  --top-k <int>         Top-K (default: 42)\n"
-        "  --top-p <float>       Top-P (default: 0.9531)\n"
-        "  --rep-penalty <float> Repetition penalty (default: 1.1229)\n"
-        "  --n-predict <int>     Max tokens to generate (default: 64)\n",
-        prog);
-}
-
 int main(int argc, char **argv) {
-    const char *model_path  = NULL;
-    const char *norms_path  = NULL;
+    const char *model_path = "/home/ztflynn/001/neogpu/models/ggml-model-i2_s.gguf";
     const char *prompt = "Hypothetically, might reflective recursion be a function of cognition?";
     float temp = 0.432f;
     u32 top_k = 42;
     float top_p = 0.9531f;
     float rep_penalty = 1.1229f;
     int n_predict = 64;
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
-            model_path = argv[++i];
-        } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
-            prompt = argv[++i];
-        } else if (strcmp(argv[i], "--norms") == 0 && i + 1 < argc) {
-            norms_path = argv[++i];
-        } else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
-            temp = (float)atof(argv[++i]);
-        } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
-            top_k = (u32)atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
-            top_p = (float)atof(argv[++i]);
-        } else if (strcmp(argv[i], "--rep-penalty") == 0 && i + 1 < argc) {
-            rep_penalty = (float)atof(argv[++i]);
-        } else if (strcmp(argv[i], "--n-predict") == 0 && i + 1 < argc) {
-            n_predict = atoi(argv[++i]);
-        } else {
-            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            usage(argv[0]);
-            return 1;
-        }
-    }
-
-    if (!model_path) {
-        fprintf(stderr, "Error: --model is required\n");
-        usage(argv[0]);
-        return 1;
-    }
+    if (argc > 1) prompt = argv[1];
 
     HSMLTernary m;
     hs_mlt_init(&m);
     if (hs_mlt_load_gguf(&m, model_path) != 0) return 1;
-
-    /* Load BF16 norms from sidecar — GGUF norm tensors are corrupt in the
-     * upstream converter. The sidecar was extracted directly from the HF
-     * safetensors checkpoint via HTTP range request. */
-    if (hs_mlt_load_norms_sidecar(&m, norms_path) != 0) {
-        fprintf(stderr, "warning: norms sidecar '%s' not loaded, "
-                "using GGUF norms (may be corrupt)\n", norms_path);
-    }
-
     if (!m.tokenizer_vocab) {
         fprintf(stderr, "tokenizer vocab not loaded from GGUF\n");
         return 2;
     }
-    if (!m.tokenizer_merges || m.num_merges == 0) {
-        fprintf(stderr, "warning: no BPE merges loaded, tokenization may be wrong\n");
-    }
+
+    GPT2ByteMap map;
+    gpt2_bytemap_init(&map);
+    char *xform = gpt2_transform_input(prompt, &map);
+    if (!xform) return 3;
+
+    HSTokenizer tok;
+    hs_tokenizer_init(&tok, m.tokenizer_vocab, m.vocab_size, 0, m.tokenizer_bos, m.tokenizer_eos, 0);
 
     u32 *tokens = malloc((4096 + n_predict) * sizeof(u32));
     float *logits = malloc(m.vocab_size * sizeof(float));
-    if (!tokens || !logits) return 4;
+    char *decoded = malloc(1 << 20);
+    if (!tokens || !logits || !decoded) return 4;
 
-    /* BPE encode prompt */
     u32 n = 0;
-    tokens[n++] = m.tokenizer_bos;  /* BOS = 128000 */
-    n += hs_mlt_bpe_encode(&m, prompt, (u32)strlen(prompt), tokens + n, 4096 - n);
+    if (m.tokenizer_bos) tokens[n++] = m.tokenizer_bos;
+    n += hs_tokenizer_encode(&tok, xform, (u32)strlen(xform), tokens + n, 4096 - n);
 
     printf("prompt: %s\n", prompt);
     printf("encoded_tokens=%u\n", n);
-    printf("token_ids:");
-    for (u32 i = 0; i < n; i++) printf(" %u", tokens[i]);
-    printf("\n");
 
     HSMLTernarySession s;
     if (hs_mlt_session_init(&s, &m) != 0) return 5;
-
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
     if (hs_mlt_prefill(&s, tokens, n) != 0) return 6;
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double prefill_ms = ((double)(t1.tv_sec - t0.tv_sec)*1e3
-                       + (double)(t1.tv_nsec - t0.tv_nsec)/1e6);
 
-    /* Get logits after prefill */
-    if (hs_mlt_session_logits(&s, logits) != 0) return 7;
-
-    /* Decode loop */
     u32 total = n;
-    u32 n_generated = 0;
-    double decode_total_ms = 0.0;
-    double decode_min_ms = 1e9, decode_max_ms = 0.0;
+    u32 tok_id = m.tokenizer_eos ? m.tokenizer_eos : tokens[n - 1];
     srand(42);
-    printf("\nresponse:\n");
     for (int i = 0; i < n_predict; i++) {
-        u32 tok_id = sample_with_controls(logits, m.vocab_size,
-                                          tokens, total, temp, top_k, top_p, rep_penalty);
+        if (hs_mlt_decode(&s, tok_id, logits) != 0) break;
+        tok_id = sample_with_controls(logits, m.vocab_size, tokens, total, temp, top_k, top_p, rep_penalty);
         tokens[total++] = tok_id;
         if (tok_id == m.tokenizer_eos) break;
-
-        /* Print token (decode Ġ back to space) */
-        if (tok_id < m.vocab_size && m.tokenizer_vocab[tok_id]) {
-            const char *s_tok = m.tokenizer_vocab[tok_id];
-            while (*s_tok) {
-                if ((u8)s_tok[0] == 0xC4 && (u8)s_tok[1] == 0xA0) {
-                    putchar(' ');
-                    s_tok += 2;
-                } else {
-                    putchar(*s_tok++);
-                }
-            }
-        }
-        fflush(stdout);
-
-        /* Run decode step for next token, timed */
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        if (hs_mlt_decode(&s, tok_id, logits) != 0) break;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        double step_ms = ((double)(t1.tv_sec - t0.tv_sec)*1e3
-                        + (double)(t1.tv_nsec - t0.tv_nsec)/1e6);
-        decode_total_ms += step_ms;
-        if (step_ms < decode_min_ms) decode_min_ms = step_ms;
-        if (step_ms > decode_max_ms) decode_max_ms = step_ms;
-        n_generated++;
     }
 
-    double avg_ms = n_generated > 0 ? decode_total_ms / n_generated : 0.0;
-    double tok_per_sec = n_generated > 0 ? 1000.0 / avg_ms : 0.0;
+    u32 out_len = hs_tokenizer_decode(&tok, tokens + n, total - n, decoded, 1 << 20);
+    decoded[out_len] = '\0';
+    char *final = gpt2_inverse_output(decoded, &map);
 
-    printf("\n\nmeta: temp=%.4f top_k=%u top_p=%.4f rep_penalty=%.4f generated=%u\n",
+    printf("\nresponse:\n%s\n", final ? final : decoded);
+    printf("\nmeta: temp=%.4f top_k=%u top_p=%.4f rep_penalty=%.4f generated=%u\n",
            temp, top_k, top_p, rep_penalty, total - n);
-    printf("perf: prefill=%.0fms  decode_avg=%.0fms  decode_min=%.0fms  decode_max=%.0fms\n",
-           prefill_ms, avg_ms, decode_min_ms, decode_max_ms);
-    printf("      %.3f tokens/sec  (%.0f ms/token)\n", tok_per_sec, avg_ms);
 
+    free(final);
+    free(decoded);
     free(logits);
     free(tokens);
+    free(xform);
+    hs_tokenizer_free(&tok);
     hs_mlt_session_free(&s);
     hs_mlt_free(&m);
     return 0;
