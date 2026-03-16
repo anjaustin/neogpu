@@ -11,16 +11,24 @@ static int finite_all(const float *x, u32 n) {
 }
 
 int main(void) {
-    const char *path = "/home/ztflynn/001/neogpu/models/ggml-model-i2_s.gguf";
+    const char *path       = "/home/ztflynn/001/neogpu/models/ggml-model-i2_s.gguf";
+    const char *norms_path = "/home/ztflynn/001/neogpu/models/norms_v2.bin";
 
     HSMLTernary m;
     hs_mlt_init(&m);
 
     int rc = hs_mlt_load_gguf(&m, path);
-    printf("load_rc=%d loaded=%d hidden=%u layers=%u q_heads=%u kv_heads=%u ffn=%u vocab=%u ctx=%u\n",
-           rc, m.loaded, m.hidden_size, m.num_layers, m.num_heads, m.num_kv_heads,
-           m.ffn_hidden_size, m.vocab_size, m.max_context);
+    printf("load_rc=%d loaded=%d use_i2s=%d\n", rc, m.loaded, (int)m.use_i2s);
+    printf("hidden=%u layers=%u q_heads=%u kv_heads=%u ffn=%u vocab=%u ctx=%u rope=%.0f\n",
+           m.hidden_size, m.num_layers, m.num_heads, m.num_kv_heads,
+           m.ffn_hidden_size, m.vocab_size, m.max_context, m.rope_theta);
     if (rc != 0) return 1;
+
+    /* Load real BF16 norms */
+    if (hs_mlt_load_norms_sidecar(&m, norms_path) == 0)
+        printf("norms sidecar loaded\n");
+    else
+        printf("WARNING: norms sidecar missing, using GGUF norms\n");
 
     HSMLTernarySession s;
     rc = hs_mlt_session_init(&s, &m);

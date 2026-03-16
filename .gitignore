@@ -33,3 +33,6 @@ ui.hdll
 uv.hdll
 hl
 libhl.so
+*.gguf
+*.bin
+models/

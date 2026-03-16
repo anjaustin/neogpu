@@ -39,6 +39,7 @@ void hs_mlt_free(HSMLTernary* m) {
     free(m->embedding);
     free(m->lm_head);
     free(m->final_norm);
+
     if (m->tokenizer_vocab) {
         for (u32 i = 0; i < m->vocab_size; i++) free(m->tokenizer_vocab[i]);
         free(m->tokenizer_vocab);
@@ -51,13 +52,13 @@ void hs_mlt_free(HSMLTernary* m) {
     if (m->layers) {
         for (u32 l = 0; l < m->num_layers; l++) {
             HSTernaryLayer* lay = &m->layers[l];
-            free(lay->q_proj);   free(lay->q_scale);
-            free(lay->k_proj);   free(lay->k_scale);
-            free(lay->v_proj);   free(lay->v_scale);
-            free(lay->o_proj);   free(lay->o_scale);
-            free(lay->gate_proj);free(lay->gate_scale);
-            free(lay->up_proj);  free(lay->up_scale);
-            free(lay->down_proj);free(lay->down_scale);
+            free(lay->q_proj);    free(lay->q_scale);
+            free(lay->k_proj);    free(lay->k_scale);
+            free(lay->v_proj);    free(lay->v_scale);
+            free(lay->o_proj);    free(lay->o_scale);
+            free(lay->gate_proj); free(lay->gate_scale);
+            free(lay->up_proj);   free(lay->up_scale);
+            free(lay->down_proj); free(lay->down_scale);
             free(lay->attn_norm);
             free(lay->attn_sub_norm);
             free(lay->ffn_norm);
@@ -122,6 +123,7 @@ int hs_mlt_alloc_random(HSMLTernary* m,
     m->ffn_hidden_size = ffn_hidden_size;
     m->max_context     = max_context;
     m->rope_theta      = 10000.0f;
+    m->use_i2s         = false;      /* synthetic: use int8 path */
 
     unsigned int rng = seed;
 
@@ -362,9 +364,18 @@ extern void hs_ml_ternary_f32_proj(float* out, const float* in,
                                     const u8* W, u32 N, u32 K);
 
 static void f32_proj(HSMLTernary* m, float* out, const float* in,
-                     const u8* W, u32 N, u32 K) {
+                     const u8* W, const float* weight_scale, u32 N, u32 K) {
     u64 t0 = now_ns();
     hs_ml_ternary_f32_proj(out, in, W, N, K);
+
+    /* Apply per-tensor weight scale from BitNet quantization.
+     * The model stores ternary weights {-1,0,+1} but the effective weight
+     * during inference is ternary / weight_scale. All rows share the same scale. */
+    if (weight_scale && weight_scale[0] != 1.0f) {
+        float inv_scale = 1.0f / weight_scale[0];
+        for (u32 i = 0; i < N; i++) out[i] *= inv_scale;
+    }
+
     g_mlt_stats.total_gemm_calls++;
     g_mlt_stats.total_gemm_ops += (u64)N * K;
     g_mlt_stats.total_ns += now_ns() - t0;
@@ -463,9 +474,9 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     /* ── 2-5. Q, K, V projections ── */
     if (m->use_i2s) {
         /* Pure f32 path: no quantize/dequantize */
-        f32_proj(m, q, fbuf, lay->q_proj, H, H);
-        f32_proj(m, k, fbuf, lay->k_proj, kv, H);
-        f32_proj(m, v, fbuf, lay->v_proj, kv, H);
+        f32_proj(m, q, fbuf, lay->q_proj, lay->q_scale, H, H);
+        f32_proj(m, k, fbuf, lay->k_proj, lay->k_scale, kv, H);
+        f32_proj(m, v, fbuf, lay->v_proj, lay->v_scale, kv, H);
     } else {
         float act_scale = hs_mlt_quantize(qbuf, fbuf, H);
         ternary_proj(m, gbuf, qbuf, lay->q_proj, H, H);
@@ -544,7 +555,7 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
 
     /* ── 9. O projection ── */
     if (m->use_i2s) {
-        f32_proj(m, fbuf, attn_out, lay->o_proj, H, H);
+        f32_proj(m, fbuf, attn_out, lay->o_proj, lay->o_scale, H, H);
     } else {
         float act_scale = hs_mlt_quantize(qbuf, attn_out, H);
         ternary_proj(m, gbuf, qbuf, lay->o_proj, H, H);
@@ -557,8 +568,8 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
 
     /* ── 12. Gate and Up projections ── */
     if (m->use_i2s) {
-        f32_proj(m, gate_out, fbuf, lay->gate_proj, F, H);
-        f32_proj(m, up_out, fbuf, lay->up_proj, F, H);
+        f32_proj(m, gate_out, fbuf, lay->gate_proj, lay->gate_scale, F, H);
+        f32_proj(m, up_out, fbuf, lay->up_proj, lay->up_scale, F, H);
     } else {
         float act_scale = hs_mlt_quantize(qbuf, fbuf, H);
         ternary_proj(m, gbuf, qbuf, lay->gate_proj, F, H);
@@ -592,7 +603,7 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
 
     /* ── 14. Down projection ── */
     if (m->use_i2s) {
-        f32_proj(m, fbuf, ffbuf, lay->down_proj, H, F);
+        f32_proj(m, fbuf, ffbuf, lay->down_proj, lay->down_scale, H, F);
     } else {
         float act_scale = hs_mlt_quantize(fqbuf, ffbuf, F);
         ternary_proj(m, gbuf, fqbuf, lay->down_proj, H, F);

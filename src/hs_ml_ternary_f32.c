@@ -7,15 +7,22 @@
  * weight = {-1, 0, +1}
  * output[n] = sum(act[k] where w[n,k]=+1) - sum(act[k] where w[n,k]=-1)
  *
- * I2_S format: raw codes {0,1,2} mapped as {-1,0,+1}
- * Group layout: group_idx=j/16, group_pos=j%16, bits [7:6] first
+ * BitNet I2_S format (GGUF type 36):
+ *   Simple sequential 2-bit packing, 4 weights per byte, low bits first:
+ *     byte bits [1:0] = weight 0
+ *     byte bits [3:2] = weight 1
+ *     byte bits [5:4] = weight 2
+ *     byte bits [7:6] = weight 3
+ *   Code mapping: 0 = -1, 1 = 0, 2 = +1, 3 = 0 (zero, for FFN tensors)
+ *
+ * This was confirmed by reading the Microsoft BitNet converter:
+ *   data_torch = (data_torch.float() - 1)  =>  {0:-1, 1:0, 2:+1}
+ *   shift = [0, 2, 4, 6]  =>  sequential low-bits-first
  *
  * NEON strategy:
- *   - Load 4 float32 activations per vld1q_f32 (16 bytes)
- *   - Decode 4 weight codes from 1 byte
- *   - Use vbslq_f32 to select activations for +1 and -1
- *   - Accumulate positive and negative sums separately
- *   - Final: output = pos_sum - neg_sum
+ *   - Process 4 activations at a time per byte
+ *   - Build sign vector from decoded codes
+ *   - Accumulate via vfmaq_f32
  */
 
 #include <stdint.h>
@@ -26,89 +33,82 @@
 #include <arm_neon.h>
 #endif
 
-#define I2S_QK 64u
-
 /*============================================================================
  * Scalar reference: float32 activations × I2_S ternary weights
+ *
+ * Sequential 2-bit packing, 4 weights per byte, low bits first.
+ * Code mapping: 0=-1, 1=0, 2=+1, 3=0
  *============================================================================*/
 
 static void i2s_f32_proj_scalar(float *out, const float *in,
                                  const uint8_t *W, uint32_t N, uint32_t K) {
     uint32_t row_bytes = K / 4;
-    uint32_t nblk = K / I2S_QK;
 
     for (uint32_t n = 0; n < N; n++) {
         const uint8_t *wrow = W + n * row_bytes;
         float acc = 0.0f;
 
-        for (uint32_t bi = 0; bi < nblk; bi++) {
-            const uint8_t *block = wrow + bi * (I2S_QK / 4);
-            for (uint32_t j = 0; j < I2S_QK; j++) {
-                uint32_t k = bi * I2S_QK + j;
-                uint32_t gi = j / 16;
-                uint32_t gp = j % 16;
-                uint8_t raw = (block[gp] >> (6 - 2 * gi)) & 0x3;
-                /* raw: 0=-1, 1=0, 2=+1 */
-                if (raw == 2) acc += in[k];
-                else if (raw == 0) acc -= in[k];
-            }
+        for (uint32_t byte_idx = 0; byte_idx < row_bytes; byte_idx++) {
+            uint8_t b = wrow[byte_idx];
+            uint32_t k_base = byte_idx * 4;
+
+            /* 4 weights per byte, sequential: bits[1:0], [3:2], [5:4], [7:6] */
+            uint8_t c0 = (b >> 0) & 3;
+            uint8_t c1 = (b >> 2) & 3;
+            uint8_t c2 = (b >> 4) & 3;
+            uint8_t c3 = (b >> 6) & 3;
+
+            /* code: 0=-1, 1=0, 2=+1, 3=0 */
+            if (c0 == 2)      acc += in[k_base + 0];
+            else if (c0 == 0) acc -= in[k_base + 0];
+            if (c1 == 2)      acc += in[k_base + 1];
+            else if (c1 == 0) acc -= in[k_base + 1];
+            if (c2 == 2)      acc += in[k_base + 2];
+            else if (c2 == 0) acc -= in[k_base + 2];
+            if (c3 == 2)      acc += in[k_base + 3];
+            else if (c3 == 0) acc -= in[k_base + 3];
         }
         out[n] = acc;
     }
 }
 
 /*============================================================================
- * NEON: float32 activations × I2_S ternary weights
+ * NEON: float32 activations × I2_S ternary weights (sequential packing)
  *
- * Per 16-byte weight block (16 bytes = 64 weights):
- *   - 4 groups of 16 weights
- *   - Each group: 16 bytes decode to 16 codes
- *   - Process 4 activations at a time (one float32x4)
- *
- * For each byte, bits [7:6] = group 0, [5:4] = group 1, [3:2] = group 2, [1:0] = group 3
- * Group g processes activations[bi*64 + g*16 + 0..15]
+ * Each byte has 4 weights packed sequentially.
+ * Process 4 bytes at a time → 16 weights → 4 float32x4 loads.
+ * For each byte, decode 4 codes and build a sign vector.
  *============================================================================*/
 
 #ifdef __ARM_NEON
 static void i2s_f32_proj_neon(float *out, const float *in,
                                const uint8_t *W, uint32_t N, uint32_t K) {
     const uint32_t row_bytes = K / 4;
-    const uint32_t nblk = K / I2S_QK;
 
     for (uint32_t n = 0; n < N; n++) {
         const uint8_t *wrow = W + n * row_bytes;
         float32x4_t vacc = vdupq_n_f32(0.0f);
 
-        for (uint32_t bi = 0; bi < nblk; bi++) {
-            const uint8_t *block = wrow + bi * 16;
+        for (uint32_t byte_idx = 0; byte_idx < row_bytes; byte_idx++) {
+            uint8_t b = wrow[byte_idx];
+            uint32_t k_base = byte_idx * 4;
 
-            /* Process 4 groups of 16 weights each */
-            for (uint32_t g = 0; g < 4; g++) {
-                uint32_t shift = 6 - 2 * g;
-                uint32_t base_k = bi * 64 + g * 16;
+            /* Decode 4 codes from this byte (sequential: low bits first) */
+            uint8_t c0 = (b >> 0) & 3;
+            uint8_t c1 = (b >> 2) & 3;
+            uint8_t c2 = (b >> 4) & 3;
+            uint8_t c3 = (b >> 6) & 3;
 
-                /* Process 16 activations in chunks of 4 */
-                for (uint32_t p = 0; p < 16; p += 4) {
-                    /* Decode 4 weight codes from 4 consecutive bytes */
-                    uint8_t c0 = (block[p + 0] >> shift) & 3;
-                    uint8_t c1 = (block[p + 1] >> shift) & 3;
-                    uint8_t c2 = (block[p + 2] >> shift) & 3;
-                    uint8_t c3 = (block[p + 3] >> shift) & 3;
-
-                    float32x4_t act = vld1q_f32(in + base_k + p);
-
-                    /* Build sign vector: +1 for code 2, -1 for code 0, 0 for code 1 */
-                    float signs[4] = {
-                        (c0 == 2) ? 1.0f : (c0 == 0) ? -1.0f : 0.0f,
-                        (c1 == 2) ? 1.0f : (c1 == 0) ? -1.0f : 0.0f,
-                        (c2 == 2) ? 1.0f : (c2 == 0) ? -1.0f : 0.0f,
-                        (c3 == 2) ? 1.0f : (c3 == 0) ? -1.0f : 0.0f
-                    };
-                    float32x4_t vsign = vld1q_f32(signs);
-
-                    vacc = vfmaq_f32(vacc, act, vsign);
-                }
-            }
+            /* Build sign vector: code 0=-1, 1=0, 2=+1, 3=0 */
+            float signs[4] = {
+                (c0 == 2) ? 1.0f : (c0 == 0) ? -1.0f : 0.0f,
+                (c1 == 2) ? 1.0f : (c1 == 0) ? -1.0f : 0.0f,
+                (c2 == 2) ? 1.0f : (c2 == 0) ? -1.0f : 0.0f,
+                (c3 == 2) ? 1.0f : (c3 == 0) ? -1.0f : 0.0f
+            };
+            float32x4_t vsign = vld1q_f32(signs);
+            float32x4_t act = vld1q_f32(in + k_base);
+            vacc = vfmaq_f32(vacc, act, vsign);
         }
         out[n] = vaddvq_f32(vacc);
     }

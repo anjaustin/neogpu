@@ -99,100 +99,104 @@ static void i2s_proj_neon(int32_t* out, const int8_t* in, const u8* W, u32 N, u3
     }
 }
 
+/* Declare f32 projection from hs_ml_ternary_f32.c */
+extern void hs_ml_ternary_f32_proj(float *out, const float *in,
+                                    const uint8_t *W, uint32_t N, uint32_t K);
+
 int main(void) {
+    const char *model_path = "/home/ztflynn/001/neogpu/models/ggml-model-i2_s.gguf";
+    const char *norms_path = "/home/ztflynn/001/neogpu/models/norms_v2.bin";
+
     HSMLTernary m;
     hs_mlt_init(&m);
-    if (hs_mlt_load_gguf(&m, "/home/ztflynn/001/neogpu/models/ggml-model-i2_s.gguf")) return 1;
-    for (u32 l = 0; l < m.num_layers; l++) {
-        for (u32 i = 0; i < m.hidden_size; i++) {
-            m.layers[l].attn_norm[i] = 1.0f;
-            m.layers[l].attn_sub_norm[i] = 1.0f;
-            m.layers[l].ffn_norm[i] = 1.0f;
-        }
-        for (u32 i = 0; i < m.ffn_hidden_size; i++) {
-            m.layers[l].ffn_sub_norm[i] = 1.0f;
-        }
+    if (hs_mlt_load_gguf(&m, model_path)) return 1;
+    printf("use_i2s=%d rope_theta=%.0f\n", (int)m.use_i2s, m.rope_theta);
+
+    /* Load real BF16 norms */
+    if (hs_mlt_load_norms_sidecar(&m, norms_path) == 0) {
+        printf("norms sidecar loaded\n");
+    } else {
+        printf("WARNING: norms sidecar not loaded\n");
     }
+
     HSTernaryLayer *lay = &m.layers[0];
-    u32 H = m.hidden_size, F = m.ffn_hidden_size, nh = m.num_heads, nkv = m.num_kv_heads, hd = m.head_dim, kv = nkv * hd;
+    u32 H = m.hidden_size, F = m.ffn_hidden_size;
+    u32 nh = m.num_heads, nkv = m.num_kv_heads, hd = m.head_dim, kv = nkv * hd;
 
     float *hidden = malloc(H * sizeof(float));
     memcpy(hidden, m.embedding + (size_t)128000 * H, H * sizeof(float));
     statsf("embed", hidden, H);
 
-    float *tmp = malloc((F > H ? F : H) * sizeof(float));
-    int8_t *qbuf = malloc((F > H ? F : H));
-    int32_t *gbuf = malloc((F > H ? F : H) * sizeof(int32_t));
-    float *q = malloc(H * sizeof(float));
-    float *k = malloc(kv * sizeof(float));
-    float *v = malloc(kv * sizeof(float));
-    float *attn = calloc(H, sizeof(float));
-    float *gate = malloc(F * sizeof(float));
-    float *up = malloc(F * sizeof(float));
-    float *ff = malloc(F * sizeof(float));
+    float *normed = malloc((F > H ? F : H) * sizeof(float));
+    float *q      = malloc(H * sizeof(float));
+    float *k      = malloc(kv * sizeof(float));
+    float *v      = malloc(kv * sizeof(float));
+    float *attn   = calloc(H, sizeof(float));
+    float *gate   = malloc(F * sizeof(float));
+    float *up     = malloc(F * sizeof(float));
+    float *ff     = malloc(F * sizeof(float));
 
-    rmsnorm_local(tmp, hidden, lay->attn_norm, 1e-5f, H);
-    statsf("attn_norm", tmp, H);
-    float as = quantize_local(qbuf, tmp, H);
-    printf("act_scale=%g\n", as);
+    /* ── Attention pre-norm ── */
+    rmsnorm_local(normed, hidden, lay->attn_norm, 1e-5f, H);
+    statsf("attn_normed", normed, H);
 
-    i2s_proj_neon(gbuf, qbuf, lay->q_proj, H, H);
-    statsi("q_gemm", gbuf, H);
-    dequant_local(q, gbuf, H, as);
-    statsf("q", q, H);
+    /* ── Q/K/V projections — pure f32 ternary ── */
+    hs_ml_ternary_f32_proj(q, normed, lay->q_proj, H, H);
+    statsf("q_proj", q, H);
+    hs_ml_ternary_f32_proj(k, normed, lay->k_proj, kv, H);
+    statsf("k_proj", k, kv);
+    hs_ml_ternary_f32_proj(v, normed, lay->v_proj, kv, H);
+    statsf("v_proj", v, kv);
 
-    i2s_proj_neon(gbuf, qbuf, lay->k_proj, kv, H);
-    statsi("k_gemm", gbuf, kv);
-    dequant_local(k, gbuf, kv, as);
-    statsf("k", k, kv);
-
-    i2s_proj_neon(gbuf, qbuf, lay->v_proj, kv, H);
-    statsi("v_gemm", gbuf, kv);
-    dequant_local(v, gbuf, kv, as);
-    statsf("v", v, kv);
-
+    /* Simulate single-token attention: just copy v directly (seq_len=1) */
     memset(attn, 0, H * sizeof(float));
     for (u32 h = 0; h < nh; h++) {
         u32 kv_h = h * nkv / nh;
         for (u32 d = 0; d < hd; d++) attn[h * hd + d] = v[kv_h * hd + d];
     }
     statsf("attn_pre_subnorm", attn, H);
+
+    /* ── attn_sub_norm ── */
     rmsnorm_local(attn, attn, lay->attn_sub_norm, 1e-5f, H);
-    statsf("attn_sub_norm", attn, H);
+    statsf("attn_post_subnorm", attn, H);
 
-    as = quantize_local(qbuf, attn, H);
-    i2s_proj_neon(gbuf, qbuf, lay->o_proj, H, H);
-    statsi("o_gemm", gbuf, H);
-    dequant_local(tmp, gbuf, H, as);
-    statsf("o_proj", tmp, H);
+    /* ── O projection ── */
+    hs_ml_ternary_f32_proj(normed, attn, lay->o_proj, H, H);
+    statsf("o_proj", normed, H);
 
-    for (u32 i = 0; i < H; i++) hidden[i] += tmp[i];
+    for (u32 i = 0; i < H; i++) hidden[i] += normed[i];
     statsf("after_attn_resid", hidden, H);
 
-    rmsnorm_local(tmp, hidden, lay->ffn_norm, 1e-5f, H);
-    statsf("ffn_norm", tmp, H);
-    as = quantize_local(qbuf, tmp, H);
-    i2s_proj_neon(gbuf, qbuf, lay->gate_proj, F, H);
-    statsi("gate_gemm", gbuf, F);
-    dequant_local(gate, gbuf, F, as);
-    statsf("gate", gate, F);
-    i2s_proj_neon(gbuf, qbuf, lay->up_proj, F, H);
-    statsi("up_gemm", gbuf, F);
-    dequant_local(up, gbuf, F, as);
-    statsf("up", up, F);
+    /* ── FFN pre-norm ── */
+    rmsnorm_local(normed, hidden, lay->ffn_norm, 1e-5f, H);
+    statsf("ffn_normed", normed, H);
+
+    /* ── Gate / Up projections ── */
+    hs_ml_ternary_f32_proj(gate, normed, lay->gate_proj, F, H);
+    statsf("gate_proj", gate, F);
+    hs_ml_ternary_f32_proj(up, normed, lay->up_proj, F, H);
+    statsf("up_proj", up, F);
+
+    /* ── ReLU^2(gate) * up ── */
     for (u32 i = 0; i < F; i++) {
         float rg = gate[i] > 0.0f ? gate[i] : 0.0f;
         ff[i] = (rg * rg) * up[i];
     }
-    statsf("relu2*up", ff, F);
+    statsf("relu2_gate_x_up", ff, F);
+
+    /* ── ffn_sub_norm ── */
     rmsnorm_local(ff, ff, lay->ffn_sub_norm, 1e-5f, F);
-    statsf("ffn_sub_norm", ff, F);
-    as = quantize_local(qbuf, ff, F);
-    i2s_proj_neon(gbuf, qbuf, lay->down_proj, H, F);
-    statsi("down_gemm", gbuf, H);
-    dequant_local(tmp, gbuf, H, as);
-    statsf("down", tmp, H);
-    for (u32 i = 0; i < H; i++) hidden[i] += tmp[i];
+    statsf("ffn_post_subnorm", ff, F);
+
+    /* ── Down projection ── */
+    hs_ml_ternary_f32_proj(normed, ff, lay->down_proj, H, F);
+    statsf("down_proj", normed, H);
+
+    for (u32 i = 0; i < H; i++) hidden[i] += normed[i];
     statsf("after_ffn_resid", hidden, H);
+
+    free(hidden); free(normed); free(q); free(k); free(v);
+    free(attn); free(gate); free(up); free(ff);
+    hs_mlt_free(&m);
     return 0;
 }

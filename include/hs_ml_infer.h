@@ -2,49 +2,16 @@
  * NeoGPU ML - Ternary Inference Layer
  *
  * End-to-end inference using the ternary GEMM kernels.
- * Parallel to HSMLSystem (which uses float32 weights) — this struct
- * holds weights in the formats the actual kernels consume:
  *
- *   - Projection weights:  uint8_t* 2-bit packed ternary [N, K/4]
- *   - Projection scales:   float* per-row scale [N]
- *   - Norms:               float* [hidden]
- *   - Embeddings:          float* [vocab, hidden]
- *   - LM head:             float* [vocab, hidden]
+ * Two weight paths:
+ *   - use_i2s=false: 2-bit packed ternary with int8 quantized activations
+ *   - use_i2s=true:  raw I2_S (GGUF type 36) with pure float32 activations
  *
- * Data flow for one transformer layer (decode, M=1):
- *
- *   hidden[hidden]  float32
- *       |
- *   RMSNorm (attn)
- *       |
- *   Quantize -> int8[hidden]  (per-tensor, scale = 127/max_abs)
- *       |
- *   Q/K/V proj  -> ternary GEMM -> int32[hidden] -> dequant -> float32
- *       |
- *   RoPE
- *       |
- *   Attention (float32 scores, KV cache)
- *       |
- *   O proj  -> ternary GEMM -> int32 -> dequant -> float32
- *       |
- *   Residual add
- *       |
- *   RMSNorm (ffn)
- *       |
- *   Quantize -> int8
- *       |
- *   Gate proj  -> ternary GEMM -> int32 -> dequant
- *   Up proj    -> ternary GEMM -> int32 -> dequant
- *       |
- *   SwiGLU (SiLU(gate) * up)
- *       |
- *   Quantize -> int8
- *       |
- *   Down proj  -> ternary GEMM -> int32 -> dequant
- *       |
- *   Residual add
- *       |
- *   hidden[hidden]  float32
+ * BitNet b1.58 layer order (per experimental/BitNet/gpu/model.py):
+ *   hidden -> attn_norm -> Q/K/V proj -> RoPE -> attention
+ *          -> attn_sub_norm -> o_proj -> residual
+ *          -> ffn_norm -> gate/up proj -> ReLU^2(gate)*up
+ *          -> ffn_sub_norm -> down_proj -> residual
  */
 
 #ifndef HS_ML_INFER_H
@@ -57,84 +24,86 @@
 /*
  * Per-layer ternary weights.
  * All projection matrices are 2-bit packed ternary with per-row float scales.
+ * I2_S format: raw GGUF I2_S bytes, NOT re-packed. Decoded on-the-fly.
  */
 typedef struct {
-    /* Attention projections: [hidden, hidden] ternary */
-    u8*    q_proj;      /* [hidden, hidden/4] packed 2-bit */
+    /* Attention projections */
+    u8*    q_proj;      /* [hidden, hidden/4] packed ternary */
     float* q_scale;     /* [hidden] per-row scales */
 
-    u8*    k_proj;
+    u8*    k_proj;      /* [kv_size, hidden/4] */
     float* k_scale;
 
-    u8*    v_proj;
+    u8*    v_proj;      /* [kv_size, hidden/4] */
     float* v_scale;
 
-    u8*    o_proj;
+    u8*    o_proj;      /* [hidden, hidden/4] */
     float* o_scale;
 
     /* FFN projections */
     u8*    gate_proj;   /* [ffn_hidden, hidden/4] */
     float* gate_scale;
 
-    u8*    up_proj;
+    u8*    up_proj;     /* [ffn_hidden, hidden/4] */
     float* up_scale;
 
     u8*    down_proj;   /* [hidden, ffn_hidden/4] */
     float* down_scale;
 
-    /* Learned norms (float -- not quantized) */
-    float* attn_norm;      /* [hidden] */
-    float* attn_sub_norm;  /* [hidden] post-attention subln */
-    float* ffn_norm;       /* [hidden] */
-    float* ffn_sub_norm;   /* [ffn_hidden] post-activation subln */
+    /* Learned norms (float32 — not quantized) */
+    float* attn_norm;       /* [hidden]     pre-attention RMSNorm */
+    float* attn_sub_norm;   /* [hidden]     BitNet subln after attention, before o_proj */
+    float* ffn_norm;        /* [hidden]     pre-FFN RMSNorm */
+    float* ffn_sub_norm;    /* [ffn_hidden] BitNet subln after gate*up, before down_proj */
 } HSTernaryLayer;
 
 /*
  * Full ternary model.
  */
 typedef struct {
-    /* Config */
-    u32 vocab_size;
-    u32 hidden_size;
-    u32 num_layers;
-    u32 num_heads;
-    u32 num_kv_heads;  /* KV heads for GQA */
-    u32 head_dim;
-    u32 ffn_hidden_size;
-    u32 max_context;
-    float rope_theta;
+    /* Architecture config */
+    u32   vocab_size;
+    u32   hidden_size;
+    u32   num_layers;
+    u32   num_heads;
+    u32   num_kv_heads;     /* GQA: may be < num_heads */
+    u32   head_dim;         /* hidden_size / num_heads */
+    u32   ffn_hidden_size;
+    u32   max_context;
+    float rope_theta;       /* RoPE base frequency (500000 for BitNet 2B-4T) */
+
+    /* Weight format flag */
+    bool  use_i2s;          /* true = raw I2_S bytes + f32 activation path */
 
     /* Non-quantized weights */
     float* embedding;   /* [vocab, hidden] float32 */
-    float* lm_head;     /* [vocab, hidden] float32 */
+    float* lm_head;     /* [vocab, hidden] float32 (tied to embedding if no output.weight) */
     float* final_norm;  /* [hidden] float32 */
-
-    /* Tokenizer metadata from GGUF */
-    char** tokenizer_vocab;
-    u32    tokenizer_bos;
-    u32    tokenizer_eos;
-    u32    tokenizer_pad;
-    char** tokenizer_merges;
-    u32    num_merges;
 
     /* Per-layer ternary weights */
     HSTernaryLayer* layers; /* [num_layers] */
 
     /* Runtime scratch (allocated once — no hot malloc in forward pass) */
-    int8_t*  quant_buf;  /* [max(hidden, ffn_hidden)] quantized activations */
-    int32_t* gemm_buf;   /* [max(hidden, ffn_hidden)] GEMM output */
-    float*   hidden_buf; /* [hidden] */
-    float*   ffn_buf;    /* [ffn_hidden] */
+    int8_t*  quant_buf;  /* [max(hidden, ffn_hidden)] int8 activations */
+    int32_t* gemm_buf;   /* [max(hidden, ffn_hidden)] GEMM int32 output */
+    float*   hidden_buf; /* [hidden] general float scratch */
+    float*   ffn_buf;    /* [ffn_hidden] FFN float scratch */
     float*   q_buf;      /* [hidden] Q projection output */
-    float*   k_buf;      /* [hidden] K projection output */
-    float*   v_buf;      /* [hidden] V projection output */
+    float*   k_buf;      /* [kv_size] K projection output */
+    float*   v_buf;      /* [kv_size] V projection output */
     float*   attn_buf;   /* [hidden] attention output */
     float*   gate_buf;   /* [ffn_hidden] gate projection output */
     float*   up_buf;     /* [ffn_hidden] up projection output */
     float*   score_buf;  /* [max_context] attention scores */
-    int8_t*  ffn_qbuf;   /* [ffn_hidden] quantized FFN activations */
+    int8_t*  ffn_qbuf;   /* [ffn_hidden] quantized FFN activations (int8 path) */
 
-    bool use_i2s;
+    /* Tokenizer (optional — loaded from GGUF tokenizer.ggml.* metadata) */
+    char**  tokenizer_vocab;    /* [vocab_size] token strings */
+    char**  tokenizer_merges;   /* BPE merge rules */
+    u32     num_merges;
+    u32     tokenizer_bos;      /* BOS token ID */
+    u32     tokenizer_eos;      /* EOS token ID */
+
     bool loaded;
 } HSMLTernary;
 
@@ -151,12 +120,25 @@ void hs_mlt_free(HSMLTernary* m);
 /*
  * Allocate synthetic random weights for testing.
  * Ternary weights are random {-1,0,+1}, norms are 1.0, embeddings are random.
- * seed: random seed for reproducibility
  */
 int hs_mlt_alloc_random(HSMLTernary* m,
                         u32 vocab_size, u32 hidden_size, u32 num_layers,
                         u32 num_heads, u32 ffn_hidden_size, u32 max_context,
                         unsigned int seed);
+
+/*
+ * Load model from GGUF file.
+ * Automatically detects I2_S format and sets use_i2s=true.
+ * Loads tokenizer vocab from GGUF metadata if present.
+ */
+int hs_mlt_load_gguf(HSMLTernary* m, const char* path);
+
+/*
+ * Load BF16 norm weights from sidecar binary.
+ * Overwrites layer norms and final_norm loaded from GGUF.
+ * Format: magic(u32) + n_tensors(u32) + [name_len(u32) + name + n_values(u32) + bf16_data]*
+ */
+int hs_mlt_load_norms_sidecar(HSMLTernary* m, const char* path);
 
 /*============================================================================
  * Inference
@@ -165,38 +147,24 @@ int hs_mlt_alloc_random(HSMLTernary* m,
 /*
  * Quantize float32 vector to int8 using per-tensor absmax scaling.
  * Returns the scale factor used (127 / max_abs).
- * output: [n] int8
- * input:  [n] float32
  */
 float hs_mlt_quantize(int8_t* output, const float* input, u32 n);
 
 /*
  * Dequantize int32 GEMM output to float32.
- * output: [n] float32
- * input:  [n] int32
- * act_scale:    scale from activation quantization
- * weight_scales: [n] per-row weight scales
  */
 void hs_mlt_dequantize(float* output, const int32_t* input, u32 n,
                        float act_scale, const float* weight_scales);
 
 /*
  * Run one transformer layer forward pass (decode mode, M=1).
- *
- * hidden:    [hidden_size] float32, modified in place
- * layer_idx: which layer
- * cache:     KV cache for this layer (updated in place)
- * m:         model
+ * hidden: [hidden_size] float32, modified in place.
  */
 void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
                           HSKVCache* cache, HSMLTernary* m);
 
 /*
- * Full forward pass: token -> logits.
- * For each token in sequence, runs all layers, returns logits for last token.
- *
- * logits: [vocab_size] float32 output
- * tokens: [seq_len] token IDs
+ * Full forward pass: token sequence -> logits.
  */
 int hs_mlt_forward(HSMLTernary* m, const u32* tokens, u32 seq_len,
                    float* logits);
@@ -205,6 +173,31 @@ int hs_mlt_forward(HSMLTernary* m, const u32* tokens, u32 seq_len,
  * Greedy token sampling.
  */
 u32 hs_mlt_sample_greedy(const float* logits, u32 vocab_size);
+
+/*============================================================================
+ * Stateful decode session
+ *============================================================================*/
+
+typedef struct {
+    HSMLTernary*  model;
+    float*        hidden;    /* [hidden_size] current hidden state */
+    HSKVCache*    caches;    /* [num_layers] KV caches */
+    u32           seq_len;
+    bool          ready;
+} HSMLTernarySession;
+
+int  hs_mlt_session_init(HSMLTernarySession* sess, HSMLTernary* model);
+void hs_mlt_session_free(HSMLTernarySession* sess);
+void hs_mlt_session_reset(HSMLTernarySession* sess);
+
+/* Prefill: process prompt tokens, update KV cache. */
+int hs_mlt_prefill(HSMLTernarySession* sess, const u32* tokens, u32 seq_len);
+
+/* Get logits from current hidden state (after prefill). */
+int hs_mlt_session_logits(HSMLTernarySession* sess, float* logits);
+
+/* Decode: step one new token, update KV cache, write logits. */
+int hs_mlt_decode(HSMLTernarySession* sess, u32 token, float* logits);
 
 /*============================================================================
  * Stats
@@ -218,25 +211,6 @@ typedef struct {
 } HSMLTernaryStats;
 
 void hs_mlt_reset_stats(HSMLTernary* m);
-/* Stats are stored inline in the struct for simplicity */
-extern HSMLTernaryStats g_mlt_stats;  /* global, reset on each forward pass */
+extern HSMLTernaryStats g_mlt_stats;
 
 #endif /* HS_ML_INFER_H */
-
-
-/* Stateful decode session */
-typedef struct {
-    HSMLTernary* model;
-    float* hidden;
-    HSKVCache* caches;
-    u32 seq_len;
-    bool ready;
-} HSMLTernarySession;
-
-int  hs_mlt_load_gguf(HSMLTernary* m, const char* path);
-int  hs_mlt_session_init(HSMLTernarySession* sess, HSMLTernary* model);
-void hs_mlt_session_free(HSMLTernarySession* sess);
-void hs_mlt_session_reset(HSMLTernarySession* sess);
-int  hs_mlt_prefill(HSMLTernarySession* sess, const u32* tokens, u32 seq_len);
-int  hs_mlt_decode(HSMLTernarySession* sess, u32 token, float* logits);
-int  hs_mlt_session_logits(HSMLTernarySession* sess, float* logits);

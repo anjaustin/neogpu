@@ -181,7 +181,8 @@ static u32 sample_with_controls(float *logits, u32 vocab_size,
 }
 
 int main(int argc, char **argv) {
-    const char *model_path = "/home/ztflynn/001/neogpu/models/ggml-model-i2_s.gguf";
+    const char *model_path  = "/home/ztflynn/001/neogpu/models/ggml-model-i2_s.gguf";
+    const char *norms_path  = "/home/ztflynn/001/neogpu/models/norms_v2.bin";
     const char *prompt = "Hypothetically, might reflective recursion be a function of cognition?";
     float temp = 0.432f;
     u32 top_k = 42;
@@ -189,10 +190,20 @@ int main(int argc, char **argv) {
     float rep_penalty = 1.1229f;
     int n_predict = 64;
     if (argc > 1) prompt = argv[1];
+    if (argc > 2) norms_path = argv[2];
 
     HSMLTernary m;
     hs_mlt_init(&m);
     if (hs_mlt_load_gguf(&m, model_path) != 0) return 1;
+
+    /* Load BF16 norms from sidecar — GGUF norm tensors are corrupt in the
+     * upstream converter. The sidecar was extracted directly from the HF
+     * safetensors checkpoint via HTTP range request. */
+    if (hs_mlt_load_norms_sidecar(&m, norms_path) != 0) {
+        fprintf(stderr, "warning: norms sidecar '%s' not loaded, "
+                "using GGUF norms (may be corrupt)\n", norms_path);
+    }
+
     if (!m.tokenizer_vocab) {
         fprintf(stderr, "tokenizer vocab not loaded from GGUF\n");
         return 2;
@@ -223,17 +234,13 @@ int main(int argc, char **argv) {
     if (hs_mlt_prefill(&s, tokens, n) != 0) return 6;
 
     u32 total = n;
+    u32 tok_id = m.tokenizer_eos ? m.tokenizer_eos : tokens[n - 1];
     srand(42);
-
-    if (hs_mlt_session_logits(&s, logits) != 0) return 7;
-    u32 tok_id = sample_with_controls(logits, m.vocab_size, tokens, total, temp, top_k, top_p, rep_penalty);
-    tokens[total++] = tok_id;
-
-    for (int i = 1; i < n_predict; i++) {
-        if (tok_id == m.tokenizer_eos) break;
+    for (int i = 0; i < n_predict; i++) {
         if (hs_mlt_decode(&s, tok_id, logits) != 0) break;
         tok_id = sample_with_controls(logits, m.vocab_size, tokens, total, temp, top_k, top_p, rep_penalty);
         tokens[total++] = tok_id;
+        if (tok_id == m.tokenizer_eos) break;
     }
 
     u32 out_len = hs_tokenizer_decode(&tok, tokens + n, total - n, decoded, 1 << 20);

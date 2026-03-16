@@ -19,10 +19,39 @@ static void statsf(const char *name, const float *x, u32 n) {
 }
 
 int main(void) {
+    const char *model_path = "/home/ztflynn/001/neogpu/models/ggml-model-i2_s.gguf";
+    const char *norms_path = "/home/ztflynn/001/neogpu/models/norms_v2.bin";
+
     HSMLTernary m;
     hs_mlt_init(&m);
-    if (hs_mlt_load_gguf(&m, "/home/ztflynn/001/neogpu/models/ggml-model-i2_s.gguf"))
-        return 1;
+    if (hs_mlt_load_gguf(&m, model_path)) return 1;
+
+    printf("use_i2s=%d rope_theta=%.0f\n", (int)m.use_i2s, m.rope_theta);
+
+    /* Load real BF16 norms from sidecar */
+    if (hs_mlt_load_norms_sidecar(&m, norms_path) == 0) {
+        printf("norms loaded from sidecar\n");
+    } else {
+        printf("WARNING: sidecar not loaded — using GGUF norms (may be corrupt)\n");
+    }
+
+    /* Print a sample of norm magnitudes for sanity check */
+    {
+        HSTernaryLayer *l0 = &m.layers[0];
+        float an_am = 0, asn_am = 0, fn_am = 0, fsn_am = 0;
+        for (u32 i = 0; i < m.hidden_size; i++) {
+            float a;
+            a = fabsf(l0->attn_norm[i]);     if (a > an_am)  an_am  = a;
+            a = fabsf(l0->attn_sub_norm[i]); if (a > asn_am) asn_am = a;
+            a = fabsf(l0->ffn_norm[i]);      if (a > fn_am)  fn_am  = a;
+        }
+        for (u32 i = 0; i < m.ffn_hidden_size; i++) {
+            float a = fabsf(l0->ffn_sub_norm[i]);
+            if (a > fsn_am) fsn_am = a;
+        }
+        printf("layer0 norm absmax: attn=%.4f attn_sub=%.4f ffn=%.4f ffn_sub=%.4f\n",
+               an_am, asn_am, fn_am, fsn_am);
+    }
 
     u32 H = m.hidden_size;
     float *hidden = malloc(H * sizeof(float));

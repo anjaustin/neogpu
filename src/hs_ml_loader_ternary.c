@@ -1,8 +1,7 @@
 /*
  * NeoGPU ML - GGUF Loader for HSMLTernary
  *
- * Loads a GGUF file produced by tools/write_test_gguf.py (or a compatible
- * real BitNet GGUF) into an HSMLTernary struct for inference.
+ * Loads a GGUF file (real BitNet 2B-4T or compatible) into HSMLTernary.
  *
  * GGUF binary layout (little-endian):
  *   [magic u32][version u32][tensor_count u64][kv_count u64]
@@ -11,25 +10,32 @@
  *   [alignment padding]
  *   [tensor data...]
  *
- * Weight convention in our test GGUF:
- *   - All projection weights stored as F32 (GGML_TYPE_F32 = 0)
- *   - Shape in GGUF is [K, N] (column-major / transposed from row-major)
- *   - Companion tensor "<name>_scale" holds per-row F32 scales
- *   - We convert F32 weights to 2-bit packed ternary at load time
+ * Tensor naming (GGUF standard BitNet):
+ *   token_embd.weight          [vocab, hidden]  F16
+ *   output.weight              [vocab, hidden]  F16  (absent = weight tying)
+ *   output_norm.weight         [hidden]         F32
+ *   blk.{l}.attn_norm.weight   [hidden]         F32
+ *   blk.{l}.attn_sub_norm.weight [hidden]       F32
+ *   blk.{l}.ffn_norm.weight    [hidden]         F32
+ *   blk.{l}.ffn_sub_norm.weight [ffn_hidden]    F32
+ *   blk.{l}.attn_q.weight      [hidden, hidden] I2_S
+ *   blk.{l}.attn_k.weight      [kv_size, hidden] I2_S
+ *   blk.{l}.attn_v.weight      [kv_size, hidden] I2_S
+ *   blk.{l}.attn_output.weight [hidden, hidden] I2_S
+ *   blk.{l}.ffn_gate.weight    [ffn_hidden, hidden] I2_S
+ *   blk.{l}.ffn_up.weight      [ffn_hidden, hidden] I2_S
+ *   blk.{l}.ffn_down.weight    [hidden, ffn_hidden] I2_S
  *
- * Tensor naming (GGUF standard):
- *   token_embd.weight          [hidden, vocab]
- *   output.weight              [hidden, vocab]
- *   output_norm.weight         [hidden]
- *   blk.{l}.attn_norm.weight   [hidden]
- *   blk.{l}.ffn_norm.weight    [hidden]
- *   blk.{l}.attn_q.weight      [hidden, hidden]   + _scale [hidden]
- *   blk.{l}.attn_k.weight      [hidden, hidden]
- *   blk.{l}.attn_v.weight      [hidden, hidden]
- *   blk.{l}.attn_output.weight [hidden, hidden]
- *   blk.{l}.ffn_gate.weight    [hidden, ffn]
- *   blk.{l}.ffn_up.weight      [hidden, ffn]
- *   blk.{l}.ffn_down.weight    [ffn, hidden]
+ * I2_S format (GGML type 36):
+ *   Contiguous packed bytes: tensor_bytes = (rows * cols) / 4 [+ small header]
+ *   64-weight blocks: 16 bytes per block, 4 groups of 16 weights.
+ *   Bit layout: bits [7:6] = group 0, [5:4] = group 1, [3:2] = group 2, [1:0] = group 3
+ *   Raw codes: 0 = -1, 1 = 0, 2 = +1
+ *
+ * When I2_S weights are detected, m->use_i2s is set to true.
+ * The inference engine then uses hs_ml_ternary_f32_proj() (pure f32 path).
+ * Norms from GGUF are loaded as-is; call hs_mlt_load_norms_sidecar() to
+ * override them with the BF16 values from models/norms_v2.bin.
  */
 
 #include "hs_ml_infer.h"
@@ -58,11 +64,11 @@
 #define GGUF_TYPE_INT64   11u
 #define GGUF_TYPE_FLOAT64 12u
 
-/* GGML tensor types we care about */
+/* GGML tensor types */
 #define GGML_TYPE_F32  0u
 #define GGML_TYPE_F16  1u
 #define GGML_TYPE_I8   24u
-#define GGML_TYPE_I2_S 36u  /* BitNet I2_S ternary blocks */
+#define GGML_TYPE_I2_S 36u
 
 #define MAX_TENSORS 4096
 #define MAX_NAME    256
@@ -129,8 +135,8 @@ static int skip_value(FILE* f, uint32_t type) {
 typedef struct {
     char     name[MAX_NAME];
     uint32_t n_dims;
-    uint64_t dims[4];      /* GGUF col-major: dims[0]=cols, dims[1]=rows */
-    uint32_t type;         /* GGML_TYPE_* */
+    uint64_t dims[4];      /* GGUF col-major: dims[0]=cols(K), dims[1]=rows(N) */
+    uint32_t type;
     uint64_t offset;       /* offset from tensor_data_start */
 } TensorInfo;
 
@@ -141,12 +147,105 @@ static int find_tensor(TensorInfo* tis, int n, const char* name) {
 }
 
 /*============================================================================
- * F32 -> 2-bit packed ternary conversion
+ * Float conversion helpers
+ *============================================================================*/
+
+static float fp16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x03FF;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;
+        } else {
+            exp = 127 - 15 + 1;
+            while ((mant & 0x0400) == 0) { mant <<= 1; exp--; }
+            mant &= 0x03FF;
+            f = sign | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = sign | 0x7F800000u | (mant << 13);
+    } else {
+        f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+    }
+    float out; memcpy(&out, &f, sizeof(float)); return out;
+}
+
+static float bf16_to_f32(uint16_t b) {
+    uint32_t u = (uint32_t)b << 16;
+    float out; memcpy(&out, &u, sizeof(float)); return out;
+}
+
+/* Load tensor data as float32, handling F32, F16 types. */
+static float* load_as_f32(FILE* f, long data_start,
+                           TensorInfo* ti, uint32_t n_elem) {
+    float* out = malloc((size_t)n_elem * sizeof(float));
+    if(!out) return NULL;
+
+    long pos = data_start + (long)ti->offset;
+    if(fseek(f, pos, SEEK_SET)) { free(out); return NULL; }
+
+    if(ti->type == GGML_TYPE_F32) {
+        if(fread(out, sizeof(float), n_elem, f) != n_elem) { free(out); return NULL; }
+    } else if(ti->type == GGML_TYPE_F16) {
+        uint16_t* tmp = malloc((size_t)n_elem * sizeof(uint16_t));
+        if(!tmp) { free(out); return NULL; }
+        if(fread(tmp, sizeof(uint16_t), n_elem, f) != n_elem) { free(tmp); free(out); return NULL; }
+        for(uint32_t i = 0; i < n_elem; i++) out[i] = fp16_to_f32(tmp[i]);
+        free(tmp);
+    } else if(ti->type == GGML_TYPE_I8) {
+        int8_t* tmp = malloc(n_elem);
+        if(!tmp) { free(out); return NULL; }
+        if(fread(tmp, 1, n_elem, f) != n_elem) { free(tmp); free(out); return NULL; }
+        for(uint32_t i = 0; i < n_elem; i++) out[i] = (float)tmp[i];
+        free(tmp);
+    } else {
+        fprintf(stderr, "loader: unsupported tensor type %u for load_as_f32\n", ti->type);
+        free(out); return NULL;
+    }
+    return out;
+}
+
+/*============================================================================
+ * I2_S direct load
  *
- * Our kernel packing: 4 weights per byte
- *   00 = 0, 01 = +1, 10 = -1
- * Input: F32 array [N] (already ±1 or 0)
- * Output: uint8 array [N/4]
+ * I2_S layout in GGUF (type 36):
+ *   Contiguous packed bytes, no per-row metadata.
+ *   tensor_bytes = ceil(N * K / 4)   (rounded to GGUF_ALIGNMENT)
+ *   Row r occupies bytes [r * (K/4), r * (K/4) + K/4).
+ *   Within each row, K weights packed into K/4 bytes.
+ *   Block of 64 weights (16 bytes):
+ *     byte[i] holds 4 codes: bits[7:6]=group0, [5:4]=group1, [3:2]=group2, [1:0]=group3
+ *     group g covers activations at positions bi*64 + g*16 + [0..15]
+ *     code: 0=-1, 1=0, 2=+1
+ *
+ * We load the raw packed bytes directly — the f32 kernel reads I2_S in-place.
+ * No re-packing needed.
+ *============================================================================*/
+
+static uint8_t* load_i2s_raw(FILE* f, long data_start,
+                               TensorInfo* ti, uint32_t rows, uint32_t cols) {
+    size_t row_bytes = cols / 4;
+    size_t total     = (size_t)rows * row_bytes;
+    uint8_t* buf = aligned_alloc(64, total);
+    if(!buf) return NULL;
+
+    long pos = data_start + (long)ti->offset;
+    if(fseek(f, pos, SEEK_SET)) { free(buf); return NULL; }
+    if(fread(buf, 1, total, f) != total) {
+        fprintf(stderr, "loader: I2_S read failed for '%s' (want %zu bytes)\n",
+                ti->name, total);
+        free(buf); return NULL;
+    }
+    return buf;
+}
+
+/*============================================================================
+ * F32 -> 2-bit packed ternary (for synthetic / F32 test models only)
+ *
+ * Our internal 2-bit code: 00=0, 01=+1, 10=-1
+ * This is NOT used for real I2_S model weights.
  *============================================================================*/
 
 static void f32_to_ternary_packed(uint8_t* out, const float* in, uint32_t N) {
@@ -155,15 +254,11 @@ static void f32_to_ternary_packed(uint8_t* out, const float* in, uint32_t N) {
         uint8_t byte = 0;
         for(int b = 0; b < 4; b++) {
             float v = in[i*4 + b];
-            uint8_t code;
-            if(v > 0.5f)       code = 1;  /* +1 */
-            else if(v < -0.5f) code = 2;  /* -1 */
-            else               code = 0;  /* 0  */
+            uint8_t code = (v > 0.5f) ? 1 : (v < -0.5f) ? 2 : 0;
             byte |= (code << (b * 2));
         }
         out[i] = byte;
     }
-    /* Handle remainder */
     if(N % 4 != 0) {
         uint8_t byte = 0;
         for(uint32_t b = 0; b < N % 4; b++) {
@@ -176,139 +271,19 @@ static void f32_to_ternary_packed(uint8_t* out, const float* in, uint32_t N) {
 }
 
 /*============================================================================
- * Load a specific F32 tensor from the GGUF data section.
- * Returns malloc'd float array, or NULL on error.
- * rows*cols == total number of floats.
- *============================================================================*/
-
-static float* load_f32_tensor(FILE* f, long data_start,
-                               TensorInfo* ti, uint32_t rows, uint32_t cols) {
-    if(ti->type != GGML_TYPE_F32) {
-        fprintf(stderr, "loader: tensor '%s' is not F32 (type=%u)\n",
-                ti->name, ti->type);
-        return NULL;
-    }
-    uint64_t n_elem = (uint64_t)rows * cols;
-    float* data = malloc(n_elem * sizeof(float));
-    if(!data) return NULL;
-
-    long pos = data_start + (long)ti->offset;
-    if(fseek(f, pos, SEEK_SET)) { free(data); return NULL; }
-    if(fread(data, sizeof(float), n_elem, f) != n_elem) { free(data); return NULL; }
-    return data;
-}
-
-static float fp16_to_f32(uint16_t h) {
-    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
-    uint32_t exp  = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x03FF;
-    uint32_t f;
-    if (exp == 0) {
-        if (mant == 0) {
-            f = sign;
-        } else {
-            exp = 127 - 15 + 1;
-            while ((mant & 0x0400) == 0) {
-                mant <<= 1;
-                exp--;
-            }
-            mant &= 0x03FF;
-            f = sign | (exp << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        f = sign | 0x7F800000u | (mant << 13);
-    } else {
-        f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-    }
-    float out;
-    memcpy(&out, &f, sizeof(float));
-    return out;
-}
-
-static float* load_as_f32(FILE* f, long data_start,
-                           TensorInfo* ti, uint32_t n_elem) {
-    float* out = malloc((size_t)n_elem * sizeof(float));
-    if(!out) return NULL;
-
-    long pos = data_start + (long)ti->offset;
-    if(fseek(f, pos, SEEK_SET)) { free(out); return NULL; }
-
-    if(ti->type == GGML_TYPE_F32) {
-        if(fread(out, sizeof(float), n_elem, f) != n_elem) {
-            free(out);
-            return NULL;
-        }
-    } else if(ti->type == GGML_TYPE_F16) {
-        uint16_t* tmp = malloc((size_t)n_elem * sizeof(uint16_t));
-        if(!tmp) { free(out); return NULL; }
-        if(fread(tmp, sizeof(uint16_t), n_elem, f) != n_elem) {
-            free(tmp);
-            free(out);
-            return NULL;
-        }
-        for(uint32_t i = 0; i < n_elem; i++) out[i] = fp16_to_f32(tmp[i]);
-        free(tmp);
-    } else if(ti->type == GGML_TYPE_I8) {
-        int8_t* tmp = malloc(n_elem);
-        if(!tmp) { free(out); return NULL; }
-        if(fread(tmp, 1, n_elem, f) != n_elem) {
-            free(tmp);
-            free(out);
-            return NULL;
-        }
-        for(uint32_t i = 0; i < n_elem; i++) out[i] = (float)tmp[i];
-        free(tmp);
-    } else {
-        fprintf(stderr, "loader: unsupported tensor type %u\n", ti->type);
-        free(out);
-        return NULL;
-    }
-    return out;
-}
-
-#define I2S_QK 64u
-
-/* Real BitNet GGUF I2_S tensors are laid out as contiguous packed bytes:
- *   tensor_bytes = (rows * cols) / 4 + 32
- * There are no per-row scale blocks inside the payload for this model file.
- * Each 64-weight block occupies 16 bytes, with 4 groups of 16 weights packed
- * into bits [7:6], [5:4], [3:2], [1:0] of each byte.
- */
-static void i2s_row_to_packed(uint8_t* out, const uint8_t* row, uint32_t cols) {
-    uint32_t packed_row = (cols + 3) / 4;
-    memset(out, 0, packed_row);
-
-    uint32_t nblk = (cols + I2S_QK - 1) / I2S_QK;
-    for(uint32_t bi = 0; bi < nblk; bi++) {
-        const uint8_t* block = row + bi * (I2S_QK / 4);
-        for(uint32_t j = 0; j < I2S_QK && bi * I2S_QK + j < cols; j++) {
-            uint32_t k = bi * I2S_QK + j;
-            uint32_t group_idx = j / 16;
-            uint32_t group_pos = j % 16;
-            uint8_t raw = (block[group_pos] >> (6 - 2*group_idx)) & 0x3;
-            uint8_t code = (raw == 0) ? 2 : (raw == 1) ? 0 : 1;
-            out[k / 4] |= (code << ((k % 4) * 2));
-        }
-    }
-}
-
-/*============================================================================
- * Load a ternary projection layer:
- *   weight tensor [cols, rows] F32  -> packed [rows, cols/4] uint8
- *   scale tensor  [rows]       F32  -> float array [rows]
+ * load_ternary_proj
  *
- * GGUF stores weights in column-major: dims[0]=K(cols), dims[1]=N(rows)
- * So the raw F32 data is laid out as: [row0_col0, row0_col1, ..., row1_col0, ...]
- * when dims are [K, N] — actually GGUF is row-by-row in the file for F32.
- *
- * We read it as a flat [rows * cols] F32 array and pack row by row.
+ * Loads one projection layer weight matrix.
+ * For I2_S tensors: loads raw bytes, sets *is_i2s = true.
+ * For F32 tensors: packs into 2-bit ternary.
  *============================================================================*/
 
 static int load_ternary_proj(FILE* f, long data_start,
                               TensorInfo* tis, int n_tensors,
                               const char* wname, const char* sname,
                               uint32_t rows, uint32_t cols,
-                              uint8_t** w_out, float** s_out) {
+                              uint8_t** w_out, float** s_out,
+                              bool* is_i2s) {
     int wi = find_tensor(tis, n_tensors, wname);
     int si = find_tensor(tis, n_tensors, sname);
     if(wi < 0) {
@@ -316,17 +291,49 @@ static int load_ternary_proj(FILE* f, long data_start,
         return -1;
     }
 
-    uint32_t packed_row = (cols + 3) / 4;
-    uint8_t* packed = aligned_alloc(64, (size_t)rows * packed_row);
     float* scales = malloc(rows * sizeof(float));
-    if(!packed || !scales) {
-        free(packed);
-        free(scales);
-        return -1;
-    }
+    if(!scales) return -1;
+    for(uint32_t r = 0; r < rows; r++) scales[r] = 1.0f;
 
-    if(tis[wi].type == GGML_TYPE_F32) {
-        float* raw = load_f32_tensor(f, data_start, &tis[wi], rows, cols);
+    if(tis[wi].type == GGML_TYPE_I2_S) {
+        /* Load raw I2_S bytes — used directly by hs_ml_ternary_f32_proj */
+        uint8_t* raw = load_i2s_raw(f, data_start, &tis[wi], rows, cols);
+        if(!raw) { free(scales); return -1; }
+
+        /* Load per-tensor weight scale if present.
+         * BitNet uses a single scalar scale per projection:
+         *   output = ternary_proj(input, W) / weight_scale
+         * We store it in scales[0]; the inference code reads it from there. */
+        if(si >= 0) {
+            uint64_t scale_elems = tis[si].dims[0];
+            if(scale_elems == 1) {
+                /* Single scalar — broadcast to scales[0] */
+                float s;
+                long pos = data_start + (long)tis[si].offset;
+                if(fseek(f, pos, SEEK_SET) == 0 && fread(&s, sizeof(float), 1, f) == 1) {
+                    scales[0] = s;
+                    /* Broadcast to all rows for uniformity */
+                    for(uint32_t r = 1; r < rows; r++) scales[r] = s;
+                }
+            } else if(scale_elems == rows) {
+                long pos = data_start + (long)tis[si].offset;
+                if(fseek(f, pos, SEEK_SET) != 0 ||
+                   fread(scales, sizeof(float), rows, f) != rows)
+                    for(uint32_t r = 0; r < rows; r++) scales[r] = 1.0f;
+            }
+        }
+
+        *w_out  = raw;
+        *s_out  = scales;
+        if(is_i2s) *is_i2s = true;
+        return 0;
+
+    } else if(tis[wi].type == GGML_TYPE_F32) {
+        uint32_t packed_row = (cols + 3) / 4;
+        uint8_t* packed = aligned_alloc(64, (size_t)rows * packed_row);
+        if(!packed) { free(scales); return -1; }
+
+        float* raw = load_as_f32(f, data_start, &tis[wi], rows * cols);
         if(!raw) { free(packed); free(scales); return -1; }
         for(uint32_t r = 0; r < rows; r++)
             f32_to_ternary_packed(packed + r * packed_row, raw + r * cols, cols);
@@ -334,38 +341,21 @@ static int load_ternary_proj(FILE* f, long data_start,
 
         if(si >= 0) {
             long pos = data_start + (long)tis[si].offset;
-            if(fseek(f, pos, SEEK_SET) || fread(scales, sizeof(float), rows, f) != rows) {
+            if(fseek(f, pos, SEEK_SET) || fread(scales, sizeof(float), rows, f) != rows)
                 for(uint32_t r = 0; r < rows; r++) scales[r] = 1.0f;
-            }
-        } else {
-            for(uint32_t r = 0; r < rows; r++) scales[r] = 1.0f;
         }
-    } else if(tis[wi].type == GGML_TYPE_I2_S) {
-        size_t row_bytes = cols / 4;
-        uint8_t* row = malloc(row_bytes);
-        if(!row) { free(packed); free(scales); return -1; }
-        for(uint32_t r = 0; r < rows; r++) {
-            long pos = data_start + (long)tis[wi].offset + (long)r * (long)row_bytes;
-            if(fseek(f, pos, SEEK_SET) || fread(row, 1, row_bytes, f) != row_bytes) {
-                free(row);
-                free(packed);
-                free(scales);
-                return -1;
-            }
-            i2s_row_to_packed(packed + r * packed_row, row, cols);
-            scales[r] = 1.0f;
-        }
-        free(row);
+
+        *w_out  = packed;
+        *s_out  = scales;
+        if(is_i2s) *is_i2s = false;
+        return 0;
+
     } else {
-        fprintf(stderr, "loader: unsupported weight type %u for %s\n", tis[wi].type, wname);
-        free(packed);
+        fprintf(stderr, "loader: unsupported weight type %u for '%s'\n",
+                tis[wi].type, wname);
         free(scales);
         return -1;
     }
-
-    *w_out = packed;
-    *s_out = scales;
-    return 0;
 }
 
 /*============================================================================
@@ -397,11 +387,12 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
     /* ── Metadata KV pairs ── */
     uint32_t hidden_size = 0, n_layers = 0, n_heads = 0, n_kv_heads = 0, ffn_size = 0;
     uint32_t vocab_size  = 0, ctx_len  = 0;
+    uint32_t tokenizer_bos = 1, tokenizer_eos = 2;
     float    rope_freq   = 10000.0f;
-    char**   tokenizer_vocab = NULL;
-    char**   tokenizer_merges = NULL;
-    uint32_t num_merges = 0;
-    uint32_t tokenizer_bos = 1, tokenizer_eos = 2, tokenizer_pad = 0;
+
+    /* Tokenizer vocab storage */
+    char**   tok_vocab   = NULL;
+    uint32_t tok_vocab_n = 0;
 
     for(uint64_t i = 0; i < kv_count; i++) {
         char* key = rd_string(f);
@@ -409,7 +400,6 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
         uint32_t vtype;
         if(rd_u32(f, &vtype)) { free(key); goto fail; }
 
-        /* Extract keys we care about -- support llama.* and bitnet-b1.58.* */
 #define HAS_SUFFIX(k, s) (strstr((k), (s)) && strcmp(strstr((k), (s)), (s)) == 0)
         if(HAS_SUFFIX(key, ".embedding_length") && vtype == GGUF_TYPE_UINT32)
             rd_u32(f, &hidden_size);
@@ -427,51 +417,49 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
             rd_u32(f, &vocab_size);
         else if(HAS_SUFFIX(key, ".rope.freq_base") && vtype == GGUF_TYPE_FLOAT32)
             rd_f32(f, &rope_freq);
-#undef HAS_SUFFIX
-        /* Tokenizer tokens */
-        else if(strcmp(key, "tokenizer.ggml.tokens") == 0 && vtype == GGUF_TYPE_ARRAY) {
-            uint32_t elem_type;
-            uint64_t arr_len;
-            rd_u32(f, &elem_type);
-            rd_u64(f, &arr_len);
-            vocab_size = (uint32_t)arr_len;
-            tokenizer_vocab = calloc(vocab_size, sizeof(char*));
-            if(!tokenizer_vocab) { free(key); goto fail; }
-            for(uint64_t j = 0; j < arr_len; j++) tokenizer_vocab[j] = rd_string(f);
-        } else if(strcmp(key, "tokenizer.ggml.merges") == 0 && vtype == GGUF_TYPE_ARRAY) {
-            uint32_t elem_type;
-            uint64_t arr_len;
-            rd_u32(f, &elem_type);
-            rd_u64(f, &arr_len);
-            num_merges = (uint32_t)arr_len;
-            tokenizer_merges = calloc(num_merges, sizeof(char*));
-            if(!tokenizer_merges) { free(key); goto fail; }
-            for(uint64_t j = 0; j < arr_len; j++) tokenizer_merges[j] = rd_string(f);
-        } else if(strcmp(key, "tokenizer.ggml.bos_token_id") == 0 && vtype == GGUF_TYPE_UINT32) {
+        else if(strcmp(key, "tokenizer.ggml.bos_token_id") == 0 && vtype == GGUF_TYPE_UINT32)
             rd_u32(f, &tokenizer_bos);
-        } else if(strcmp(key, "tokenizer.ggml.eos_token_id") == 0 && vtype == GGUF_TYPE_UINT32) {
+        else if(strcmp(key, "tokenizer.ggml.eos_token_id") == 0 && vtype == GGUF_TYPE_UINT32)
             rd_u32(f, &tokenizer_eos);
-        } else if(strcmp(key, "tokenizer.ggml.padding_token_id") == 0 && vtype == GGUF_TYPE_UINT32) {
-            rd_u32(f, &tokenizer_pad);
-        } else {
+        else if(strcmp(key, "tokenizer.ggml.tokens") == 0 && vtype == GGUF_TYPE_ARRAY) {
+            /* Load tokenizer vocab */
+            uint32_t elem_type;
+            uint64_t arr_len;
+            rd_u32(f, &elem_type);
+            rd_u64(f, &arr_len);
+            if(!vocab_size) vocab_size = (uint32_t)arr_len;
+            tok_vocab_n = (uint32_t)arr_len;
+            tok_vocab = calloc(tok_vocab_n, sizeof(char*));
+            for(uint64_t j = 0; j < arr_len; j++) {
+                char* tok = rd_string(f);
+                if(tok_vocab && j < tok_vocab_n) tok_vocab[j] = tok;
+                else free(tok);
+            }
+        }
+#undef HAS_SUFFIX
+        else {
             if(skip_value(f, vtype)) { free(key); goto fail; }
         }
         free(key);
     }
 
     if(!hidden_size || !n_layers || !n_heads || !ffn_size || !vocab_size) {
-        fprintf(stderr, "loader: missing required metadata (hidden=%u layers=%u heads=%u ffn=%u vocab=%u)\n",
+        fprintf(stderr, "loader: missing required metadata "
+                "(hidden=%u layers=%u heads=%u ffn=%u vocab=%u)\n",
                 hidden_size, n_layers, n_heads, ffn_size, vocab_size);
         goto fail;
     }
-    if(!ctx_len) ctx_len = 4096;
+    if(!ctx_len)    ctx_len  = 4096;
     if(!n_kv_heads) n_kv_heads = n_heads;
-    printf("loader: hidden=%u layers=%u Q-heads=%u KV-heads=%u ffn=%u vocab=%u ctx=%u rope=%.0f\n",
-           hidden_size, n_layers, n_heads, n_kv_heads, ffn_size, vocab_size, ctx_len, rope_freq);
+    printf("loader: hidden=%u layers=%u Q-heads=%u KV-heads=%u ffn=%u "
+           "vocab=%u ctx=%u rope=%.0f bos=%u eos=%u\n",
+           hidden_size, n_layers, n_heads, n_kv_heads, ffn_size,
+           vocab_size, ctx_len, rope_freq, tokenizer_bos, tokenizer_eos);
 
     /* ── Tensor infos ── */
     if(tensor_count > MAX_TENSORS) {
-        fprintf(stderr, "loader: too many tensors (%llu)\n", (unsigned long long)tensor_count);
+        fprintf(stderr, "loader: too many tensors (%llu)\n",
+                (unsigned long long)tensor_count);
         goto fail;
     }
     TensorInfo* tis = calloc((size_t)tensor_count, sizeof(TensorInfo));
@@ -505,15 +493,12 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
     m->ffn_hidden_size = ffn_size;
     m->max_context     = ctx_len;
     m->rope_theta      = rope_freq;
-    m->use_i2s         = true;
-    m->use_i2s         = true;
-    m->use_i2s         = true;
-    m->tokenizer_vocab  = tokenizer_vocab;
-    m->tokenizer_bos    = tokenizer_bos;
-    m->tokenizer_eos    = tokenizer_eos;
-    m->tokenizer_pad    = tokenizer_pad;
-    m->tokenizer_merges = tokenizer_merges;
-    m->num_merges       = num_merges;
+    m->use_i2s         = false;  /* set true below when I2_S tensors found */
+    m->tokenizer_bos   = tokenizer_bos;
+    m->tokenizer_eos   = tokenizer_eos;
+    m->tokenizer_vocab = tok_vocab;
+    m->num_merges      = 0;
+    tok_vocab          = NULL;  /* model owns it now */
 
     /* Non-quantized weights */
     m->embedding  = malloc((size_t)vocab_size * hidden_size * sizeof(float));
@@ -521,26 +506,39 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
     m->final_norm = malloc(hidden_size * sizeof(float));
     if(!m->embedding || !m->lm_head || !m->final_norm) { free(tis); goto fail; }
 
-    /* Load embedding */
+    /* Load embedding (F16 in real model) */
     {
         int idx = find_tensor(tis, (int)tensor_count, "token_embd.weight");
-        if(idx < 0) { fprintf(stderr, "loader: missing token_embd.weight\n"); free(tis); goto fail; }
-        /* GGUF shape [hidden, vocab] — read as vocab*hidden floats */
+        if(idx < 0) {
+            fprintf(stderr, "loader: missing token_embd.weight\n");
+            free(tis); goto fail;
+        }
         float* raw = load_as_f32(f, data_start, &tis[idx], vocab_size * hidden_size);
         if(!raw) { free(tis); goto fail; }
         memcpy(m->embedding, raw, (size_t)vocab_size * hidden_size * sizeof(float));
         free(raw);
+        printf("loader: embedding loaded (type=%u)\n", tis[idx].type);
     }
 
-    /* Load lm_head */
+    /* Load lm_head (or weight tying) */
     {
         int idx = find_tensor(tis, (int)tensor_count, "output.weight");
         if(idx >= 0) {
             float* raw = load_as_f32(f, data_start, &tis[idx], vocab_size * hidden_size);
-            if(raw) { memcpy(m->lm_head, raw, (size_t)vocab_size * hidden_size * sizeof(float)); free(raw); }
+            if(raw) {
+                memcpy(m->lm_head, raw, (size_t)vocab_size * hidden_size * sizeof(float));
+                free(raw);
+                printf("loader: lm_head loaded (type=%u)\n", tis[idx].type);
+            } else {
+                memcpy(m->lm_head, m->embedding,
+                       (size_t)vocab_size * hidden_size * sizeof(float));
+                printf("loader: lm_head load failed, using embedding (weight tying)\n");
+            }
         } else {
-            /* Use embedding weights as lm_head (weight tying) */
-            memcpy(m->lm_head, m->embedding, (size_t)vocab_size * hidden_size * sizeof(float));
+            /* Weight tying: tie_word_embeddings = True */
+            memcpy(m->lm_head, m->embedding,
+                   (size_t)vocab_size * hidden_size * sizeof(float));
+            printf("loader: no output.weight, using embedding (weight tying)\n");
         }
     }
 
@@ -550,6 +548,7 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
         if(idx >= 0) {
             float* raw = load_as_f32(f, data_start, &tis[idx], hidden_size);
             if(raw) { memcpy(m->final_norm, raw, hidden_size * sizeof(float)); free(raw); }
+            else { for(uint32_t i = 0; i < hidden_size; i++) m->final_norm[i] = 1.0f; }
         } else {
             for(uint32_t i = 0; i < hidden_size; i++) m->final_norm[i] = 1.0f;
         }
@@ -559,53 +558,57 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
     m->layers = calloc(n_layers, sizeof(HSTernaryLayer));
     if(!m->layers) { free(tis); goto fail; }
 
+    u32 kv_size = n_kv_heads * (hidden_size / n_heads);
+
     for(uint32_t l = 0; l < n_layers; l++) {
         HSTernaryLayer* lay = &m->layers[l];
         char wname[256], sname[256];
 
-        /* Norms */
+        /* Norms — allocate and default to 1 */
         lay->attn_norm     = malloc(hidden_size * sizeof(float));
         lay->attn_sub_norm = malloc(hidden_size * sizeof(float));
         lay->ffn_norm      = malloc(hidden_size * sizeof(float));
         lay->ffn_sub_norm  = malloc(ffn_size * sizeof(float));
-        if(!lay->attn_norm || !lay->attn_sub_norm || !lay->ffn_norm || !lay->ffn_sub_norm) { free(tis); goto fail; }
-        for(uint32_t i = 0; i < hidden_size; i++) { lay->attn_norm[i] = 1.0f; lay->attn_sub_norm[i] = 1.0f; lay->ffn_norm[i] = 1.0f; }
+        if(!lay->attn_norm || !lay->attn_sub_norm ||
+           !lay->ffn_norm  || !lay->ffn_sub_norm) { free(tis); goto fail; }
+        for(uint32_t i = 0; i < hidden_size; i++) {
+            lay->attn_norm[i]     = 1.0f;
+            lay->attn_sub_norm[i] = 1.0f;
+            lay->ffn_norm[i]      = 1.0f;
+        }
         for(uint32_t i = 0; i < ffn_size; i++) lay->ffn_sub_norm[i] = 1.0f;
 
-        /* Load attn_norm */
+        /* Load norms from GGUF (may be garbage for the real model — override
+         * with hs_mlt_load_norms_sidecar() after loading) */
         snprintf(wname, sizeof(wname), "blk.%u.attn_norm.weight", l);
-        int ni = find_tensor(tis, (int)tensor_count, wname);
-        if(ni >= 0) {
-            float* raw = load_as_f32(f, data_start, &tis[ni], hidden_size);
-            if(raw) { memcpy(lay->attn_norm, raw, hidden_size * sizeof(float)); free(raw); }
-        }
+        { int ni = find_tensor(tis, (int)tensor_count, wname);
+          if(ni >= 0) {
+              float* r = load_as_f32(f, data_start, &tis[ni], hidden_size);
+              if(r) { memcpy(lay->attn_norm, r, hidden_size*sizeof(float)); free(r); }
+          } }
 
-        /* Load attn_sub_norm */
         snprintf(wname, sizeof(wname), "blk.%u.attn_sub_norm.weight", l);
-        ni = find_tensor(tis, (int)tensor_count, wname);
-        if(ni >= 0) {
-            float* raw = load_as_f32(f, data_start, &tis[ni], hidden_size);
-            if(raw) { memcpy(lay->attn_sub_norm, raw, hidden_size * sizeof(float)); free(raw); }
-        }
+        { int ni = find_tensor(tis, (int)tensor_count, wname);
+          if(ni >= 0) {
+              float* r = load_as_f32(f, data_start, &tis[ni], hidden_size);
+              if(r) { memcpy(lay->attn_sub_norm, r, hidden_size*sizeof(float)); free(r); }
+          } }
 
-        /* Load ffn_norm */
         snprintf(wname, sizeof(wname), "blk.%u.ffn_norm.weight", l);
-        ni = find_tensor(tis, (int)tensor_count, wname);
-        if(ni >= 0) {
-            float* raw = load_as_f32(f, data_start, &tis[ni], hidden_size);
-            if(raw) { memcpy(lay->ffn_norm, raw, hidden_size * sizeof(float)); free(raw); }
-        }
+        { int ni = find_tensor(tis, (int)tensor_count, wname);
+          if(ni >= 0) {
+              float* r = load_as_f32(f, data_start, &tis[ni], hidden_size);
+              if(r) { memcpy(lay->ffn_norm, r, hidden_size*sizeof(float)); free(r); }
+          } }
 
-        /* Load ffn_sub_norm */
         snprintf(wname, sizeof(wname), "blk.%u.ffn_sub_norm.weight", l);
-        ni = find_tensor(tis, (int)tensor_count, wname);
-        if(ni >= 0) {
-            float* raw = load_as_f32(f, data_start, &tis[ni], ffn_size);
-            if(raw) { memcpy(lay->ffn_sub_norm, raw, ffn_size * sizeof(float)); free(raw); }
-        }
+        { int ni = find_tensor(tis, (int)tensor_count, wname);
+          if(ni >= 0) {
+              float* r = load_as_f32(f, data_start, &tis[ni], ffn_size);
+              if(r) { memcpy(lay->ffn_sub_norm, r, ffn_size*sizeof(float)); free(r); }
+          } }
 
-        /* Allocate scales */
-        u32 kv_size = n_kv_heads * (hidden_size / n_heads);
+        /* Allocate scale arrays (used only in int8 path; set to 1 for I2_S) */
         lay->q_scale    = malloc(hidden_size * sizeof(float));
         lay->k_scale    = malloc(kv_size * sizeof(float));
         lay->v_scale    = malloc(kv_size * sizeof(float));
@@ -618,100 +621,208 @@ int hs_mlt_load_gguf(HSMLTernary* m, const char* path) {
             free(tis); goto fail;
         }
 
-/* Helper macro to load one ternary projection */
-#define LOAD_PROJ(field_w, field_s, basename, rows, cols) do { \
-    snprintf(wname, sizeof(wname), "blk.%u." basename ".weight", l); \
-    snprintf(sname, sizeof(sname), "blk.%u." basename ".weight_scale", l); \
+        /* Load projection weights.
+         * LOAD_PROJ detects I2_S and accumulates use_i2s flag. */
+        bool layer_i2s = false;
+
+#define LOAD_PROJ(fw, fs, base, rows, cols) do { \
+    snprintf(wname, sizeof(wname), "blk.%u." base ".weight", l); \
+    snprintf(sname, sizeof(sname), "blk.%u." base ".weight_scale", l); \
+    bool _i2s = false; \
     if(load_ternary_proj(f, data_start, tis, (int)tensor_count, \
                          wname, sname, rows, cols, \
-                         &lay->field_w, &lay->field_s)) { \
-        fprintf(stderr, "loader: failed to load %s\n", wname); \
+                         &lay->fw, &lay->fs, &_i2s)) { \
+        fprintf(stderr, "loader: failed '%s'\n", wname); \
         free(tis); goto fail; \
     } \
+    if(_i2s) layer_i2s = true; \
 } while(0)
 
-        LOAD_PROJ(q_proj,    q_scale,    "attn_q",       hidden_size, hidden_size);
-        LOAD_PROJ(k_proj,    k_scale,    "attn_k",       kv_size, hidden_size);
-        LOAD_PROJ(v_proj,    v_scale,    "attn_v",       kv_size, hidden_size);
-        LOAD_PROJ(o_proj,    o_scale,    "attn_output",  hidden_size, hidden_size);
-        LOAD_PROJ(gate_proj, gate_scale, "ffn_gate",     ffn_size,    hidden_size);
-        LOAD_PROJ(up_proj,   up_scale,   "ffn_up",       ffn_size,    hidden_size);
-        LOAD_PROJ(down_proj, down_scale, "ffn_down",     hidden_size, ffn_size);
+        LOAD_PROJ(q_proj,    q_scale,    "attn_q",      hidden_size, hidden_size);
+        LOAD_PROJ(k_proj,    k_scale,    "attn_k",      kv_size,     hidden_size);
+        LOAD_PROJ(v_proj,    v_scale,    "attn_v",      kv_size,     hidden_size);
+        LOAD_PROJ(o_proj,    o_scale,    "attn_output", hidden_size, hidden_size);
+        LOAD_PROJ(gate_proj, gate_scale, "ffn_gate",    ffn_size,    hidden_size);
+        LOAD_PROJ(up_proj,   up_scale,   "ffn_up",      ffn_size,    hidden_size);
+        LOAD_PROJ(down_proj, down_scale, "ffn_down",    hidden_size, ffn_size);
 
 #undef LOAD_PROJ
+
+        if(layer_i2s) m->use_i2s = true;
+
+        if((l % 5 == 0) || l == n_layers - 1)
+            printf("loader: layer %u/%u loaded%s\n", l+1, n_layers,
+                   layer_i2s ? " (I2_S)" : " (F32)");
     }
 
     /* Scratch buffers */
     uint32_t max_dim = (hidden_size > ffn_size) ? hidden_size : ffn_size;
-    m->quant_buf  = aligned_alloc(64, max_dim * sizeof(int8_t));
+    m->quant_buf  = aligned_alloc(64, max_dim);           /* int8 */
     m->gemm_buf   = aligned_alloc(64, max_dim * sizeof(int32_t));
     m->hidden_buf = malloc(hidden_size * sizeof(float));
     m->ffn_buf    = malloc(ffn_size * sizeof(float));
     m->q_buf      = malloc(hidden_size * sizeof(float));
-    m->k_buf      = malloc(hidden_size * sizeof(float));
-    m->v_buf      = malloc(hidden_size * sizeof(float));
+    m->k_buf      = malloc(kv_size * sizeof(float));
+    m->v_buf      = malloc(kv_size * sizeof(float));
     m->attn_buf   = calloc(hidden_size, sizeof(float));
     m->gate_buf   = malloc(ffn_size * sizeof(float));
     m->up_buf     = malloc(ffn_size * sizeof(float));
     m->score_buf  = malloc(ctx_len * sizeof(float));
-    m->ffn_qbuf   = aligned_alloc(64, ffn_size * sizeof(int8_t));
+    m->ffn_qbuf   = aligned_alloc(64, ffn_size);          /* int8 */
 
     if(!m->quant_buf || !m->gemm_buf || !m->hidden_buf || !m->ffn_buf ||
        !m->q_buf || !m->k_buf || !m->v_buf || !m->attn_buf ||
        !m->gate_buf || !m->up_buf || !m->score_buf || !m->ffn_qbuf) {
         free(tis); goto fail;
     }
-    /* Load real BF16 norms from sidecar file (extracted from HF checkpoint).
-     * The GGUF norm tensors are corrupt (upstream converter bug).
-     * Sidecar format: u32 header_len + JSON header + BF16 data */
-    /* Load real BF16 norms from v2 sidecar (simple binary, no JSON) */
-    if (m->use_i2s) {
-        const char *np = "/home/ztflynn/001/neogpu/models/norms_v2.bin";
-        FILE *nf = fopen(np, "rb");
-        if (nf) {
-            uint32_t magic, nt;
-            fread(&magic, 4, 1, nf); fread(&nt, 4, 1, nf);
-            if (magic == 0x4E524D32) {
-                for (uint32_t ti = 0; ti < nt; ti++) {
-                    uint32_t nl, nv;
-                    fread(&nl, 4, 1, nf);
-                    char tname[256]; fread(tname, 1, nl, nf); tname[nl] = 0;
-                    fread(&nv, 4, 1, nf);
-                    uint16_t *buf = malloc(nv * 2);
-                    fread(buf, 2, nv, nf);
-                    /* Match name to field */
-                    u32 layer = 0; int matched = 0;
-                    if (sscanf(tname, "model.layers.%u.", &layer) == 1 && layer < n_layers) {
-                        HSTernaryLayer *lay = &m->layers[layer];
-                        float *dst = NULL; u32 dsz = 0;
-                        if (strstr(tname, ".input_layernorm.")) { dst = lay->attn_norm; dsz = hidden_size; }
-                        else if (strstr(tname, ".attn_sub_norm.")) { dst = lay->attn_sub_norm; dsz = hidden_size; }
-                        else if (strstr(tname, ".post_attention_layernorm.")) { dst = lay->ffn_norm; dsz = hidden_size; }
-                        else if (strstr(tname, ".ffn_sub_norm.")) { dst = lay->ffn_sub_norm; dsz = ffn_size; }
-                        if (dst && dsz <= nv) {
-                            for (u32 i = 0; i < dsz; i++) { uint32_t bits = (uint32_t)buf[i] << 16; memcpy(&dst[i], &bits, 4); }
-                            matched = 1;
-                        }
-                    } else if (strcmp(tname, "model.norm.weight") == 0 && nv >= hidden_size) {
-                        for (u32 i = 0; i < hidden_size; i++) { uint32_t bits = (uint32_t)buf[i] << 16; memcpy(&m->final_norm[i], &bits, 4); }
-                        matched = 1;
-                    }
-                    free(buf);
-                }
-                printf("loader: loaded real BF16 norms from %s\n", np);
-            }
-            fclose(nf);
-        }
-    }
 
     free(tis);
     fclose(f);
     m->loaded = true;
-    printf("loader: model loaded successfully\n");
+    printf("loader: model loaded — use_i2s=%d rope_theta=%.0f\n",
+           (int)m->use_i2s, m->rope_theta);
     return 0;
 
 fail:
+    if(tok_vocab) {
+        for(uint32_t i = 0; i < tok_vocab_n; i++) free(tok_vocab[i]);
+        free(tok_vocab);
+    }
     fclose(f);
     hs_mlt_free(m);
     return -1;
+}
+
+/*============================================================================
+ * hs_mlt_load_norms_sidecar
+ *
+ * Loads BF16 norm weights from norms_v2.bin sidecar.
+ * These were extracted directly from the HuggingFace safetensors checkpoint
+ * via HTTP range request because the GGUF converter produces corrupt norms.
+ *
+ * File format:
+ *   magic:     u32 = 0x4E524D32 ("NRM2")
+ *   n_tensors: u32
+ *   for each tensor:
+ *     name_len: u32
+ *     name:     char[name_len]  (NOT null-terminated in file)
+ *     n_values: u32
+ *     data:     bf16[n_values]
+ *
+ * Tensor names are HuggingFace convention:
+ *   model.layers.{l}.input_layernorm.weight         -> attn_norm
+ *   model.layers.{l}.self_attn.attn_sub_norm.weight -> attn_sub_norm
+ *   model.layers.{l}.post_attention_layernorm.weight -> ffn_norm
+ *   model.layers.{l}.mlp.ffn_sub_norm.weight        -> ffn_sub_norm
+ *   model.norm.weight                                -> final_norm
+ *============================================================================*/
+
+#define NORMS_SIDECAR_MAGIC 0x4E524D32u  /* "NRM2" little-endian */
+
+int hs_mlt_load_norms_sidecar(HSMLTernary* m, const char* path) {
+    if(!m || !m->loaded || !path) return -1;
+
+    FILE* f = fopen(path, "rb");
+    if(!f) {
+        fprintf(stderr, "norms_sidecar: cannot open '%s'\n", path);
+        return -1;
+    }
+
+    uint32_t magic, n_tensors;
+    if(rd_u32(f, &magic) || magic != NORMS_SIDECAR_MAGIC) {
+        fprintf(stderr, "norms_sidecar: bad magic 0x%08X (expected 0x%08X) in '%s'\n",
+                magic, NORMS_SIDECAR_MAGIC, path);
+        fclose(f); return -1;
+    }
+    if(rd_u32(f, &n_tensors)) { fclose(f); return -1; }
+    printf("norms_sidecar: loading %u norm tensors from '%s'\n", n_tensors, path);
+
+    uint32_t loaded = 0, skipped = 0;
+    for(uint32_t t = 0; t < n_tensors; t++) {
+        uint32_t name_len, n_values;
+        if(rd_u32(f, &name_len)) break;
+        if(name_len >= MAX_NAME) {
+            /* Skip oversized name + data */
+            fseek(f, name_len, SEEK_CUR);
+            if(rd_u32(f, &n_values)) break;
+            fseek(f, n_values * 2, SEEK_CUR);
+            skipped++;
+            continue;
+        }
+
+        char name[MAX_NAME] = {0};
+        if(fread(name, 1, name_len, f) != name_len) break;
+        name[name_len] = '\0';
+
+        if(rd_u32(f, &n_values)) break;
+
+        /* Read BF16 values and convert to float32 */
+        uint16_t* bf16 = malloc(n_values * sizeof(uint16_t));
+        if(!bf16) { fseek(f, n_values * 2, SEEK_CUR); skipped++; continue; }
+        if(fread(bf16, 2, n_values, f) != n_values) { free(bf16); break; }
+
+        float* vals = malloc(n_values * sizeof(float));
+        if(!vals) { free(bf16); skipped++; continue; }
+        for(uint32_t i = 0; i < n_values; i++) vals[i] = bf16_to_f32(bf16[i]);
+        free(bf16);
+
+        /* Route tensor to correct model field using HF name convention */
+        bool placed = false;
+
+        /* Final norm: model.norm.weight */
+        if(strcmp(name, "model.norm.weight") == 0 && n_values == m->hidden_size) {
+            memcpy(m->final_norm, vals, n_values * sizeof(float));
+            placed = true;
+        } else {
+            /* Per-layer norms: model.layers.{l}.<path>.weight */
+            uint32_t layer_idx = 0;
+            char rest[MAX_NAME] = {0};
+            if(sscanf(name, "model.layers.%u.%255s", &layer_idx, rest) == 2
+               && layer_idx < m->num_layers) {
+                HSTernaryLayer* lay = &m->layers[layer_idx];
+
+                if(strcmp(rest, "input_layernorm.weight") == 0
+                   && n_values == m->hidden_size) {
+                    /* input_layernorm = attn_norm (pre-attention RMSNorm) */
+                    memcpy(lay->attn_norm, vals, n_values * sizeof(float));
+                    placed = true;
+                } else if(strcmp(rest, "self_attn.attn_sub_norm.weight") == 0
+                          && n_values == m->hidden_size) {
+                    /* attn_sub_norm (BitNet subln after attention) */
+                    memcpy(lay->attn_sub_norm, vals, n_values * sizeof(float));
+                    placed = true;
+                } else if(strcmp(rest, "post_attention_layernorm.weight") == 0
+                          && n_values == m->hidden_size) {
+                    /* post_attention_layernorm = ffn_norm (pre-FFN RMSNorm) */
+                    memcpy(lay->ffn_norm, vals, n_values * sizeof(float));
+                    placed = true;
+                } else if(strcmp(rest, "mlp.ffn_sub_norm.weight") == 0
+                          && n_values == m->ffn_hidden_size) {
+                    /* ffn_sub_norm (BitNet subln after gate*up) */
+                    memcpy(lay->ffn_sub_norm, vals, n_values * sizeof(float));
+                    placed = true;
+                }
+            }
+        }
+
+        free(vals);
+        if(placed) loaded++;
+        else {
+            if(skipped < 5)
+                fprintf(stderr, "norms_sidecar: unrecognised '%s' (n=%u)\n",
+                        name, n_values);
+            skipped++;
+        }
+    }
+
+    fclose(f);
+    printf("norms_sidecar: placed %u/%u norm tensors (%u skipped)\n",
+           loaded, n_tensors, skipped);
+
+    /* Sanity check: we expect 121 tensors (30*4 + 1) */
+    if(loaded < m->num_layers * 4) {
+        fprintf(stderr, "norms_sidecar: WARNING — only %u norms placed, "
+                "expected %u\n", loaded, m->num_layers * 4 + 1);
+    }
+    return (loaded > 0) ? 0 : -1;
 }
