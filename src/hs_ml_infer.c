@@ -369,11 +369,11 @@ static void f32_proj(HSMLTernary* m, float* out, const float* in,
     hs_ml_ternary_f32_proj(out, in, W, N, K);
 
     /* Apply per-tensor weight scale from BitNet quantization.
-     * The model stores ternary weights {-1,0,+1} but the effective weight
-     * during inference is ternary / weight_scale. All rows share the same scale. */
+     * weight_scale = mean(|w_original|). Ternary = round(w / scale).
+     * To recover original magnitude: output = ternary_proj(input) * scale. */
     if (weight_scale && weight_scale[0] != 1.0f) {
-        float inv_scale = 1.0f / weight_scale[0];
-        for (u32 i = 0; i < N; i++) out[i] *= inv_scale;
+        float s = weight_scale[0];
+        for (u32 i = 0; i < N; i++) out[i] *= s;
     }
 
     g_mlt_stats.total_gemm_calls++;
