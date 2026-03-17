@@ -223,7 +223,7 @@ static void neon_rope_impl(float* x, uint32_t num_heads, uint32_t head_dim, uint
 #include <xf86drm.h>
 #include <linux/dma-buf.h>
 
-#define V3D_DEV_PATH "/dev/dri/card1"
+#define V3D_DEV_PATH "/dev/dri/renderD128"
 
 typedef struct {
     int fd;
@@ -242,11 +242,28 @@ static int v3d_alloc(size_t size, uint32_t* handle_out) {
 
 static int v3d_submit(void* prog, uint32_t size, uint32_t qpus) {
     if (g_v3d_ctx.fd < 0) return -1;
-    struct drm_v3d_submit_cs submit = {
-        .qpu = true, .qpu_offsets = 0, .qpu_size = size,
-        .qpu_bo_handles = 0, .uniforms = 0, .qpu_count = qpus,
+    
+    // DRM_V3D_SUBMIT_CS (QPU assembly) not available on this driver
+    // Use DRM_V3D_SUBMIT_CSD (compute shader dispatch) instead
+    struct drm_v3d_submit_csd csd = {
+        .cfg[0] = qpus,  // workgroup count
+        .cfg[1] = 1,
+        .cfg[2] = 1,
+        .cfg[3] = 8,     // local size x
+        .cfg[4] = 1,
+        .cfg[5] = 1,
+        .cfg[6] = 0,
+        .coef = {0},
+        .bo_handles = 0,
+        .bo_handle_count = 0,
+        .in_sync = 0,
+        .out_sync = 0,
+        .perfmon_id = 0,
+        .extensions = 0,
+        .flags = 0,
+        .pad = 0,
     };
-    return drmIoctl(g_v3d_ctx.fd, DRM_V3D_SUBMIT_CS, &submit);
+    return drmIoctl(g_v3d_ctx.fd, DRM_V3D_SUBMIT_CSD, &csd);
 }
 #endif
 
