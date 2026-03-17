@@ -1,0 +1,74 @@
+#version 310 es
+precision highp float;
+
+layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer WeightBuffer {
+    uint weights[];  // Use uint instead of uint8_t[]
+};
+
+layout(std430, binding = 1) readonly buffer InputBuffer {
+    float inputs[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutputBuffer {
+    float outputs[];
+};
+
+struct Uniforms {
+    uint N;      // output rows
+    uint K;      // input cols
+    uint row;    // current row
+};
+
+layout(binding = 3) uniform UB {
+    Uniforms u;
+};
+
+float ternary_decode(uint w, float a0, float a1, float a2, float a3) {
+    float result = 0.0;
+    
+    // Extract each nibble and decode
+    uint c0 = w & 0x3u;
+    if (c0 == 0u) result -= a0;
+    else if (c0 == 2u) result += a0;
+    
+    uint c1 = (w >> 2) & 0x3u;
+    if (c1 == 0u) result -= a1;
+    else if (c1 == 2u) result += a1;
+    
+    uint c2 = (w >> 4) & 0x3u;
+    if (c2 == 0u) result -= a2;
+    else if (c2 == 2u) result += a2;
+    
+    uint c3 = (w >> 6) & 0x3u;
+    if (c3 == 0u) result -= a3;
+    else if (c3 == 2u) result += a3;
+    
+    return result;
+}
+
+void main() {
+    uint out_idx = gl_GlobalInvocationID.x;
+    if (out_idx >= u.N) return;
+    
+    uint weight_row_offset = u.row * (u.K / 4u);
+    float acc = 0.0;
+    
+    // Each thread processes one column
+    for (uint k = 0u; k < u.K; k++) {
+        uint weight_idx = weight_row_offset + k;
+        uint w = weights[weight_idx];
+        
+        // Load corresponding 4 activation values
+        uint in_base = k * 4u;
+        float a0 = inputs[in_base + 0u];
+        float a1 = inputs[in_base + 1u];
+        float a2 = inputs[in_base + 2u];
+        float a3 = inputs[in_base + 3u];
+        
+        acc += ternary_decode(w, a0, a1, a2, a3);
+    }
+    
+    outputs[out_idx] = acc;
+}
