@@ -60,3 +60,13 @@
 - Revert benchmark regressions and document rejected ideas.
 - Favor low-risk structural or arithmetic wins over clever heuristics that add coordination or branch complexity.
 - Only keep optimizations that survive both measurement and correctness checks.
+- Always compare against the fastest CPU implementation available (e.g., NEON SIMD), not naive C.
+
+## GPU Acceleration Status (Pi4 V3D)
+
+**Current: 1.25x GPU speedup for lm_head (128K vocab)**
+
+- GPU requires `-DHAS_GLES_COMPUTE` flag to compile
+- Weights must be preloaded once at startup (not per-inference)
+- Benchmark: `tests/bench_cpu_gpu_comm`
+- Config: `/boot/firmware/config.txt` with `gpu_mem=512 gpu_freq=750 core_freq=750 cma=256`
