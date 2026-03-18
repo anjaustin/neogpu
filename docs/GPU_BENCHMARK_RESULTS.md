@@ -99,3 +99,18 @@ CPU→GPU bus is ~7x slower than RAM, but overhead is <1ms - acceptable.
 2. Test QKV projections with batched dispatch
 3. Profile end-to-end token generation
 4. Investigate stability issues with smaller workgroups
+
+## End-to-End Inference Results
+
+### profile_step_trit (CPU-only)
+```
+decode step with ternary lm_head: 973.9 ms
+```
+
+### With GPU (lm_head on GPU)
+```
+lm_head: 561.1 ms (GPU)
+TOTAL: 1222.2 ms
+```
+
+Note: The full inference test shows GPU is being used for lm_head. The GPU benchmark confirms 1.25x speedup for lm_head specifically. Full end-to-end comparison requires rebuilding the profile_step tool with proper GPU integration.
