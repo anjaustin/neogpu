@@ -21,7 +21,7 @@
 #include <sys/ioctl.h>
 
 #define V3D_DEV "/dev/dri/renderD128"
-#define SHADER_FILE "tests/ternary_v3d.spv"
+#define SHADER_FILE "ternary_v3d.spv"
 
 static int v3d_create_bo(int fd, size_t size, uint32_t* handle) {
     struct drm_v3d_create_bo bo = { .size = size };

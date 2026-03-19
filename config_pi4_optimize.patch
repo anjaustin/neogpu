@@ -1,0 +1,15 @@
+--- a/config.txt
++++ b/config.txt
+@@ -38,7 +38,14 @@ dtoverlay=dwc2
+
+ [pi4]
+ max_framebuffers=2
+ arm_boost=1
++# GPU optimizations for LLM inference - ADD THESE:
++gpu_mem=512          # Max GPU memory (was 76MB)
++gpu_freq=750         # GPU frequency in MHz (was 500MHz)
++core_freq=750        # Core frequency in MHz (was 500MHz)
++cma=256              # Contiguous memory allocator for GPU
+
+ [pi3+]
+ # Use a smaller contiguous memory area, specifically on the 3A+ to avoid an

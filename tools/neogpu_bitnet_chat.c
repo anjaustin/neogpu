@@ -268,6 +268,7 @@ int main(int argc, char **argv) {
     printf("token_ids:");
     for (u32 i = 0; i < n; i++) printf(" %u", tokens[i]);
     printf("\n");
+    fflush(stdout);
 
     HSMLTernarySession s;
     if (hs_mlt_session_init(&s, &m) != 0) return 5;

@@ -1,74 +1,82 @@
 #version 310 es
 precision highp float;
+precision highp int;
 
-layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
+/*
+ * Ternary GEMM Compute Shader for V3D
+ * 
+ * Computes: output[n] = sum_k(ternary_weight[n,k] * input[k])
+ * 
+ * Each thread computes ONE output element.
+ * gl_GlobalInvocationID.x = output index n
+ * 
+ * BitNet I2_S encoding (GGUF type 36):
+ *   Sequential 2-bit packing, 4 weights per byte, low bits first.
+ *   Code mapping: 0=-1, 1=0, 2=+1, 3=0
+ * 
+ * Weights are packed: 4 weights per byte, LSB first.
+ * Byte layout: [w0:2][w1:2][w2:2][w3:2]
+ *   w0 = bits[1:0], w1 = bits[3:2], w2 = bits[5:4], w3 = bits[7:6]
+ */
 
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+/* Packed ternary weights: N * (K/4) bytes, stored as uint for alignment */
 layout(std430, binding = 0) readonly buffer WeightBuffer {
-    uint weights[];  // Use uint instead of uint8_t[]
+    uint weights[];
 };
 
+/* Input activations: K floats */
 layout(std430, binding = 1) readonly buffer InputBuffer {
     float inputs[];
 };
 
+/* Output: N floats */
 layout(std430, binding = 2) writeonly buffer OutputBuffer {
     float outputs[];
 };
 
-struct Uniforms {
-    uint N;      // output rows
-    uint K;      // input cols
-    uint row;    // current row
+/* Uniforms */
+layout(std430, binding = 3) readonly buffer UniformBuffer {
+    uint N;      /* Number of output elements */
+    uint K;      /* Number of input elements (must be multiple of 4) */
 };
-
-layout(binding = 3) uniform UB {
-    Uniforms u;
-};
-
-float ternary_decode(uint w, float a0, float a1, float a2, float a3) {
-    float result = 0.0;
-    
-    // Extract each nibble and decode
-    uint c0 = w & 0x3u;
-    if (c0 == 0u) result -= a0;
-    else if (c0 == 2u) result += a0;
-    
-    uint c1 = (w >> 2) & 0x3u;
-    if (c1 == 0u) result -= a1;
-    else if (c1 == 2u) result += a1;
-    
-    uint c2 = (w >> 4) & 0x3u;
-    if (c2 == 0u) result -= a2;
-    else if (c2 == 2u) result += a2;
-    
-    uint c3 = (w >> 6) & 0x3u;
-    if (c3 == 0u) result -= a3;
-    else if (c3 == 2u) result += a3;
-    
-    return result;
-}
 
 void main() {
-    uint out_idx = gl_GlobalInvocationID.x;
-    if (out_idx >= u.N) return;
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= N) return;
     
-    uint weight_row_offset = u.row * (u.K / 4u);
+    uint bytes_per_row = K / 4u;
+    uint uints_per_row = (bytes_per_row + 3u) / 4u;
+    uint row_offset = n * uints_per_row;
+    
     float acc = 0.0;
     
-    // Each thread processes one column
-    for (uint k = 0u; k < u.K; k++) {
-        uint weight_idx = weight_row_offset + k;
-        uint w = weights[weight_idx];
+    /* Process K inputs, 4 at a time (one byte of weights) */
+    for (uint k = 0u; k < K; k += 4u) {
+        uint byte_idx = k / 4u;
+        uint uint_idx = byte_idx / 4u;
+        uint byte_off = byte_idx & 3u;
         
-        // Load corresponding 4 activation values
-        uint in_base = k * 4u;
-        float a0 = inputs[in_base + 0u];
-        float a1 = inputs[in_base + 1u];
-        float a2 = inputs[in_base + 2u];
-        float a3 = inputs[in_base + 3u];
+        uint wdata = weights[row_offset + uint_idx];
+        uint b = (wdata >> (byte_off * 8u)) & 0xFFu;
         
-        acc += ternary_decode(w, a0, a1, a2, a3);
+        float a0 = inputs[k + 0u];
+        float a1 = inputs[k + 1u];
+        float a2 = inputs[k + 2u];
+        float a3 = inputs[k + 3u];
+        
+        /* Decode ternary weights: 0=-1, 1=0, 2=+1, 3=0 */
+        uint c0 = b & 3u;
+        uint c1 = (b >> 2u) & 3u;
+        uint c2 = (b >> 4u) & 3u;
+        uint c3 = (b >> 6u) & 3u;
+        
+        if (c0 == 2u) acc += a0; else if (c0 == 0u) acc -= a0;
+        if (c1 == 2u) acc += a1; else if (c1 == 0u) acc -= a1;
+        if (c2 == 2u) acc += a2; else if (c2 == 0u) acc -= a2;
+        if (c3 == 2u) acc += a3; else if (c3 == 0u) acc -= a3;
     }
     
-    outputs[out_idx] = acc;
+    outputs[n] = acc;
 }

@@ -55,6 +55,11 @@ typedef struct {
     float* attn_sub_norm;   /* [hidden]     BitNet subln after attention, before o_proj */
     float* ffn_norm;        /* [hidden]     pre-FFN RMSNorm */
     float* ffn_sub_norm;    /* [ffn_hidden] BitNet subln after gate*up, before down_proj */
+
+    /* GPU acceleration fields (zero-copy persistent buffers) */
+    u8*    gpu_weight_base;     /* Base pointer to GPU weight buffer (NULL if not on GPU) */
+    size_t gpu_weight_offset[7]; /* Byte offsets for: Q, K, V, O, gate, up, down */
+    bool   gpu_enabled;         /* True if layer weights copied to GPU */
 } HSTernaryLayer;
 
 /*
@@ -74,6 +79,11 @@ typedef struct {
 
     /* Weight format flag */
     bool  use_i2s;          /* true = raw I2_S bytes + f32 activation path */
+
+    /* GPU acceleration */
+    bool  gpu_available;    /* true if GPU GEMM is available */
+    bool  gpu_enabled;      /* true if GPU acceleration is enabled for inference */
+    bool  gpu_lmhead_ready; /* true if lm_head weights copied to GPU */
 
     /* Non-quantized weights */
     float* embedding;      /* [vocab, hidden] float32 (for embedding lookup) */

@@ -6,6 +6,7 @@
  */
 
 #include "hs_ml_infer.h"
+#include "hs_ml_gpu_gemm.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -394,6 +395,26 @@ static void ternary_proj(HSMLTernary* m, int32_t* out, const int8_t* in,
 extern void hs_ml_ternary_f32_proj(float* out, const float* in,
                                     const u8* W, u32 N, u32 K);
 
+/* GPU float32 ternary projection - uses zero-copy persistent buffer */
+static void gpu_f32_proj(float* out, const float* in,
+                         HSTernaryLayer* lay, u32 layer_idx,
+                         size_t weight_offset,
+                         const u8* cpu_weights, u32 N, u32 K) {
+    u64 t0 = now_ns();
+    if (lay->gpu_enabled && lay->gpu_weight_base) {
+        int rc = gpu_gemm_run(layer_idx, weight_offset, in, out, N, K);
+        if (rc != 0) {
+            /* GPU failed, use CPU */
+            hs_ml_ternary_f32_proj(out, in, cpu_weights, N, K);
+        }
+    } else {
+        hs_ml_ternary_f32_proj(out, in, cpu_weights, N, K);
+    }
+    g_mlt_stats.total_gemm_calls++;
+    g_mlt_stats.total_gemm_ops += (u64)N * K;
+    g_mlt_stats.total_ns += now_ns() - t0;
+}
+
 static void f32_proj(HSMLTernary* m, float* out, const float* in,
                      const u8* W, const float* weight_scale, u32 N, u32 K) {
     u64 t0 = now_ns();
@@ -505,9 +526,19 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
     /* ── 2-5. Q, K, V projections ── */
     if (m->use_i2s) {
         /* Pure f32 path: no quantize/dequantize */
-        f32_proj(m, q, fbuf, lay->q_proj, lay->q_scale, H, H);
-        f32_proj(m, k, fbuf, lay->k_proj, lay->k_scale, kv, H);
-        f32_proj(m, v, fbuf, lay->v_proj, lay->v_scale, kv, H);
+        if (m->gpu_enabled && lay->gpu_enabled) {
+            /* Use GPU for all QKV projections */
+            int rc_q = gpu_gemm_run(layer_idx, lay->gpu_weight_offset[0], fbuf, q, H, H);
+            int rc_k = gpu_gemm_run(layer_idx, lay->gpu_weight_offset[1], fbuf, k, kv, H);
+            int rc_v = gpu_gemm_run(layer_idx, lay->gpu_weight_offset[2], fbuf, v, kv, H);
+            if (rc_q != 0) f32_proj(m, q, fbuf, lay->q_proj, lay->q_scale, H, H);
+            if (rc_k != 0) f32_proj(m, k, fbuf, lay->k_proj, lay->k_scale, kv, H);
+            if (rc_v != 0) f32_proj(m, v, fbuf, lay->v_proj, lay->v_scale, kv, H);
+        } else {
+            f32_proj(m, q, fbuf, lay->q_proj, lay->q_scale, H, H);
+            f32_proj(m, k, fbuf, lay->k_proj, lay->k_scale, kv, H);
+            f32_proj(m, v, fbuf, lay->v_proj, lay->v_scale, kv, H);
+        }
     } else {
         float act_scale = hs_mlt_quantize(qbuf, fbuf, H);
         ternary_proj(m, gbuf, qbuf, lay->q_proj, H, H);
@@ -583,8 +614,15 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
 
     /* ── 12. Gate and Up projections ── */
     if (m->use_i2s) {
-        f32_proj(m, gate_out, fbuf, lay->gate_proj, lay->gate_scale, F, H);
-        f32_proj(m, up_out, fbuf, lay->up_proj, lay->up_scale, F, H);
+        if (m->gpu_enabled && lay->gpu_enabled) {
+            int rc_gate = gpu_gemm_run(layer_idx, lay->gpu_weight_offset[4], fbuf, gate_out, F, H);
+            int rc_up = gpu_gemm_run(layer_idx, lay->gpu_weight_offset[5], fbuf, up_out, F, H);
+            if (rc_gate != 0) f32_proj(m, gate_out, fbuf, lay->gate_proj, lay->gate_scale, F, H);
+            if (rc_up != 0) f32_proj(m, up_out, fbuf, lay->up_proj, lay->up_scale, F, H);
+        } else {
+            f32_proj(m, gate_out, fbuf, lay->gate_proj, lay->gate_scale, F, H);
+            f32_proj(m, up_out, fbuf, lay->up_proj, lay->up_scale, F, H);
+        }
     } else {
         float act_scale = hs_mlt_quantize(qbuf, fbuf, H);
         ternary_proj(m, gbuf, qbuf, lay->gate_proj, F, H);
@@ -618,7 +656,12 @@ void hs_mlt_layer_forward(float* hidden, u32 layer_idx,
 
     /* ── 14. Down projection ── */
     if (m->use_i2s) {
-        f32_proj(m, fbuf, ffbuf, lay->down_proj, lay->down_scale, H, F);
+        if (m->gpu_enabled && lay->gpu_enabled) {
+            int rc_down = gpu_gemm_run(layer_idx, lay->gpu_weight_offset[6], ffbuf, fbuf, H, F);
+            if (rc_down != 0) f32_proj(m, fbuf, ffbuf, lay->down_proj, lay->down_scale, H, F);
+        } else {
+            f32_proj(m, fbuf, ffbuf, lay->down_proj, lay->down_scale, H, F);
+        }
     } else {
         float act_scale = hs_mlt_quantize(fqbuf, ffbuf, F);
         ternary_proj(m, gbuf, fqbuf, lay->down_proj, H, F);
@@ -1089,11 +1132,28 @@ static void session_logits_trit(HSMLTernarySession* sess, float* logits) {
 
     rmsnorm(normed, sess->hidden, m->final_norm, 1e-5f, H);
 
-    /* Stage 1: fused 4-plane LUT kernel — pure ternary float32, no quantization */
-    hs_ml_lmhead_stage1(coarse, normed,
-                        m->lm_head_planes[0], m->lm_head_planes[1],
-                        m->lm_head_planes[2], m->lm_head_planes[3],
-                        m->lm_head_row_scale, V, H);
+    /* Try GPU for Stage 1 - full vocab projection */
+    fprintf(stderr, "DEBUG: gpu_enabled=%d gpu_lmhead_ready=%d\n", m->gpu_enabled, m->gpu_lmhead_ready);
+    if (m->gpu_enabled && m->gpu_lmhead_ready) {
+        fprintf(stderr, "DEBUG: calling GPU lm_head\n");
+        if (gpu_gemm_run_lmhead(normed, coarse, V, H) == 0) {
+            /* GPU succeeded - use coarse logits from GPU */
+            fprintf(stderr, "DEBUG: GPU lm_head succeeded\n");
+        } else {
+            /* GPU failed - fall back to CPU */
+            fprintf(stderr, "DEBUG: GPU lm_head failed, using CPU\n");
+            hs_ml_lmhead_stage1(coarse, normed,
+                                m->lm_head_planes[0], m->lm_head_planes[1],
+                                m->lm_head_planes[2], m->lm_head_planes[3],
+                                m->lm_head_row_scale, V, H);
+        }
+    } else {
+        /* Stage 1: fused 4-plane LUT kernel — pure ternary float32, no quantization */
+        hs_ml_lmhead_stage1(coarse, normed,
+                            m->lm_head_planes[0], m->lm_head_planes[1],
+                            m->lm_head_planes[2], m->lm_head_planes[3],
+                            m->lm_head_row_scale, V, H);
+    }
 
     /* Identify top-C candidates */
     partial_top_c(coarse, V, cands, C);
