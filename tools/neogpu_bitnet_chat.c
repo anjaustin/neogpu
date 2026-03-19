@@ -259,7 +259,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "warning: no BPE merges loaded, tokenization may be wrong\n");
     }
 
-    /* Encode lm_head to ternary for faster CPU computation */
+    /* Encode lm_head to ternary - needed for both CPU and GPU paths */
     if (hs_mlt_lmhead_encode(&m) != 0) {
         fprintf(stderr, "warning: lm_head encoding failed\n");
     }
@@ -376,5 +376,10 @@ int main(int argc, char **argv) {
     free(tokens);
     hs_mlt_session_free(&s);
     hs_mlt_free(&m);
+    
+    if (use_gpu) {
+        gpu_gemm_shutdown();
+    }
+    
     return 0;
 }
