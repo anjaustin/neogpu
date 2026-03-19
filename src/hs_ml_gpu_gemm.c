@@ -551,14 +551,13 @@ int gpu_gemm_run(u32 layer_idx, u32 weight_offset,
     
     /* Use unified buffer if available, otherwise fall back to per-layer */
     bool use_unified = g_pool.unified_available && g_pool.unified_weights.valid;
-    GLuint weight_ssbo = 0;
-    if (use_unified) {
-        weight_ssbo = g_pool.unified_weights.ssbo;
-    } else {
-        if (layer_idx >= g_pool.num_layers) return -1;
-        if (!g_pool.weights[layer_idx].valid) return -1;
-        weight_ssbo = g_pool.weights[layer_idx].ssbo;
+    if (!use_unified) {
+        fprintf(stderr, "GPU: unified buffer not available!\n");
+        return -1;
     }
+    GLuint weight_ssbo = g_pool.unified_weights.ssbo;
+    fprintf(stderr, "GPU: running layer %u weight_offset=%u N=%u K=%u\n", 
+            layer_idx, weight_offset, N, K);
 
     /* GPU path - execute compute shader */
     /* Copy input to persistent buffer (small: K floats = 2.5-10KB) */
