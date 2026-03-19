@@ -19,7 +19,7 @@ static void hs_capture_header_init(HSCaptureHeader* h, u32 count) {
     memset(h, 0, sizeof(*h));
     memcpy(h->magic, "HSCAP1\0", 7);
     h->endian = 0x01020304u;
-    h->version = 2u;
+    h->version = 1u;
     h->msg_size = (u32)sizeof(Message);
     h->payload_size = (u32)sizeof(Payload);
     h->count = count;
@@ -29,7 +29,7 @@ static bool hs_capture_header_valid(const HSCaptureHeader* h) {
     if (!h) return false;
     if (memcmp(h->magic, "HSCAP1\0", 7) != 0) return false;
     if (h->endian != 0x01020304u) return false;
-    if (h->version != 2u) return false;
+    if (h->version != 1u) return false;
     if (h->msg_size != (u32)sizeof(Message)) return false;
     if (h->payload_size != (u32)sizeof(Payload)) return false;
     return true;
@@ -1056,10 +1056,18 @@ void hs_capture_init(HSCapture* cap, Message* msg_buf, Payload* payload_buf, u32
 bool hs_capture_from_log(const HSSystem* sys, const Message* msgs, u32 count, HSCapture* out) {
     /* Capturing is read-only but depends on stable payload storage; caller should serialize appropriately. */
     if (!sys || !msgs || !out || !out->msgs || !out->payloads) return false;
+    if (count == 0) return false;
     if (count > out->capacity) return false;
     if (!sys->payloads || sys->payload_capacity == 0) return false;
 
-    for (u32 i = 0; i < count; i++) {
+    u32 effective_count = count;
+    if (effective_count > sys->payload_capacity) {
+        effective_count = sys->payload_capacity;
+        fprintf(stderr, "Warning: truncating capture from %u to %u messages (payload limit)\n", 
+                count, effective_count);
+    }
+
+    for (u32 i = 0; i < effective_count; i++) {
         Message m = msgs[i];
         if (m.payload_len != 0) {
             if (m.payload_idx >= sys->payload_capacity) return false;
@@ -1069,13 +1077,16 @@ bool hs_capture_from_log(const HSSystem* sys, const Message* msgs, u32 count, HS
         out->msgs[i] = m;
     }
 
-    out->count = count;
+    out->count = effective_count;
     return true;
 }
 
 bool hs_capture_replay(HSSystem* sys, const HSCapture* cap) {
     if (!sys || !cap || !cap->msgs || !cap->payloads) return false;
-    if (cap->count > cap->capacity) return false;
+    if (cap->count == 0 || cap->count > cap->capacity) return false;
+
+    fprintf(stderr, "Warning: replay assumes deterministic execution (rand/time will replay identically)\n");
+    fflush(stderr);
 
     Payload* saved_payloads = sys->payloads;
     u32 saved_cap = sys->payload_capacity;
@@ -1114,8 +1125,28 @@ bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Pa
     if (!f) return false;
 
     HSCaptureHeader h;
-    bool ok = (fread(&h, sizeof(h), 1, f) == 1);
-    ok = ok && hs_capture_header_valid(&h);
+    if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return false; }
+    
+    bool ok = hs_capture_header_valid(&h);
+    if (!ok) { fclose(f); return false; }
+
+    HSCaptureHeader h;
+    size_t nread = fread(&h, sizeof(h), 1, f);
+    if (nread != 1) {
+        fprintf(stderr, "Capture read: failed to read header (got %zu)\n", nread);
+        fclose(f);
+        return false;
+    }
+    
+    bool ok = hs_capture_header_valid(&h);
+    
+    ok = hs_capture_header_valid(&h);
+    if (!ok) {
+        fprintf(stderr, "Capture read: invalid header magic=%.7s version=%u endian=0x%x\n", 
+                h.magic, h.version, h.endian);
+        fclose(f);
+        return false;
+    }
     ok = ok && (h.count <= capacity);
 
     if (!ok) {

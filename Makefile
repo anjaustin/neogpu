@@ -35,8 +35,20 @@ $(HS_TARGET): $(HS_OBJ)
 
 TOOL_TGT = neogpu_tool
 
-$(TOOL_TGT):
-	$(CC) $(CFLAGS) tools/neogpu_tool.c src/hs_core.o src/hs_nodes.o -o $@ $(LDFLAGS)
+neogpu_pong: tools/neogpu_pong.c
+	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o -o $@ $(LDFLAGS)
+	$(STRIP) $@
+
+neogpu_capture_demo: tools/neogpu_capture_demo.c
+	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_backend_gles.o -o $@ $(LDFLAGS)
+	$(STRIP) $@
+
+neogpu_pong_ai: tools/neogpu_pong_ai.c
+	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_backend_gles.o -o $@ $(LDFLAGS)
+	$(STRIP) $@
+
+neogpu_pong_llm: tools/neogpu_pong_llm.c src/hs_ml_ternary_neon.o src/hs_ml_ternary_coproc.o src/hs_ml_ternary_mt.o src/hs_ml_gpu_gemm.o
+	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_backend_gles.o src/hs_ml_infer.o src/hs_ml_loader.o src/hs_ml_loader_ternary.o src/hs_ml.o src/hs_ml_ternary.o src/hs_ml_msg.o src/hs_ml_routing.o src/hs_ml_binary.o src/hs_ml_ternary_neon.o src/hs_ml_ternary_coproc.o src/hs_ml_ternary_mt.o src/hs_ml_gpu_gemm.o -o $@ $(LDFLAGS)
 	$(STRIP) $@
 
 .PHONY: tool
@@ -45,7 +57,7 @@ $(TOOL_TGT):
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(HS_OBJ) $(HS_DEPS) $(HS_TARGET) tests/*.o tests/test_01_clear tests/test_02_triangle tests/test_03_instancing tests/test_04_blending tests/test_05_cube3d tests/test_06_raycast tests/test_07_message_triangle $(TOOL_TGT)
+	rm -f $(HS_OBJ) $(HS_DEPS) $(HS_TARGET) tests/*.o tests/test_01_clear tests/test_02_triangle tests/test_03_instancing tests/test_04_blending tests/test_05_cube3d tests/test_06_raycast tests/test_07_message_triangle neogpu_tool neogpu_pong
 
 run: $(HS_TARGET)
 	./$(HS_TARGET)

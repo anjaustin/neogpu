@@ -27,11 +27,49 @@ NeoGPU is a message-native runtime substrate. Rendering is its clearest proof su
 ## Quick Start
 
 ```bash
-# Build
+# Build all
 make build
 
 # Run demo
 make run
+```
+
+## Demos
+
+### Pong (Game Engine Demo)
+```bash
+make neogpu_pong
+sudo ./neogpu_pong
+# Controls: W/S or UP/DOWN arrows, Q to quit
+```
+
+### Pong + AI (Simulated Commentary)
+```bash
+make neogpu_pong_ai
+sudo ./neogpu_pong_ai
+```
+
+### Pong + Real LLM (Combined Game + Inference)
+```bash
+make neogpu_pong_llm
+sudo ./neogpu_pong_llm --model models/bitnet-2b4t-i2s.gguf --prompt "Hello"
+```
+This demonstrates:
+- Real BitNet inference running alongside game
+- Message capture of combined workload
+- Screenshot output
+
+### Message Capture Demo
+```bash
+make neogpu_capture_demo
+sudo ./neogpu_capture_demo
+# Output: /tmp/neogpu_capture.bin (HSCAP1 format)
+```
+
+### BitNet Chat (Standalone LLM)
+```bash
+# Already built: tools/neogpu_bitnet_chat
+sudo ./tools/neogpu_bitnet_chat --model models/bitnet-2b4t-i2s.gguf --prompt "Hello"
 ```
 
 ## Tooling Mode
@@ -121,6 +159,7 @@ src/
   hs_nodes.c      - Node message handlers (Shader, Buffer, Texture, Output, Sound)
   hs_gpu.c        - High-level GPU API
   hs_ipc.c        - IPC server (Unix domain + TCP/IP)
+  hs_ml_*.c       - ML inference (BitNet 2B)
   main.c          - Demo/test suite
   benchmark.c     - Benchmarks
 
@@ -135,6 +174,15 @@ include/
   hs_audio.h      - 4-channel audio system (48KHz)
   hs_storage.h    - Persistent storage (16 slots × 256B)
   hs_graphics.h   - GBM/EGL/GLES graphics backend
+  hs_ml_infer.h   - ML inference API
+
+tools/
+  neogpu_bitnet_chat.c   - Standalone LLM chat
+  neogpu_pong.c         - Simple Pong game
+  neogpu_pong_ai.c      - Pong with AI commentary
+  neogpu_pong_llm.c     - Pong + real BitNet inference
+  neogpu_capture_demo.c - Message capture demo
+  neogpu_viz.c          - ML visualization
 
 tests/
   test_01_clear.c     - Clear screen test
@@ -143,6 +191,9 @@ tests/
   test_04_blending.c   - Alpha blending
   test_05_cube3d.c     - 3D rotating cube
   test_06_raycast.c    - Ray casting spheres (270 FPS on Pi)
+
+src/archive_ternary_kernels/
+  - Archived kernel variants (v2-v21)
 ```
 
 ## API Reference
@@ -362,7 +413,7 @@ Test results on Raspberry Pi 4:
 |---------|--------|
 | Message queue (64-byte aligned) | ✅ |
 | 5 nodes (Shader, Buffer, Texture, Output, Sound) | ✅ |
-| Recording & replay | ✅ |
+| Recording & replay (HSCAP1 format) | ✅ |
 | Overflow detection | ✅ |
 | All vec4/mat4 ops (NEON) | ✅ |
 | Input system | ✅ |
@@ -373,6 +424,10 @@ Test results on Raspberry Pi 4:
 | Storage (16 slots × 256B, file I/O) | ✅ |
 | Graphics (GBM/EGL/GLES for Pi display) | ✅ |
 | **Test suite** (6 graphics tests) | ✅ |
+| BitNet inference (1.58-bit, 2B params) | ✅ |
+| Pong game demo | ✅ |
+| Pong + LLM combined demo | ✅ |
+| Message capture & replay | ✅ |
 
 ## Memory Usage
 

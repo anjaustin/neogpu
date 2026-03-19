@@ -36,3 +36,8 @@ libhl.so
 *.gguf
 *.bin
 models/
+neogpu_pong
+neogpu_pong_ai
+neogpu_pong_llm
+neogpu_capture_demo
+src/archive_ternary_kernels/
