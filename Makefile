@@ -51,6 +51,10 @@ neogpu_pong_llm: tools/neogpu_pong_llm.c src/hs_ml_ternary_neon.o src/hs_ml_tern
 	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_backend_gles.o src/hs_ml_infer.o src/hs_ml_loader.o src/hs_ml_loader_ternary.o src/hs_ml.o src/hs_ml_ternary.o src/hs_ml_msg.o src/hs_ml_routing.o src/hs_ml_binary.o src/hs_ml_ternary_neon.o src/hs_ml_ternary_coproc.o src/hs_ml_ternary_mt.o src/hs_ml_gpu_gemm.o -o $@ $(LDFLAGS)
 	$(STRIP) $@
 
+neogpu_procgame: tools/neogpu_procgame.c
+	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o -o $@ $(LDFLAGS)
+	$(STRIP) $@
+
 .PHONY: tool
 
 %.o: %.c
