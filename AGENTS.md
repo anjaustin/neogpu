@@ -64,9 +64,36 @@
 
 ## GPU Acceleration Status (Pi4 V3D)
 
-**Current: 1.25x GPU speedup for lm_head (128K vocab)**
+**Current: 1.34x GPU speedup for lm_head (128K vocab)**
 
 - GPU requires `-DHAS_GLES_COMPUTE` flag to compile
 - Weights must be preloaded once at startup (not per-inference)
 - Benchmark: `tests/bench_cpu_gpu_comm`
+- Chat tool: `tools/neogpu_bitnet_chat`
 - Config: `/boot/firmware/config.txt` with `gpu_mem=512 gpu_freq=750 core_freq=750 cma=256`
+
+## Building GPU-Accelerated Inference
+
+```bash
+# Pi4 GPU config in /boot/firmware/config.txt:
+# gpu_mem=512
+# gpu_freq=750
+# core_freq=750
+# cma=256
+
+# Build with GPU support
+gcc -O3 -march=armv8-a+simd -mtune=cortex-a72 -ffast-math -funroll-loops \
+  -DHAS_GLES_COMPUTE -Iinclude \
+  tools/neogpu_bitnet_chat.c \
+  src/hs_ml_loader.c src/hs_ml_loader_ternary.c src/hs_ml_infer.c \
+  src/hs_ml_ternary_neon.c src/hs_ml.c src/hs_ml_gpu_gemm.c \
+  src/hs_ml_msg.c src/hs_ml_routing.c src/hs_ml_binary.c \
+  src/hs_ipc.c src/hs_backend_gles.c src/hs_core.c \
+  src/hs_nodes.c src/hs_async.c src/hs_gpu.c src/hs_ml_ternary.c \
+  -o tools/neogpu_bitnet_chat \
+  -lm -lGLESv2 -lEGL -lgbm -ldrm -lpthread
+
+# Run inference
+./tools/neogpu_bitnet_chat --model models/bitnet-2b4t-i2s.gguf \
+  --prompt "Your prompt" --n-predict 64
+```

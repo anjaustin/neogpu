@@ -2,7 +2,26 @@
 
 ## Summary
 
-GPU acceleration for ternary GEMM on Raspberry Pi 4 achieved **1.25x speedup** over CPU (NEON) for lm_head projection (128K vocab).
+GPU acceleration for ternary GEMM on Raspberry Pi 4 achieved **1.34x speedup** over CPU (NEON) for lm_head projection (128K vocab).
+
+## Sample Output
+
+```
+$ ./tools/neogpu_bitnet_chat --model models/bitnet-2b4t-i2s.gguf \
+    --prompt "Hypothetically, might reflective recursion be a function of cognition?" \
+    --n-predict 128
+
+prompt: Hypothetically, might reflective recursion be a function of cognition?
+encoded_tokens=15
+
+response:
+ If so, what would that imply about the nature of self-awareness and consciousness?...
+
+perf: prefill=3293ms  decode_avg=879ms  decode_min=857ms  decode_max=906ms
+      1.13 tokens/sec  (879 ms/token)
+```
+
+The model generates coherent philosophical text about consciousness and cognition.
 
 ## Hardware Configuration
 
