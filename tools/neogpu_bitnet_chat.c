@@ -259,9 +259,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "warning: no BPE merges loaded, tokenization may be wrong\n");
     }
 
-    /* Encode lm_head to ternary - needed for both CPU and GPU paths */
-    if (hs_mlt_lmhead_encode(&m) != 0) {
-        fprintf(stderr, "warning: lm_head encoding failed\n");
+    /* Encode lm_head to ternary - only needed for CPU path */
+    /* GPU path doesn't use ternary format, so skip encoding */
+    if (!use_gpu) {
+        if (hs_mlt_lmhead_encode(&m) != 0) {
+            fprintf(stderr, "warning: lm_head encoding failed\n");
+        }
     }
 
     /* Initialize GPU for lm_head if requested */
@@ -275,11 +278,13 @@ int main(int argc, char **argv) {
             
             uint32_t row_bytes = H / 4;
             size_t plane_size = (size_t)V * row_bytes;
-            /* Only use first 4 planes for GPU (Stage 1) */
+            /* Need 4 planes for GPU */
             size_t weight_size = plane_size * 4;
             
             void* gpu_weight_buf = gpu_gemm_alloc_lmhead(weight_size);
             if (gpu_weight_buf) {
+                /* Need to encode just 4 planes for GPU */
+                hs_mlt_lmhead_encode(&m);
                 /* Copy only planes 0-3 to GPU */
                 for (int k = 0; k < 4; k++) {
                     memcpy(gpu_weight_buf + k * plane_size, m.lm_head_planes[k], plane_size);

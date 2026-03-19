@@ -946,9 +946,7 @@ int hs_mlt_session_init(HSMLTernarySession* sess, HSMLTernary* model) {
 
     sess->model  = model;
     sess->hidden = malloc(model->hidden_size * sizeof(float));
-    sess->hidden_gpu_copy = malloc(model->hidden_size * sizeof(float));
-    if (!sess->hidden || !sess->hidden_gpu_copy) {
-        free(sess->hidden); free(sess->hidden_gpu_copy);
+    if (!sess->hidden) {
         return -1;
     }
 
@@ -991,7 +989,6 @@ int hs_mlt_session_init(HSMLTernarySession* sess, HSMLTernary* model) {
 void hs_mlt_session_free(HSMLTernarySession* sess) {
     if (!sess) return;
     free(sess->hidden);
-    free(sess->hidden_gpu_copy);
     free(sess->lmh_coarse);
     free(sess->lmh_tmp);
     free(sess->lmh_candidates);
@@ -1237,62 +1234,6 @@ int hs_mlt_session_logits(HSMLTernarySession* sess, float* logits) {
     
     session_logits(sess, logits);
     return 0;
-}
-
-/*
- * Start async GPU lm_head - returns immediately.
- * Copies hidden state to GPU buffer before starting.
- */
-int hs_mlt_session_logits_async(HSMLTernarySession* sess, float* logits) {
-    if (!sess || !sess->ready || !logits) return -1;
-    
-    /* Wait for any previous pending GPU operation first */
-    if (sess->gpu_async_pending) {
-        hs_mlt_session_wait_gpu(sess);
-    }
-    
-    HSMLTernary* m = sess->model;
-    u32 H = m->hidden_size;
-    u32 V = m->vocab_size;
-    
-    /* Compute rmsnorm into hidden_gpu_copy for GPU to read */
-    float* normed = sess->hidden_gpu_copy;
-    rmsnorm(normed, sess->hidden, m->final_norm, 1e-5f, H);
-    
-    /* Start async GPU computation */
-    if (m->gpu_enabled && m->gpu_lmhead_ready) {
-        gpu_gemm_run_lmhead_async(normed, logits, V, H);
-        sess->gpu_async_pending = 1;
-    } else {
-        /* CPU fallback */
-        hs_ml_lmhead_stage1(sess->lmh_coarse, normed,
-                            m->lm_head_planes[0], m->lm_head_planes[1],
-                            m->lm_head_planes[2], m->lm_head_planes[3],
-                            m->lm_head_row_scale, V, H);
-    }
-    
-    return 0;
-}
-
-/*
- * Wait for pending GPU lm_head to complete.
- */
-int hs_mlt_session_wait_gpu(HSMLTernarySession* sess) {
-    if (!sess) return -1;
-    
-    if (sess->gpu_async_pending && sess->model->gpu_enabled) {
-        gpu_gemm_wait_lmhead();
-        sess->gpu_async_pending = 0;
-    }
-    
-    return 0;
-}
-
-/*
- * Process one token step (wrapper for async pipeline).
- */
-void hs_mlt_session_step(HSMLTernarySession* sess, u32 token) {
-    session_step(sess, token);
 }
 
 int hs_mlt_decode(HSMLTernarySession* sess, u32 token, float* logits) {
