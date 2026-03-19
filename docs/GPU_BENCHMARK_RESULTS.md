@@ -207,3 +207,42 @@ Both paths produce **identical, correct output**:
 ### Key Insight
 
 The Pi4 V3D GPU is only faster for **very large** GEMMs (N > 10K outputs). Smaller layer projections (Q, K, V, O, gate, up, down) are all N < 7000, where CPU is faster. The only layer that benefits is lm_head with 128K vocab.
+
+## Multicore Parallelism Attempt (March 2026)
+
+Tried parallelizing QKV projections within each layer using pthreads:
+
+```c
+// Attempted: parallel QKV projection
+pthread_t threads[3];
+// Thread 0: Q = W_q @ in
+// Thread 1: K = W_k @ in
+// Thread 2: V = W_v @ in
+```
+
+**Result: Did not help**
+
+- Q, K, V projections are small (2560x2560 and 1280x2560)
+- Thread creation overhead (~90 threads per decode step) dominates
+- NEON SIMD already efficiently uses one core
+- Additional threading actually slowed things down slightly
+
+**Conclusion:** Pi4's 4 cores are already well-utilized by SIMD. The bottleneck is compute-bound, not parallelism-bound.
+
+## Final Performance Summary
+
+| Path | ms/token | tokens/sec |
+|------|-----------|------------|
+| CPU | 841 | 1.19 |
+| GPU | 801 | 1.25 (~5% faster) |
+
+Both produce identical, correct output.
+
+## Future Directions
+
+For meaningful speedups on Pi4:
+1. **Smaller model** - 600M instead of 2B parameters
+2. **Better quantization** - 1-bit instead of 2-bit
+3. **Different hardware** - Pi5, desktop ARM, or x86
+
+The current implementation is well-optimized for the Pi4's constraints.
