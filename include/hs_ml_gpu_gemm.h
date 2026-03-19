@@ -186,4 +186,23 @@ void* gpu_gemm_alloc_lmhead(size_t bytes);
  */
 int gpu_gemm_run_lmhead(const float* input, float* output, uint32_t V, uint32_t H);
 
+/*
+ * Async lm_head: starts GPU compute, returns immediately.
+ * Returns 0 on launch success, -1 on failure.
+ * Call gpu_gemm_poll_lmhead() or gpu_gemm_wait_lmhead() to complete.
+ */
+int gpu_gemm_run_lmhead_async(const float* input, float* output, uint32_t V, uint32_t H);
+
+/*
+ * Poll for async lm_head completion.
+ * Returns: 0 = still running, 1 = complete, -1 = error.
+ */
+int gpu_gemm_poll_lmhead(void);
+
+/*
+ * Wait for async lm_head to complete.
+ * Returns 0 on success, -1 on error.
+ */
+int gpu_gemm_wait_lmhead(void);
+
 #endif /* HS_ML_GPU_GEMM_H */

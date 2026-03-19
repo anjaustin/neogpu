@@ -5,6 +5,7 @@
 #include <math.h>
 
 #include "hs_ml_infer.h"
+#include "hs_ml_gpu_gemm.h"
 
 typedef struct {
     int byte_to_cp[256];
@@ -190,7 +191,8 @@ static void usage(const char *prog) {
         "  --top-k <int>         Top-K (default: 42)\n"
         "  --top-p <float>       Top-P (default: 0.9531)\n"
         "  --rep-penalty <float> Repetition penalty (default: 1.1229)\n"
-        "  --n-predict <int>     Max tokens to generate (default: 64)\n",
+        "  --n-predict <int>     Max tokens to generate (default: 64)\n"
+        "  --gpu                 Use GPU acceleration (default: off)\n",
         prog);
 }
 
@@ -203,6 +205,7 @@ int main(int argc, char **argv) {
     float top_p = 0.9531f;
     float rep_penalty = 1.1229f;
     int n_predict = 64;
+    int use_gpu = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
@@ -221,6 +224,8 @@ int main(int argc, char **argv) {
             rep_penalty = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--n-predict") == 0 && i + 1 < argc) {
             n_predict = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--gpu") == 0) {
+            use_gpu = 1;
         } else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
             usage(argv[0]);
@@ -252,6 +257,42 @@ int main(int argc, char **argv) {
     }
     if (!m.tokenizer_merges || m.num_merges == 0) {
         fprintf(stderr, "warning: no BPE merges loaded, tokenization may be wrong\n");
+    }
+
+    /* Encode lm_head to ternary for faster CPU computation */
+    if (hs_mlt_lmhead_encode(&m) != 0) {
+        fprintf(stderr, "warning: lm_head encoding failed\n");
+    }
+
+    /* Initialize GPU for lm_head if requested */
+    if (use_gpu) {
+        if (gpu_gemm_init() == 0) {
+            uint32_t V = m.vocab_size;
+            uint32_t H = m.hidden_size;
+            
+            /* Set dimensions for output buffer large enough for vocab */
+            gpu_gemm_set_dims(H, H, V > H * 3 ? V : H * 3);
+            
+            uint32_t row_bytes = H / 4;
+            size_t plane_size = (size_t)V * row_bytes;
+            /* Only use first 4 planes for GPU (Stage 1) */
+            size_t weight_size = plane_size * 4;
+            
+            void* gpu_weight_buf = gpu_gemm_alloc_lmhead(weight_size);
+            if (gpu_weight_buf) {
+                /* Copy only planes 0-3 to GPU */
+                for (int k = 0; k < 4; k++) {
+                    memcpy(gpu_weight_buf + k * plane_size, m.lm_head_planes[k], plane_size);
+                }
+                m.gpu_enabled = 1;
+                m.gpu_lmhead_ready = 1;
+                fprintf(stderr, "GPU: enabled for lm_head (4 planes)\n");
+            } else {
+                fprintf(stderr, "GPU: failed to allocate lm_head weights\n");
+            }
+        } else {
+            fprintf(stderr, "GPU: not available\n");
+        }
     }
 
     u32 *tokens = malloc((4096 + n_predict) * sizeof(u32));

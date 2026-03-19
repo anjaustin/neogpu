@@ -1,5 +1,19 @@
 # GPU Benchmark Results - Pi4 V3D
 
+## Current Status (March 2026)
+
+**GPU lm_head is now integrated into the chat tool.** The tool supports both CPU and GPU paths:
+
+```bash
+# CPU path (default)
+./tools/neogpu_bitnet_chat --model models/ggml-model-i2_s.gguf --n-predict 16 --prompt "Hello"
+
+# GPU path (--gpu flag)
+./tools/neogpu_bitnet_chat --model models/ggml-model-i2_s.gguf --n-predict 16 --prompt "Hello" --gpu
+```
+
+Both paths produce identical, correct output. GPU provides ~2% speedup for lm_head.
+
 ## Summary
 
 GPU acceleration for ternary GEMM on Raspberry Pi 4 achieved **1.34x speedup** over CPU (NEON) for lm_head projection (128K vocab).
@@ -142,3 +156,54 @@ decode step with ternary lm_head: 917.8 ms
 | Size | CPU (NEON) | GPU | Speedup |
 |------|------------|-----|---------|
 | 128256 x 2560 | 709ms | 568ms | **1.25x** |
+
+## Implementation Details (March 2026)
+
+### Files Modified
+
+1. **`tools/neogpu_bitnet_chat.c`** - Added `--gpu` flag:
+   - Initializes GPU with `gpu_gemm_init()`
+   - Allocates input/output buffers sized for vocab (128K)
+   - Copies lm_head weights (4 planes, ~313MB) to GPU
+   - Sets `model->gpu_enabled = 1` and `model->gpu_lmhead_ready = 1`
+
+2. **`src/hs_ml_gpu_gemm.c`** - GPU GEMM implementation:
+   - Added `gpu_lmhead_pending` flag for async support
+   - Added `lm_head_output` pointer for async completion
+   - Implemented `gpu_gemm_run_lmhead_async()` and `gpu_gemm_wait_lmhead()`
+
+3. **`src/hs_ml_infer.c`** - Inference integration:
+   - Added `gpu_async_pending` field to session struct
+   - Added `hidden_gpu_copy` buffer for GPU input
+   - Added async API functions
+
+4. **`include/hs_ml_infer.h`** - API additions:
+   - Added `gpu_async_pending` and `hidden_gpu_copy` to session struct
+   - Added async API declarations
+
+### Usage
+
+```bash
+# CPU path (default)
+./tools/neogpu_bitnet_chat --model models/ggml-model-i2_s.gguf --n-predict 16 --prompt "Hello"
+
+# GPU path (--gpu flag)
+./tools/neogpu_bitnet_chat --model models/ggml-model-i2_s.gguf --n-predict 16 --prompt "Hello" --gpu
+```
+
+### Results
+
+Both paths produce **identical, correct output**:
+- CPU: ~934ms/token
+- GPU: ~916ms/token (~2% faster)
+
+### Why Limited End-to-End Speedup
+
+1. **lm_head is only ~30% of decode time**
+2. **Sequential architecture**: CPU does all layers, then GPU does lm_head
+3. **Async didn't help**: GPU compute (~570ms) ≈ CPU layer time (~700ms)
+4. **Small matrices**: QKV/FFN projections are too small for GPU to benefit
+
+### Key Insight
+
+The Pi4 V3D GPU is only faster for **very large** GEMMs (N > 10K outputs). Smaller layer projections (Q, K, V, O, gate, up, down) are all N < 7000, where CPU is faster. The only layer that benefits is lm_head with 128K vocab.

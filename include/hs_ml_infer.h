@@ -254,9 +254,11 @@ u32 hs_mlt_sample_greedy(const float* logits, u32 vocab_size);
 typedef struct {
     HSMLTernary*  model;
     float*        hidden;    /* [hidden_size] current hidden state */
+    float*        hidden_gpu_copy;  /* [hidden_size] copy for GPU during async */
     HSKVCache*    caches;    /* [num_layers] KV caches */
     u32           seq_len;
     bool          ready;
+    bool          gpu_async_pending;  /* GPU lm_head pending */
 
     /* Scratch for two-stage ternary spline lm_head (allocated in session_init) */
     float*   lmh_coarse;      /* [vocab_size] coarse logit accumulator (Stage 1) */
@@ -276,6 +278,15 @@ int hs_mlt_prefill(HSMLTernarySession* sess, const u32* tokens, u32 seq_len);
 
 /* Get logits from current hidden state (after prefill). */
 int hs_mlt_session_logits(HSMLTernarySession* sess, float* logits);
+
+/* Start async GPU lm_head - returns immediately, logs pending */
+int hs_mlt_session_logits_async(HSMLTernarySession* sess, float* logits);
+
+/* Wait for pending GPU lm_head to complete */
+int hs_mlt_session_wait_gpu(HSMLTernarySession* sess);
+
+/* Process one token step (for async pipeline) */
+void hs_mlt_session_step(HSMLTernarySession* sess, u32 token);
 
 /* Decode: step one new token, update KV cache, write logits. */
 int hs_mlt_decode(HSMLTernarySession* sess, u32 token, float* logits);

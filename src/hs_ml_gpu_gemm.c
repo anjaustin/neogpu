@@ -67,7 +67,10 @@ typedef struct {
     EGLContext context;
     GLuint program;        /* Single-layer shader */
     GLuint program_batch; /* Batched shader (multiple layers per dispatch) */
+    GLuint program_lmhead; /* LM-head shader (8-plane ternary) */
     bool initialized;
+    bool lm_head_pending;       /* Async lm_head in progress */
+    float* lm_head_output;      /* Output pointer for async lm_head */
 } GPUContext;
 
 static GPUContext g_gpu = {0};
@@ -168,6 +171,112 @@ static const char* GEMM_SHADER =
     "    for (int t = 0; t < TILE_N; t++) {\n"
     "        uint n = base_n + uint(t);\n"
     "        if (n < N) outputs[output_offset + n] = acc[t];\n"
+    "    }\n"
+    "}\n";
+
+/*
+ * LM-Head shader - handles 4-plane ternary format (Stage 1 only)
+ * Combines planes with weights: 1, 1/3, 1/9, 1/27
+ * Optimized: processes all planes in a single pass through the weight data
+ */
+static const char* LMHEAD_SHADER =
+    "#version 310 es\n"
+    "precision highp float;\n"
+    "precision highp int;\n"
+    "\n"
+    "#define TILE_N 4\n"
+    "#define WG_SIZE 64\n"
+    "#define K 2560\n"
+    "\n"
+    "layout(local_size_x = WG_SIZE) in;\n"
+    "\n"
+    "layout(std430, binding = 0) readonly buffer Weights { uint weights[]; };\n"
+    "layout(std430, binding = 1) readonly buffer Input { float inputs[]; };\n"
+    "layout(std430, binding = 2) writeonly buffer Output { float outputs[]; };\n"
+    "layout(std430, binding = 3) readonly buffer Uniforms {\n"
+    "    uint N; uint K; uint weight_offset; uint input_offset; uint output_offset;\n"
+    "};\n"
+    "\n"
+    "shared float shared_input[K];\n"
+    "\n"
+    "void main() {\n"
+    "    uint lid = gl_LocalInvocationID.x;\n"
+    "    uint gid = gl_WorkGroupID.x;\n"
+    "    uint wg_size = uint(WG_SIZE);\n"
+    "    uint N = N;\n"
+    "    uint bytes_per_row = K / 4u;\n"
+    "    uint plane_size = N * bytes_per_row;\n"
+    "\n"
+    "    // Load ALL input into shared memory (full hidden vector)\n"
+    "    for (uint i = lid; i < K; i += wg_size) {\n"
+    "        shared_input[i] = inputs[i];\n"
+    "    }\n"
+    "    memoryBarrierShared();\n"
+    "    barrier();\n"
+    "\n"
+    "    // Each thread handles TILE_N output rows\n"
+    "    uint base_n = gid * wg_size * uint(TILE_N) + lid * uint(TILE_N);\n"
+    "\n"
+    "    float acc[TILE_N];\n"
+    "    for (int t = 0; t < TILE_N; t++) acc[t] = 0.0;\n"
+    "\n"
+    "    // Iterate through all weight data (all 4 planes, all bytes)\n"
+    "    // Weight layout: [plane0: N*bytes_per_row][plane1: N*bytes_per_row]...\n"
+    "    for (uint plane = 0u; plane < 4u; plane++) {\n"
+    "        float plane_weight;\n"
+    "        if (plane == 0u) plane_weight = 1.0;\n"
+    "        else if (plane == 1u) plane_weight = 1.0 / 3.0;\n"
+    "        else if (plane == 2u) plane_weight = 1.0 / 9.0;\n"
+    "        else plane_weight = 1.0 / 27.0;\n"
+    "\n"
+    "        uint plane_base = plane * plane_size;\n"
+    "\n"
+    "        // For each output row this thread is responsible for\n"
+    "        for (int t = 0; t < TILE_N; t++) {\n"
+    "            uint n = base_n + uint(t);\n"
+    "            if (n >= N) continue;\n"
+    "\n"
+    "            float sum = 0.0;\n"
+    "            uint row_base = plane_base + n * bytes_per_row;\n"
+    "\n"
+    "            // Process this row: K/4 bytes, each byte = 4 trits\n"
+    "            for (uint byte_idx = 0u; byte_idx < bytes_per_row; byte_idx++) {\n"
+    "                uint wdata = weights[row_base + byte_idx];\n"
+    "\n"
+    "                // Extract 4 trits from the byte\n"
+    "                uint b0 = (wdata >> 0) & 0xFF;\n"
+    "                uint b1 = (wdata >> 8) & 0xFF;\n"
+    "                uint b2 = (wdata >> 16) & 0xFF;\n"
+    "                uint b3 = (wdata >> 24) & 0xFF;\n"
+    "\n"
+    "                // Trit 0\n"
+    "                uint c0 = b0 & 3u;\n"
+    "                if (c0 == 2u) sum += shared_input[byte_idx * 4 + 0];\n"
+    "                else if (c0 == 0u) sum -= shared_input[byte_idx * 4 + 0];\n"
+    "\n"
+    "                // Trit 1\n"
+    "                uint c1 = b1 & 3u;\n"
+    "                if (c1 == 2u) sum += shared_input[byte_idx * 4 + 1];\n"
+    "                else if (c1 == 0u) sum -= shared_input[byte_idx * 4 + 1];\n"
+    "\n"
+    "                // Trit 2\n"
+    "                uint c2 = b2 & 3u;\n"
+    "                if (c2 == 2u) sum += shared_input[byte_idx * 4 + 2];\n"
+    "                else if (c2 == 0u) sum -= shared_input[byte_idx * 4 + 2];\n"
+    "\n"
+    "                // Trit 3\n"
+    "                uint c3 = b3 & 3u;\n"
+    "                if (c3 == 2u) sum += shared_input[byte_idx * 4 + 3];\n"
+    "                else if (c3 == 0u) sum -= shared_input[byte_idx * 4 + 3];\n"
+    "            }\n"
+    "            acc[t] += sum * plane_weight;\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    // Write output\n"
+    "    for (int t = 0; t < TILE_N; t++) {\n"
+    "        uint n = base_n + uint(t);\n"
+    "        if (n < N) outputs[n] = acc[t];\n"
     "    }\n"
     "}\n";
 
@@ -367,6 +476,34 @@ static int compile_shader(void) {
         return -1;
     }
 
+    /* Compile lm_head shader (8-plane ternary) */
+    const char* src_lmhead;
+    cs = glCreateShader(GL_COMPUTE_SHADER);
+    src_lmhead = LMHEAD_SHADER;
+    glShaderSource(cs, 1, &src_lmhead, NULL);
+    glCompileShader(cs);
+
+    glGetShaderiv(cs, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(cs, 512, NULL, log);
+        fprintf(stderr, "GPU: lm_head shader compile error: %s\n", log);
+        return -1;
+    }
+
+    g_gpu.program_lmhead = glCreateProgram();
+    glAttachShader(g_gpu.program_lmhead, cs);
+    glLinkProgram(g_gpu.program_lmhead);
+    glGetProgramiv(g_gpu.program_lmhead, GL_LINK_STATUS, &ok);
+    glDeleteShader(cs);
+
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(g_gpu.program_lmhead, 512, NULL, log);
+        fprintf(stderr, "GPU: lm_head shader link error: %s\n", log);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -519,25 +656,14 @@ void gpu_gemm_set_dims(u32 H, u32 kv, u32 F) {
     size_t max_input = (H > F ? H : F) * sizeof(float);
     size_t max_output = (H > F ? H : F) * sizeof(float);
 
-    fprintf(stderr, "GPU: set_dims: max_input=%zu max_output=%zu\n", max_input, max_output);
-    fflush(stderr);
-
     if (!g_pool.input.valid || g_pool.input.size < max_input) {
-        fprintf(stderr, "GPU: creating input buffer\n");
-        fflush(stderr);
         destroy_persistent_buffer(&g_pool.input);
         create_persistent_buffer(&g_pool.input, max_input, GL_DYNAMIC_DRAW);
     }
-    fprintf(stderr, "GPU: input buffer done\n");
-    fflush(stderr);
     if (!g_pool.output.valid || g_pool.output.size < max_output) {
-        fprintf(stderr, "GPU: creating output buffer\n");
-        fflush(stderr);
         destroy_persistent_buffer(&g_pool.output);
         create_persistent_buffer(&g_pool.output, max_output, GL_DYNAMIC_DRAW);
     }
-    fprintf(stderr, "GPU: output buffer done\n");
-    fflush(stderr);
 }
 
 /*
@@ -959,18 +1085,38 @@ void* gpu_gemm_alloc_lmhead(size_t bytes) {
     return g_pool.lm_head.map;
 }
 
+/* Forward declarations */
+static int gpu_gemm_run_lmhead_async_inner(const float* input, float* output, u32 V, u32 K);
+static int gpu_gemm_wait_lmhead_inner(void);
+
 /*
  * Run lm_head projection on GPU.
  * This is a large GEMV: [V, H] x [H] -> [V]
+ * If async operation pending, waits for it first.
  */
 int gpu_gemm_run_lmhead(const float* input, float* output, u32 V, u32 K) {
+    if (g_gpu.lm_head_pending) {
+        gpu_gemm_wait_lmhead_inner();
+    }
+    return gpu_gemm_run_lmhead_async_inner(input, output, V, K);
+}
+
+/*
+ * Start async lm_head projection on GPU.
+ * Returns 0 on launch success, -1 on failure.
+ * Call gpu_gemm_poll_lmhead() or gpu_gemm_wait_lmhead() to complete.
+ */
+static int gpu_gemm_run_lmhead_async_inner(const float* input, float* output, u32 V, u32 K) {
     if (!g_gpu.initialized) return -1;
     if (!g_pool.lm_head.valid) return -1;
     
-    fprintf(stderr, "GPU lm_head: V=%u K=%u\n", V, K);
+    /* Wait for any pending operation */
+    if (g_gpu.lm_head_pending) {
+        gpu_gemm_wait_lmhead_inner();
+    }
+    
     /* Copy input to GPU */
     memcpy(g_pool.input.map, input, K * sizeof(float));
-    fprintf(stderr, "GPU lm_head: input copied\n");
     
     /* Set uniforms */
     u32* u = (u32*)g_pool.uniforms.map;
@@ -979,32 +1125,74 @@ int gpu_gemm_run_lmhead(const float* input, float* output, u32 V, u32 K) {
     u[2] = 0;       /* weight offset = 0 */
     u[3] = 0;       /* input offset */
     u[4] = 0;       /* output offset */
-    fprintf(stderr, "GPU lm_head: uniforms set\n");
     
-    /* Bind buffers */
+    /* Bind buffers - use simple ternary shader */
     glUseProgram(g_gpu.program);
-    fprintf(stderr, "GPU lm_head: program bound\n");
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g_pool.lm_head.ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g_pool.input.ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, g_pool.output.ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, g_pool.uniforms.ssbo);
-    fprintf(stderr, "GPU lm_head: buffers bound\n");
     
     /* Dispatch - lm_head is large, many workgroups */
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     u32 rows_per_wg = 64 * 4;
     u32 dispatch_size = (V + rows_per_wg - 1) / rows_per_wg;
-    fprintf(stderr, "GPU lm_head: dispatching %u workgroups\n", dispatch_size);
     glDispatchCompute(dispatch_size, 1, 1);
-    fprintf(stderr, "GPU lm_head: compute dispatched\n");
     
-    /* Wait and copy output */
-    glFinish();
-    fprintf(stderr, "GPU lm_head: finished\n");
-    memcpy(output, g_pool.output.map, V * sizeof(float));
-    fprintf(stderr, "GPU lm_head: output copied\n");
+    /* Mark as pending */
+    g_gpu.lm_head_pending = true;
+    g_gpu.lm_head_output = output;
     
     return 0;
+}
+
+/*
+ * Poll for async lm_head completion.
+ * Returns: 0 = still running, 1 = complete, -1 = error.
+ * Note: This does a glFinish - for true async, use fences.
+ */
+int gpu_gemm_poll_lmhead(void) {
+    if (!g_gpu.lm_head_pending) return 1;
+    
+    /* Try non-blocking check - for now just do glFinish */
+    glFinish();
+    
+    /* Copy output */
+    memcpy(g_gpu.lm_head_output, g_pool.output.map, 
+           *((u32*)g_pool.uniforms.map) * sizeof(float));
+    g_gpu.lm_head_pending = false;
+    
+    return 1;
+}
+
+/*
+ * Wait for async lm_head to complete.
+ */
+static int gpu_gemm_wait_lmhead_inner(void) {
+    if (!g_gpu.lm_head_pending) return 0;
+    
+    glFinish();
+    
+    /* Copy output */
+    memcpy(g_gpu.lm_head_output, g_pool.output.map, 
+           *((u32*)g_pool.uniforms.map) * sizeof(float));
+    g_gpu.lm_head_pending = false;
+    
+    return 0;
+}
+
+/*
+ * Public wrapper - waits for pending then calls async inner.
+ */
+int gpu_gemm_wait_lmhead(void) {
+    return gpu_gemm_wait_lmhead_inner();
+}
+
+/*
+ * Public async function.
+ */
+int gpu_gemm_run_lmhead_async(const float* input, float* output, u32 V, u32 K) {
+    return gpu_gemm_run_lmhead_async_inner(input, output, V, K);
 }
 
 #else /* !HAS_GLES_COMPUTE */
