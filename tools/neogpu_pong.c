@@ -16,14 +16,28 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include "hs_graphics.h"
 #include "hs_input.h"
+#include "hs_text.h"
+
+static HSFont g_font;
+static bool g_font_loaded = false;
 
 #define PADDLE_W 0.05f
 #define PADDLE_H 0.2f
 #define BALL_SIZE 0.04f
 #define PADDLE_SPEED 0.03f
 #define AI_SPEED 0.015f
+
+#define SAVE_PATH "/tmp/neogpu_pong_save.bin"
+#define HS_STORAGE_MAGIC 0x504F4E47  // "PONG"
+
+typedef struct {
+    u32 magic;
+    int player_high_score;
+    int ai_high_score;
+} PongSave;
 
 typedef struct {
     float x, y;
@@ -126,6 +140,31 @@ static bool kbhit(void) {
     return select(1, &rfds, NULL, NULL, &tv) > 0;
 }
 
+static void load_scores(int *player_high, int *ai_high) {
+    *player_high = 0;
+    *ai_high = 0;
+    FILE *f = fopen(SAVE_PATH, "rb");
+    if (!f) return;
+    PongSave save;
+    if (fread(&save, sizeof(save), 1, f) == 1 && save.magic == HS_STORAGE_MAGIC) {
+        *player_high = save.player_high_score;
+        *ai_high = save.ai_high_score;
+    }
+    fclose(f);
+}
+
+static void save_scores(int player_high, int ai_high) {
+    FILE *f = fopen(SAVE_PATH, "wb");
+    if (!f) return;
+    PongSave save = {
+        .magic = HS_STORAGE_MAGIC,
+        .player_high_score = player_high,
+        .ai_high_score = ai_high
+    };
+    fwrite(&save, sizeof(save), 1, f);
+    fclose(f);
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     srand(time(NULL));
@@ -153,10 +192,19 @@ int main(int argc, char **argv) {
     glViewport(0, 0, (GLsizei)gfx.screen_width, (GLsizei)gfx.screen_height);
     glDisable(GL_DEPTH_TEST);
 
+    g_font_loaded = hs_font_load(&g_font, "src/medodica_font");
+    if (g_font_loaded) {
+        hs_font_upload_texture(&g_font);
+    }
+
     Paddle player = { -0.9f, 0.0f, 0 };
     Paddle ai = { 0.9f, 0.0f, 0 };
     Ball ball;
     reset_ball(&ball);
+
+    int player_high = 0, ai_high = 0;
+    load_scores(&player_high, &ai_high);
+    fprintf(stderr, "High Scores - Player: %d  AI: %d\n", player_high, ai_high);
 
     fprintf(stderr, "PONG - Use UP/DOWN arrows or W/S to move\n");
     fprintf(stderr, "Press Q to quit\n");
@@ -233,12 +281,14 @@ int main(int argc, char **argv) {
 
         if (ball.x < -1.5f) {
             ai.score++;
-            fprintf(stderr, "\rPlayer: %d  AI: %d", player.score, ai.score);
+            if (ai.score > ai_high) ai_high = ai.score;
+            fprintf(stderr, "\rPlayer: %d  AI: %d  (Best: %d)", player.score, ai.score, ai_high);
             reset_ball(&ball);
         }
         if (ball.x > 1.5f) {
             player.score++;
-            fprintf(stderr, "\rPlayer: %d  AI: %d", player.score, ai.score);
+            if (player.score > player_high) player_high = player.score;
+            fprintf(stderr, "\rPlayer: %d  AI: %d  (Best: %d)", player.score, ai.score, player_high);
             reset_ball(&ball);
         }
 
@@ -257,6 +307,13 @@ int main(int argc, char **argv) {
         draw_quad(ball.x - BALL_SIZE/2, ball.y - BALL_SIZE/2,
                   ball.x + BALL_SIZE/2, ball.y + BALL_SIZE/2);
 
+        if (g_font_loaded) {
+            char score_buf[64];
+            snprintf(score_buf, sizeof(score_buf), "P:%d AI:%d", player.score, ai.score);
+            hs_font_render_text(&g_font, score_buf, -0.95f, 0.85f, 0.04f, 1.0f, 1.0f, 1.0f, 1.0f);
+            hs_font_render_text(&g_font, "SCORE", -0.3f, 0.0f, 0.08f, 1.0f, 0.0f, 0.0f, 1.0f);
+        }
+
         hs_graphics_present(&gfx);
 
         if (frame % 60 == 0) {
@@ -270,6 +327,7 @@ int main(int argc, char **argv) {
     }
 
     hs_graphics_finish(&gfx);
+    save_scores(player_high, ai_high);
     fprintf(stderr, "\npong: final score - Player: %d  AI: %d\n", player.score, ai.score);
     return 0;
 }

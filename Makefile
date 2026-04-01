@@ -36,7 +36,7 @@ $(HS_TARGET): $(HS_OBJ)
 TOOL_TGT = neogpu_tool
 
 neogpu_pong: tools/neogpu_pong.c
-	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o src/hs_text.o -o $@ $(LDFLAGS)
 	$(STRIP) $@
 
 neogpu_capture_demo: tools/neogpu_capture_demo.c
