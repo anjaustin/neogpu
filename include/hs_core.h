@@ -91,6 +91,13 @@ typedef enum {
     OP_ML_TOKENIZE,
     OP_ML_DETOKENIZE,
     
+    /* Input */
+    OP_INPUT_KEY,
+    OP_INPUT_MOUSE,
+    OP_INPUT_GAMEPAD,
+    OP_INPUT_DEVICE_ADD,
+    OP_INPUT_DEVICE_REMOVE,
+    
     OP_COUNT
 } OpCode;
 

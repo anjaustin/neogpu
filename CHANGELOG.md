@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-04-01
+
+### Added
+- **Input Streaming System** (`hs_input_stream.h`, `src/hs_input_stream.c`)
+  - Lock-free SPSC queue with 64-byte cache line alignment
+  - Per-device evdev reader threads
+  - Double-buffered HSInput for zero-contention game loop access
+  - EVIOCGRAB for exclusive device access
+  - Hotplug detection via inotify
+  - Device capability query via EVIOCGBIT
+- **NODE_INPUT Integration** (`hs_nodes.c`)
+  - `input_node_init/reset/process()` implementations
+  - `OP_INPUT_KEY`, `OP_INPUT_MOUSE`, `OP_INPUT_GAMEPAD` message handlers
+- **New Opcodes** (`hs_core.h`)
+  - `OP_INPUT_KEY`, `OP_INPUT_MOUSE`, `OP_INPUT_GAMEPAD`
+  - `OP_INPUT_DEVICE_ADD`, `OP_INPUT_DEVICE_REMOVE`
+
+### Fixed (13 issues from red-team audit)
+- SPSC false sharing (critical performance bug)
+- Dropped events untracked
+- Double-buffering broken (process thread ignored active state)
+- Thread exit fd leak
+- Failed start cleanup (orphan threads)
+- swap_buffers race condition
+- Sticky button state
+- No EVIOCGRAB (event duplication)
+- Axis mapping conflicts (ABS_Z/ABS_RX)
+- Polling inefficiency (blocking instead of polling)
+- No HSSystem integration for input
+- No capability query
+- No hotplug support
+
+### Documentation
+- `docs/INPUT_STREAM.md` - Complete input streaming system documentation
+- `docs/INPUT_STREAM_REMEDIATION.md` - Red-team analysis and fixes
+- `docs/REMEDIATION_PLAN.md` - Updated with input system status
+
 ## [0.1.0] - 2024-03-13
 
 ### Added

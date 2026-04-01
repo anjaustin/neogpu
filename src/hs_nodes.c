@@ -748,3 +748,100 @@ int system_node_process(Node* node) {
 
     return processed;
 }
+
+void input_node_init(Node* node) {
+    InputState* state = (InputState*)node->state;
+    if (state) memset(state, 0, sizeof(*state));
+    node->process_fn = input_node_process;
+    node->reset_fn = input_node_reset;
+}
+
+void input_node_reset(Node* node) {
+    InputState* state = (InputState*)node->state;
+    if (!state) return;
+    memset(&state->base, 0, sizeof(state->base));
+}
+
+static InputState* hs_input_state(Node* node) {
+    return node ? (InputState*)node->state : NULL;
+}
+
+int input_node_process(Node* node) {
+    InputState* state = hs_input_state(node);
+    int processed = 0;
+    Message msg;
+
+    if (!state) return 0;
+
+    while (mq_pop(&node->inbox, &msg)) {
+        u8 handled = 1;
+        switch (msg.op) {
+            case OP_INPUT_KEY: {
+                void* data = get_payload(node, msg.payload_idx);
+                if (data && msg.payload_len >= 3) {
+                    u16 code = ((u8*)data)[0] | (((u8*)data)[1] << 8);
+                    u8 pressed = ((u8*)data)[2];
+                    switch (code) {
+                        case 105: state->base.key_left = pressed; break;
+                        case 106: state->base.key_right = pressed; break;
+                        case 103: state->base.key_up = pressed; break;
+                        case 108: state->base.key_down = pressed; break;
+                        case 28: case 57: state->base.button1 = pressed; break;
+                        case 14: case 111: state->base.button2 = pressed; break;
+                        case 272: state->base.mouse_left = pressed; break;
+                        case 273: state->base.mouse_right = pressed; break;
+                        case 288: state->base.pad_a = pressed; break;
+                        case 289: state->base.pad_b = pressed; break;
+                    }
+                }
+                break;
+            }
+
+            case OP_INPUT_MOUSE: {
+                void* data = get_payload(node, msg.payload_idx);
+                if (data && msg.payload_len >= 8) {
+                    s32 x = *(s32*)data;
+                    s32 y = *(s32*)(data + 4);
+                    state->base.mouse_x = x < 0 ? 0 : (x > HS_WIDTH ? HS_WIDTH : x);
+                    state->base.mouse_y = y < 0 ? 0 : (y > HS_HEIGHT ? HS_HEIGHT : y);
+                }
+                break;
+            }
+
+            case OP_INPUT_GAMEPAD: {
+                void* data = get_payload(node, msg.payload_idx);
+                if (data && msg.payload_len >= 8) {
+                    f32 x = *(f32*)data;
+                    f32 y = *(f32*)(data + 4);
+                    state->base.pad_x = x < -1.0f ? -1.0f : (x > 1.0f ? 1.0f : x);
+                    state->base.pad_y = y < -1.0f ? -1.0f : (y > 1.0f ? 1.0f : y);
+                }
+                break;
+            }
+
+            default:
+                handled = 0;
+                break;
+        }
+        emit_ack(node, &msg, handled ? 0 : 1);
+        processed++;
+    }
+
+    if (processed > 0) {
+        f32 dx = 0.0f, dy = 0.0f;
+        if (state->base.key_left)  dx -= 1.0f;
+        if (state->base.key_right) dx += 1.0f;
+        if (state->base.key_up)    dy -= 1.0f;
+        if (state->base.key_down)  dy += 1.0f;
+        dx += state->base.pad_x;
+        dy += state->base.pad_y;
+        if (dx < -1.0f) dx = -1.0f;
+        if (dx >  1.0f) dx =  1.0f;
+        if (dy < -1.0f) dy = -1.0f;
+        if (dy >  1.0f) dy =  1.0f;
+        state->base.dir_x = dx;
+        state->base.dir_y = dy;
+    }
+
+    return processed;
+}

@@ -3,6 +3,7 @@
 
 #include "hs_core.h"
 #include "hs_math_neon.h"
+#include "hs_input.h"
 
 #define NODE_CPU      0
 #define NODE_SHADER  1
@@ -11,6 +12,7 @@
 #define NODE_OUTPUT  4
 #define NODE_SOUND   5
 #define NODE_SYSTEM  6
+#define NODE_INPUT   7
 
 typedef struct {
     u8   current_shader;
@@ -103,12 +105,21 @@ typedef struct {
     u8  pad2;
 } SystemState;
 
+typedef struct {
+    HSInput base;
+    u8 device_count;
+    u8 active_device;
+    int evdev_fds[8];
+    u8 device_connected[8];
+} InputState;
+
 int shader_node_process(Node* node);
 int buffer_node_process(Node* node);
 int texture_node_process(Node* node);
 int output_node_process(Node* node);
 int sound_node_process(Node* node);
 int system_node_process(Node* node);
+int input_node_process(Node* node);
 
 void shader_node_init(Node* node);
 void buffer_node_init(Node* node);
@@ -116,6 +127,7 @@ void texture_node_init(Node* node);
 void output_node_init(Node* node);
 void sound_node_init(Node* node);
 void system_node_init(Node* node);
+void input_node_init(Node* node);
 
 void shader_node_reset(Node* node);
 void buffer_node_reset(Node* node);
@@ -123,6 +135,7 @@ void texture_node_reset(Node* node);
 void output_node_reset(Node* node);
 void sound_node_reset(Node* node);
 void system_node_reset(Node* node);
+void input_node_reset(Node* node);
 
 const char* node_name(u8 id);
 
