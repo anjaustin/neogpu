@@ -16,8 +16,10 @@
 typedef struct {
     u16 width;
     u16 height;
-    int16_t offset_x;
-    int16_t offset_y;
+    int16_t offset_x;   // render offset X from cursor
+    int16_t offset_y;   // render offset Y from cursor
+    int16_t tex_x;      // texture position X in atlas
+    int16_t tex_y;      // texture position Y in atlas
     u8 advance;
 } HSGlyph;
 

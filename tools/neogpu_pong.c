@@ -194,7 +194,16 @@ int main(int argc, char **argv) {
 
     g_font_loaded = hs_font_load(&g_font, "src/medodica_font");
     if (g_font_loaded) {
+        fprintf(stderr, "Font loaded: size=%d line_height=%d\n", g_font.font_size, g_font.line_height);
+        fprintf(stderr, "Font glyph 'A': tex=(%d,%d) size=%dx%d offset=(%d,%d) advance=%d\n",
+                g_font.glyphs['A'].tex_x, g_font.glyphs['A'].tex_y,
+                g_font.glyphs['A'].width, g_font.glyphs['A'].height,
+                g_font.glyphs['A'].offset_x, g_font.glyphs['A'].offset_y,
+                g_font.glyphs['A'].advance);
         hs_font_upload_texture(&g_font);
+        fprintf(stderr, "Font texture uploaded: tex=%u\n", g_font.atlas_tex);
+    } else {
+        fprintf(stderr, "Font FAILED to load\n");
     }
 
     Paddle player = { -0.9f, 0.0f, 0 };
@@ -307,11 +316,11 @@ int main(int argc, char **argv) {
         draw_quad(ball.x - BALL_SIZE/2, ball.y - BALL_SIZE/2,
                   ball.x + BALL_SIZE/2, ball.y + BALL_SIZE/2);
 
-        if (g_font_loaded) {
-            char score_buf[64];
-            snprintf(score_buf, sizeof(score_buf), "P:%d AI:%d", player.score, ai.score);
-            hs_font_render_text(&g_font, score_buf, -0.95f, 0.85f, 0.04f, 1.0f, 1.0f, 1.0f, 1.0f);
-            hs_font_render_text(&g_font, "SCORE", -0.3f, 0.0f, 0.08f, 1.0f, 0.0f, 0.0f, 1.0f);
+        if (g_font_loaded && frame <= 2) {
+            fprintf(stderr, "Frame %d: rendering text\n", frame);
+            hs_font_render_text(&g_font, "HELLO", -0.3f, 0.8f, 0.05f, 1.0f, 1.0f, 1.0f, 1.0f);
+            glDisable(GL_BLEND);
+            glUseProgram(g_prog);
         }
 
         hs_graphics_present(&gfx);

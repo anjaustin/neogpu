@@ -79,8 +79,10 @@ static int hs_font_parse_glyph(HSGlyph* g, const char* line) {
     if (code >= 0 && code < HS_FONT_MAX_GLYPHS) {
         g[code].width = (u16)rect_w;
         g[code].height = (u16)rect_h;
-        g[code].offset_x = (int16_t)rect_x;  // texture X in atlas
-        g[code].offset_y = (int16_t)rect_y;  // texture Y in atlas
+        g[code].offset_x = (int16_t)ox;   // render offset X
+        g[code].offset_y = (int16_t)oy;   // render offset Y
+        g[code].tex_x = (int16_t)rect_x;  // texture position X
+        g[code].tex_y = (int16_t)rect_y;  // texture position Y
         g[code].advance = (u8)width;
         return code;
     }
@@ -208,10 +210,10 @@ void hs_font_render_text(const HSFont* font, const char* text, float x, float y,
             float ox = g->offset_x * scale;
             float oy = g->offset_y * scale;
             
-            float u0 = (float)g->offset_x / atlas_w;
-            float v0 = (float)g->offset_y / atlas_h;
-            float u1 = (float)(g->offset_x + g->width) / atlas_w;
-            float v1 = (float)(g->offset_y + g->height) / atlas_h;
+            float u0 = (float)g->tex_x / atlas_w;
+            float v0 = (float)(atlas_h - g->tex_y - g->height) / atlas_h;
+            float u1 = (float)(g->tex_x + g->width) / atlas_w;
+            float v1 = (float)(atlas_h - g->tex_y) / atlas_h;
             
             float q[] = {
                 cursor_x + ox, cursor_y + oy + gh, u0, v1,
