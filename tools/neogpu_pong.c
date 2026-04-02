@@ -316,20 +316,13 @@ int main(int argc, char **argv) {
         draw_quad(ball.x - BALL_SIZE/2, ball.y - BALL_SIZE/2,
                   ball.x + BALL_SIZE/2, ball.y + BALL_SIZE/2);
 
-        if (g_font_loaded && frame <= 2) {
-            fprintf(stderr, "Frame %d: rendering text\n", frame);
-            hs_font_render_text(&g_font, "HELLO", -0.3f, 0.8f, 0.05f, 1.0f, 1.0f, 1.0f, 1.0f);
+        if (g_font_loaded && frame <= 1) {
+            hs_font_render_text(&g_font, "HELLO", -0.5f, 0.0f, 0.05f, 1.0f, 1.0f, 1.0f, 1.0f);
             glDisable(GL_BLEND);
             glUseProgram(g_prog);
         }
 
         hs_graphics_present(&gfx);
-
-        if (frame % 60 == 0) {
-            char path[64];
-            snprintf(path, sizeof(path), "/tmp/pong_%03d.ppm", frame/60);
-            save_screenshot(&gfx, path);
-        }
 
         struct timespec ts = {0, 16666667};
         nanosleep(&ts, NULL);

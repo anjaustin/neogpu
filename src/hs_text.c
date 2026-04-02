@@ -211,17 +211,17 @@ void hs_font_render_text(const HSFont* font, const char* text, float x, float y,
             float oy = g->offset_y * scale;
             
             float u0 = (float)g->tex_x / atlas_w;
-            float v0 = (float)(atlas_h - g->tex_y - g->height) / atlas_h;
+            float v0 = (float)(atlas_h - g->tex_y) / atlas_h;
             float u1 = (float)(g->tex_x + g->width) / atlas_w;
-            float v1 = (float)(atlas_h - g->tex_y) / atlas_h;
+            float v1 = (float)(atlas_h - g->tex_y - g->height) / atlas_h;
             
             float q[] = {
-                cursor_x + ox, cursor_y + oy + gh, u0, v1,
-                cursor_x + ox + gw, cursor_y + oy + gh, u1, v1,
-                cursor_x + ox, cursor_y + oy, u0, v0,
-                cursor_x + ox + gw, cursor_y + oy + gh, u1, v1,
-                cursor_x + ox + gw, cursor_y + oy, u1, v0,
-                cursor_x + ox, cursor_y + oy, u0, v0,
+                cursor_x + ox, cursor_y + oy - gh, u0, v0,
+                cursor_x + ox + gw, cursor_y + oy - gh, u1, v0,
+                cursor_x + ox, cursor_y + oy, u0, v1,
+                cursor_x + ox + gw, cursor_y + oy - gh, u1, v0,
+                cursor_x + ox + gw, cursor_y + oy, u1, v1,
+                cursor_x + ox, cursor_y + oy, u0, v1,
             };
             
             glBufferData(GL_ARRAY_BUFFER, sizeof(q), q, GL_DYNAMIC_DRAW);
