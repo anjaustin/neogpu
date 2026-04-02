@@ -211,9 +211,9 @@ void hs_font_render_text(const HSFont* font, const char* text, float x, float y,
             float oy = g->offset_y * scale;
             
             float u0 = (float)g->tex_x / atlas_w;
-            float v0 = (float)(atlas_h - g->tex_y) / atlas_h;
+            float v0 = (float)(atlas_h - g->tex_y - g->height + 1) / atlas_h;
             float u1 = (float)(g->tex_x + g->width) / atlas_w;
-            float v1 = (float)(atlas_h - g->tex_y - g->height) / atlas_h;
+            float v1 = (float)(atlas_h - g->tex_y) / atlas_h;
             
             float q[] = {
                 cursor_x + ox, cursor_y + oy - gh, u0, v0,

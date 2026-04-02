@@ -316,8 +316,15 @@ int main(int argc, char **argv) {
         draw_quad(ball.x - BALL_SIZE/2, ball.y - BALL_SIZE/2,
                   ball.x + BALL_SIZE/2, ball.y + BALL_SIZE/2);
 
-        if (g_font_loaded && frame <= 1) {
-            hs_font_render_text(&g_font, "HELLO", -0.5f, 0.0f, 0.05f, 1.0f, 1.0f, 1.0f, 1.0f);
+        if (g_font_loaded && frame == 1) {
+            glDisable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            
+            char buf[32];
+            snprintf(buf, sizeof(buf), "A");
+            hs_font_render_text(&g_font, buf, -0.5f, 0.0f, 0.2f, 1.0f, 1.0f, 1.0f, 1.0f);
+            
             glDisable(GL_BLEND);
             glUseProgram(g_prog);
         }
