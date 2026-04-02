@@ -171,11 +171,15 @@ int main(int argc, char** argv) {
     int frame = 0;
     float fps = 0.0f;
     
-    printf("Rendering ray cast spheres for 15 seconds...\n");
+    printf("Rendering ray cast spheres for 10 seconds...\n");
     printf("FPS will be shown on screen\n");
     
-    while (frame < 300) {
-        float t = frame * 0.05f;
+    while (1) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= 10.0) break;
+        
+        float t = (float)elapsed;
         
         glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -195,9 +199,7 @@ int main(int argc, char** argv) {
             glDisable(GL_BLEND);
         }
         
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed > 0.5 && frame % 30 == 0) {
+        if (frame % 30 == 0) {
             fps = frame / elapsed;
             printf("FPS: %.1f\n", fps);
         }
