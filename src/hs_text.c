@@ -18,8 +18,8 @@ static const char* g_fs_text =
     "uniform sampler2D u_tex;\n"
     "uniform vec4 u_color;\n"
     "void main(){\n"
-    "  float a = texture2D(u_tex, v_uv).a;\n"
-    "  gl_FragColor = vec4(u_color.rgb, u_color.a * a);\n"
+    "  vec4 tex = texture2D(u_tex, v_uv);\n"
+    "  gl_FragColor = vec4(u_color.rgb * tex.a, tex.a);\n"
     "}\n";
 
 static GLuint g_text_prog = 0;
@@ -216,12 +216,12 @@ void hs_font_render_text(const HSFont* font, const char* text, float x, float y,
             float v1 = (float)(atlas_h - g->tex_y) / atlas_h;
             
             float q[] = {
-                cursor_x + ox, cursor_y + oy - gh, u0, v0,
-                cursor_x + ox + gw, cursor_y + oy - gh, u1, v0,
-                cursor_x + ox, cursor_y + oy, u0, v1,
-                cursor_x + ox + gw, cursor_y + oy - gh, u1, v0,
-                cursor_x + ox + gw, cursor_y + oy, u1, v1,
-                cursor_x + ox, cursor_y + oy, u0, v1,
+                -1.0f, -1.0f, u0, v0,
+                1.0f, -1.0f, u1, v0,
+                -1.0f, 1.0f, u0, v1,
+                1.0f, -1.0f, u1, v0,
+                1.0f, 1.0f, u1, v1,
+                -1.0f, 1.0f, u0, v1,
             };
             
             glBufferData(GL_ARRAY_BUFFER, sizeof(q), q, GL_DYNAMIC_DRAW);
