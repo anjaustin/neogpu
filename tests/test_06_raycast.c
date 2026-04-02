@@ -16,6 +16,10 @@
 #include <string.h>
 #include <time.h>
 #include "hs_graphics.h"
+#include "hs_text.h"
+
+static HSFont g_font;
+static bool g_font_loaded = false;
 
 static const char* vertex_shader_src = R"(
     attribute vec2 a_position;
@@ -128,6 +132,12 @@ int main(int argc, char** argv) {
     
     printf("Screen: %dx%d\n", gfx.screen_width, gfx.screen_height);
     
+    g_font_loaded = hs_font_load(&g_font, "src/medodica_font");
+    if (g_font_loaded) {
+        hs_font_upload_texture(&g_font);
+        printf("Font loaded successfully\n");
+    }
+    
     GLuint program = create_program(vertex_shader_src, fragment_shader_src);
     if (!program) return 1;
     
@@ -174,6 +184,16 @@ int main(int argc, char** argv) {
         glDrawArrays(GL_TRIANGLES, 0, 6);
         
         hs_graphics_present(&gfx);
+        
+        if (g_font_loaded && frame > 0) {
+            char fps_buf[32];
+            snprintf(fps_buf, sizeof(fps_buf), "FPS: %.1f", fps);
+            glDisable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            hs_font_render_text(&g_font, fps_buf, -0.95f, 0.85f, 0.04f, 1.0f, 1.0f, 0.0f, 1.0f);
+            glDisable(GL_BLEND);
+        }
         
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
