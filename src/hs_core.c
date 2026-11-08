@@ -1125,12 +1125,6 @@ bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Pa
     if (!f) return false;
 
     HSCaptureHeader h;
-    if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return false; }
-    
-    bool ok = hs_capture_header_valid(&h);
-    if (!ok) { fclose(f); return false; }
-
-    HSCaptureHeader h;
     size_t nread = fread(&h, sizeof(h), 1, f);
     if (nread != 1) {
         fprintf(stderr, "Capture read: failed to read header (got %zu)\n", nread);
@@ -1140,7 +1134,6 @@ bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Pa
     
     bool ok = hs_capture_header_valid(&h);
     
-    ok = hs_capture_header_valid(&h);
     if (!ok) {
         fprintf(stderr, "Capture read: invalid header magic=%.7s version=%u endian=0x%x\n", 
                 h.magic, h.version, h.endian);

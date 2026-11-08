@@ -187,9 +187,7 @@ int main(int argc, char** argv) {
         glUniform1f(time_loc, t);
         glDrawArrays(GL_TRIANGLES, 0, 6);
         
-        hs_graphics_present(&gfx);
-        
-        if (g_font_loaded && frame > 0) {
+        if (0 && g_font_loaded && frame > 0) {
             char fps_buf[32];
             snprintf(fps_buf, sizeof(fps_buf), "FPS: %.1f", fps);
             glDisable(GL_DEPTH_TEST);
@@ -198,6 +196,8 @@ int main(int argc, char** argv) {
             hs_font_render_text(&g_font, fps_buf, -0.95f, 0.85f, 0.04f, 1.0f, 1.0f, 0.0f, 1.0f);
             glDisable(GL_BLEND);
         }
+
+        hs_graphics_present(&gfx);
         
         if (frame % 30 == 0) {
             fps = frame / elapsed;

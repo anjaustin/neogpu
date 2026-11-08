@@ -74,7 +74,7 @@ static inline int hs_graphics_init(HSGraphics* gfx) {
     if (resources) {
         for (int i = 0; i < resources->count_connectors; i++) {
             conn = drmModeGetConnector(gfx->drm_fd, resources->connectors[i]);
-            if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
+            if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0 && conn->connector_type == DRM_MODE_CONNECTOR_DSI) {
                 gfx->screen_width = conn->modes[0].hdisplay;
                 gfx->screen_height = conn->modes[0].vdisplay;
                 break;
@@ -297,7 +297,7 @@ static inline void hs_graphics_present(HSGraphics* gfx) {
             
             for (int i = 0; i < resources->count_connectors; i++) {
                 conn = drmModeGetConnector(gfx->drm_fd, resources->connectors[i]);
-                if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
+                if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0 && conn->connector_type == DRM_MODE_CONNECTOR_DSI) {
                     if (conn->encoder_id) {
                         enc = drmModeGetEncoder(gfx->drm_fd, conn->encoder_id);
                         if (enc && enc->crtc_id) {
