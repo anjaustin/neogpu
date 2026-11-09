@@ -176,6 +176,13 @@ See [integration contract/results](docs/audit/FRAME_RUNTIME_INTEGRATION.md) and
 message-only benchmark numbers do not establish an integration or display-FPS
 speedup.
 
+The [GLES/capture investigation](docs/audit/GLES_WORK_RESULTS.md) records remaining
+CPU costs and rejected GL-state cache experiments. Production rendering retains
+its original draw setup and capture defaults; successful graphics teardown now
+releases the selected DRM connector and EGL context/display resources. Standard
+regression and sanitizer targets include headless backend-state checks, distinct
+from actual pixel verification and performance collection.
+
 ## Demos
 
 The graphics tests are the clearest proof surface. They run on the Pi's

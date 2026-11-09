@@ -70,6 +70,8 @@ See [../CREDITS.md](../CREDITS.md) for the full acknowledgment.
 | [audit/BEDROCK_REDTEAM.md](audit/BEDROCK_REDTEAM.md) | Adversarial schedules, evidence-tool negative controls and remediation verification |
 | [audit/FRAME_RUNTIME_INTEGRATION.md](audit/FRAME_RUNTIME_INTEGRATION.md) | Default HSGpu participant integration contract and verification gates |
 | [audit/FRAME_RUNTIME_REDTEAM.md](audit/FRAME_RUNTIME_REDTEAM.md) | Second-pass invocation/provenance attacks and expanded composition/lifecycle checks |
+| [audit/GLES_WORK_PLAN.md](audit/GLES_WORK_PLAN.md) | Renderer/capture profiling contract, invariants and diagnostic scope |
+| [audit/GLES_WORK_RESULTS.md](audit/GLES_WORK_RESULTS.md) | Measured capture costs, graphics teardown repair and rejected state-cache candidates |
 
 ## Archive
 

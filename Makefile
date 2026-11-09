@@ -37,7 +37,7 @@ version:
 
 build: $(HS_TARGET)
 
-test: $(HS_TARGET) tests/test_p0 neogpu_tool tests/test_fabric tests/test_bedrock_hint tests/test_bedrock_split tests/test_gpu_participants
+test: $(HS_TARGET) tests/test_p0 neogpu_tool tests/test_fabric tests/test_bedrock_hint tests/test_bedrock_split tests/test_gpu_participants tests/test_gles_state
 	./$(HS_TARGET) --check
 	./tests/test_p0
 	python3 tests/test_cli.py
@@ -45,7 +45,9 @@ test: $(HS_TARGET) tests/test_p0 neogpu_tool tests/test_fabric tests/test_bedroc
 	./tests/test_bedrock_hint
 	./tests/test_bedrock_split
 	./tests/test_gpu_participants
+	./tests/test_gles_state
 	python3 -E tests/test_gpu_frame_report_checks.py
+	python3 -E tests/test_gles_work_report_checks.py
 	python3 tests/test_bedrock_tools.py
 	python3 tests/test_bedrock_adversarial.py
 
@@ -60,6 +62,19 @@ tests/test_fabric: tests/test_fabric.c src/hs_fabric.o
 
 tests/test_gpu_participants: tests/test_gpu_participants.c $(filter-out src/main.o,$(HS_OBJ))
 	$(CC) $(CFLAGS) $< $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -Wl,--wrap=pthread_mutex_init,--wrap=pthread_mutex_destroy,--wrap=hs_fabric_step -o $@
+
+GLES_STATE_WRAPS = -Wl,--wrap=glUseProgram,--wrap=glBindBuffer,--wrap=glEnableVertexAttribArray,--wrap=glVertexAttribPointer,--wrap=glDrawArrays,--wrap=glBufferData,--wrap=glActiveTexture,--wrap=glBindTexture,--wrap=glUniform1i
+tests/test_gles_state: tests/test_gles_state.c src/hs_backend_gles.c $(filter-out src/main.o src/hs_backend_gles.o,$(HS_OBJ))
+	$(CC) $(CFLAGS) $< $(filter-out src/main.o src/hs_backend_gles.o,$(HS_OBJ)) $(LDFLAGS) $(GLES_STATE_WRAPS) -o $@
+
+.PHONY: gles-state-asan gles-state-tsan
+gles-state-asan:
+	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined tests/test_gles_state.c $(filter-out src/hs_backend_gles.c,$(LIB_SRC)) $(LDFLAGS) $(GLES_STATE_WRAPS) -o tests/test_gles_state_sanitize
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test_gles_state_sanitize
+
+gles-state-tsan:
+	$(CC) $(SAN_FLAGS) -fsanitize=thread tests/test_gles_state.c $(filter-out src/hs_backend_gles.c,$(LIB_SRC)) $(LDFLAGS) $(GLES_STATE_WRAPS) -o tests/test_gles_state_tsan
+	TSAN_OPTIONS=halt_on_error=1 ./tests/test_gles_state_tsan
 
 .PHONY: gpu-participants-sanitize gpu-participants-asan gpu-participants-tsan gpu-participants-hardware
 gpu-participants-sanitize: gpu-participants-asan gpu-participants-tsan
@@ -135,7 +150,7 @@ tests/test_p0: tests/test_p0.c $(filter-out src/main.o,$(HS_OBJ))
 SAN_FLAGS = -O1 -g -fno-omit-frame-pointer -Iinclude -I/usr/include/libdrm
 LIB_SRC = $(filter-out src/main.c,$(HS_SRC))
 
-sanitize: $(HS_TARGET) gpu-participants-asan
+sanitize: $(HS_TARGET) gpu-participants-asan gles-state-asan
 	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined tests/test_p0.c $(LIB_SRC) $(LDFLAGS) -o tests/test_p0_sanitize
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test_p0_sanitize
 	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined src/main.c $(LIB_SRC) $(LDFLAGS) -o tests/test_headless_sanitize
@@ -143,7 +158,7 @@ sanitize: $(HS_TARGET) gpu-participants-asan
 	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined tools/neogpu_tool.c $(LDFLAGS) -o tests/test_tool_sanitize
 	NEOGPU_TOOL=./tests/test_tool_sanitize ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 python3 tests/test_cli.py
 
-tsan: $(HS_TARGET) gpu-participants-tsan
+tsan: $(HS_TARGET) gpu-participants-tsan gles-state-tsan
 	$(CC) $(SAN_FLAGS) -fsanitize=thread tests/test_p0.c $(LIB_SRC) $(LDFLAGS) -o tests/test_p0_tsan
 	TSAN_OPTIONS=halt_on_error=1 ./tests/test_p0_tsan
 	$(CC) $(SAN_FLAGS) -fsanitize=thread src/main.c $(LIB_SRC) $(LDFLAGS) -o tests/test_headless_tsan
@@ -212,6 +227,7 @@ tool: neogpu_tool
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
+	rm -f tests/test_gles_state tests/test_gles_state_sanitize tests/test_gles_state_tsan
 	rm -f tests/test_gpu_participants tests/test_gpu_participants_sanitize tests/test_gpu_participants_tsan
 	rm -f tests/test_bedrock_hint tests/test_bedrock_split tests/test_bedrock_hint_sanitize tests/test_bedrock_split_sanitize tests/test_bedrock_hint_tsan tests/test_bedrock_split_tsan
 	rm -f tests/test_comparison_graphics

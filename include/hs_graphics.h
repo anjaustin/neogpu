@@ -77,6 +77,8 @@ static inline int hs_graphics_init(HSGraphics* gfx) {
             if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0 && conn->connector_type == DRM_MODE_CONNECTOR_DSI) {
                 gfx->screen_width = conn->modes[0].hdisplay;
                 gfx->screen_height = conn->modes[0].vdisplay;
+                drmModeFreeConnector(conn);
+                conn = NULL;
                 break;
             }
             drmModeFreeConnector(conn);
@@ -184,12 +186,15 @@ static inline void hs_graphics_finish(HSGraphics* gfx) {
         }
     }
     
+    eglMakeCurrent(gfx->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (gfx->egl_surface != EGL_NO_SURFACE) {
         eglDestroySurface(gfx->egl_display, gfx->egl_surface);
     }
     if (gfx->egl_context != EGL_NO_CONTEXT) {
         eglDestroyContext(gfx->egl_display, gfx->egl_context);
     }
+    eglTerminate(gfx->egl_display);
+    eglReleaseThread();
     if (gfx->gbm_surface) {
         gbm_surface_destroy(gfx->gbm_surface);
     }
