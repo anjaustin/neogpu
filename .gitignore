@@ -56,6 +56,7 @@ tests/*.o
 /tmp
 /build/
 /tests/p0-perf-baseline/
+/tests/evidence-*
 /tests/p0-*.perf.data
 
 # Editor / scratch backups

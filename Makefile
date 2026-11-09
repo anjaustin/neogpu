@@ -37,10 +37,50 @@ version:
 
 build: $(HS_TARGET)
 
-test: $(HS_TARGET) tests/test_p0 neogpu_tool
+test: $(HS_TARGET) tests/test_p0 neogpu_tool tests/test_fabric
 	./$(HS_TARGET) --check
 	./tests/test_p0
 	python3 tests/test_cli.py
+	./tests/test_fabric
+
+tests/test_fabric: tests/test_fabric.c src/hs_fabric.o
+	$(CC) $(CFLAGS) tests/test_fabric.c src/hs_fabric.o -lpthread -o $@
+
+tests/test_fabric_graphics: tests/test_fabric_graphics.c src/hs_fabric.o $(filter-out src/main.o,$(HS_OBJ))
+	$(CC) $(CFLAGS) tests/test_fabric_graphics.c src/hs_fabric.o $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -Wl,--wrap=eglSwapBuffers -o $@
+
+.PHONY: fabric-hardware
+fabric-hardware: tests/test_fabric_graphics
+	./tests/test_fabric_graphics
+
+.PHONY: fabric-sanitize
+fabric-sanitize:
+	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined tests/test_fabric.c src/hs_fabric.c -lpthread -o tests/test_fabric_sanitize
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test_fabric_sanitize
+	$(CC) $(SAN_FLAGS) -fsanitize=thread tests/test_fabric.c src/hs_fabric.c -lpthread -o tests/test_fabric_tsan
+	TSAN_OPTIONS=halt_on_error=1 ./tests/test_fabric_tsan
+
+# Architectural findings are intentionally separate from the regression gate.
+.PHONY: evidence-probes
+evidence-probes: tests/test_architecture
+	./tests/test_architecture
+
+tests/test_architecture: tests/test_architecture.c $(filter-out src/main.o,$(HS_OBJ))
+	$(CC) $(CFLAGS) tests/test_architecture.c $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -o $@
+
+tests/test_architecture_latency: tests/test_architecture_latency.c $(filter-out src/main.o,$(HS_OBJ))
+	$(CC) $(CFLAGS) tests/test_architecture_latency.c $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -o $@
+
+.PHONY: evidence-sanitize
+evidence-sanitize:
+	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined tests/test_architecture.c $(LIB_SRC) $(LDFLAGS) -o tests/test_architecture_sanitize
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test_architecture_sanitize > tests/evidence-probes-asan.log
+	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined tests/test_architecture_latency.c $(LIB_SRC) $(LDFLAGS) -o tests/test_architecture_latency_sanitize
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test_architecture_latency_sanitize > tests/evidence-latency-asan.log
+	$(CC) $(SAN_FLAGS) -fsanitize=thread tests/test_architecture.c $(LIB_SRC) $(LDFLAGS) -o tests/test_architecture_tsan
+	TSAN_OPTIONS=halt_on_error=1 ./tests/test_architecture_tsan > tests/evidence-probes-tsan.log
+	$(CC) $(SAN_FLAGS) -fsanitize=thread tests/test_architecture_latency.c $(LIB_SRC) $(LDFLAGS) -o tests/test_architecture_latency_tsan
+	TSAN_OPTIONS=halt_on_error=1 ./tests/test_architecture_latency_tsan > tests/evidence-latency-tsan.log
 
 .PHONY: benchmark
 benchmark: $(HS_TARGET)
@@ -89,6 +129,7 @@ tests/test_evdev: tests/test_evdev.c src/hs_input_stream.o
 	$(CC) $(CFLAGS) tests/test_evdev.c src/hs_input_stream.o $(LDFLAGS) -o $@
 
 -include $(HS_DEPS)
+-include src/hs_fabric.d
 -include $(wildcard tests/*.d tools/*.d *.d)
 
 $(HS_TARGET): $(HS_OBJ)
@@ -128,6 +169,11 @@ tool: neogpu_tool
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
+	rm -f src/hs_fabric.o src/hs_fabric.d tests/test_fabric tests/test_fabric_sanitize tests/test_fabric_tsan
+	rm -f tests/test_fabric_graphics
+	rm -f tests/test_architecture
+	rm -f tests/test_architecture_latency
+	rm -f tests/test_architecture_sanitize tests/test_architecture_latency_sanitize tests/test_architecture_tsan tests/test_architecture_latency_tsan
 	rm -f tests/test_p0 tests/test_p0_sanitize tests/test_p0_tsan tests/test_headless_sanitize tests/test_headless_tsan tests/*.d tools/*.d *.d
 	rm -f tests/test_evdev
 	rm -f tests/test_tool_sanitize tests/test_tool_tsan
