@@ -60,6 +60,8 @@ See [../CREDITS.md](../CREDITS.md) for the full acknowledgment.
 | [audit/ARCHITECTURE_EVIDENCE_RESULTS.md](audit/ARCHITECTURE_EVIDENCE_RESULTS.md) | Pi ordering/isolation/frame counterexamples and RT latency measurements |
 | [architecture/PARTICIPANT_SLICE.md](architecture/PARTICIPANT_SLICE.md) | Bounded participant FIFO/lifetime/frame-commit contract and explicit limits |
 | [audit/PARTICIPANT_SLICE_RESULTS.md](audit/PARTICIPANT_SLICE_RESULTS.md) | Concurrent delivery/lifecycle, sanitizer and real-pixel evidence for the participant slice |
+| [audit/COMPARISON_PLAN.md](audit/COMPARISON_PLAN.md) | Pinned optimized-queue and equivalent GLES comparison controls |
+| [audit/COMPARISON_RESULTS.md](audit/COMPARISON_RESULTS.md) | Same-Pi throughput/latency and byte-identical direct-GLES measurements |
 
 ## Archive
 

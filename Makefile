@@ -49,6 +49,9 @@ tests/test_fabric: tests/test_fabric.c src/hs_fabric.o
 tests/test_fabric_graphics: tests/test_fabric_graphics.c src/hs_fabric.o $(filter-out src/main.o,$(HS_OBJ))
 	$(CC) $(CFLAGS) tests/test_fabric_graphics.c src/hs_fabric.o $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -Wl,--wrap=eglSwapBuffers -o $@
 
+tests/test_comparison_graphics: tests/test_comparison_graphics.c src/hs_fabric.o $(filter-out src/main.o,$(HS_OBJ))
+	$(CC) $(CFLAGS) tests/test_comparison_graphics.c src/hs_fabric.o $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -Wl,--wrap=eglSwapBuffers -o $@
+
 .PHONY: fabric-hardware
 fabric-hardware: tests/test_fabric_graphics
 	./tests/test_fabric_graphics
@@ -169,6 +172,7 @@ tool: neogpu_tool
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
+	rm -f tests/test_comparison_graphics
 	rm -f src/hs_fabric.o src/hs_fabric.d tests/test_fabric tests/test_fabric_sanitize tests/test_fabric_tsan
 	rm -f tests/test_fabric_graphics
 	rm -f tests/test_architecture
