@@ -20,7 +20,7 @@ SRC_DIR = src
 OBJ_DIR = src
 
 # --- Graphics and runtime substrate ---
-HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/hs_backend_gles.c $(SRC_DIR)/hs_ipc.c $(SRC_DIR)/hs_text.c $(SRC_DIR)/hs_input_stream.c $(SRC_DIR)/main.c
+HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_fabric.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/hs_backend_gles.c $(SRC_DIR)/hs_ipc.c $(SRC_DIR)/hs_text.c $(SRC_DIR)/hs_input_stream.c $(SRC_DIR)/main.c
 
 HS_OBJ = $(HS_SRC:.c=.o)
 HS_DEPS = $(HS_OBJ:.o=.d)
@@ -37,13 +37,15 @@ version:
 
 build: $(HS_TARGET)
 
-test: $(HS_TARGET) tests/test_p0 neogpu_tool tests/test_fabric tests/test_bedrock_hint tests/test_bedrock_split
+test: $(HS_TARGET) tests/test_p0 neogpu_tool tests/test_fabric tests/test_bedrock_hint tests/test_bedrock_split tests/test_gpu_participants
 	./$(HS_TARGET) --check
 	./tests/test_p0
 	python3 tests/test_cli.py
 	./tests/test_fabric
 	./tests/test_bedrock_hint
 	./tests/test_bedrock_split
+	./tests/test_gpu_participants
+	python3 -E tests/test_gpu_frame_report_checks.py
 	python3 tests/test_bedrock_tools.py
 	python3 tests/test_bedrock_adversarial.py
 
@@ -56,11 +58,30 @@ tests/test_bedrock_split: tests/test_bedrock_split.c src/hs_fabric.o
 tests/test_fabric: tests/test_fabric.c src/hs_fabric.o
 	$(CC) $(CFLAGS) tests/test_fabric.c src/hs_fabric.o -lpthread -o $@
 
-tests/test_fabric_graphics: tests/test_fabric_graphics.c src/hs_fabric.o $(filter-out src/main.o,$(HS_OBJ))
-	$(CC) $(CFLAGS) tests/test_fabric_graphics.c src/hs_fabric.o $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -Wl,--wrap=eglSwapBuffers -o $@
+tests/test_gpu_participants: tests/test_gpu_participants.c $(filter-out src/main.o,$(HS_OBJ))
+	$(CC) $(CFLAGS) $< $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -Wl,--wrap=pthread_mutex_init,--wrap=pthread_mutex_destroy,--wrap=hs_fabric_step -o $@
 
-tests/test_comparison_graphics: tests/test_comparison_graphics.c src/hs_fabric.o $(filter-out src/main.o,$(HS_OBJ))
-	$(CC) $(CFLAGS) tests/test_comparison_graphics.c src/hs_fabric.o $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -Wl,--wrap=eglSwapBuffers -o $@
+.PHONY: gpu-participants-sanitize gpu-participants-asan gpu-participants-tsan gpu-participants-hardware
+gpu-participants-sanitize: gpu-participants-asan gpu-participants-tsan
+
+gpu-participants-asan:
+	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined tests/test_gpu_participants.c $(LIB_SRC) $(LDFLAGS) -Wl,--wrap=pthread_mutex_init,--wrap=pthread_mutex_destroy,--wrap=hs_fabric_step -o tests/test_gpu_participants_sanitize
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test_gpu_participants_sanitize
+
+gpu-participants-tsan:
+	$(CC) $(SAN_FLAGS) -fsanitize=thread tests/test_gpu_participants.c $(LIB_SRC) $(LDFLAGS) -Wl,--wrap=pthread_mutex_init,--wrap=pthread_mutex_destroy,--wrap=hs_fabric_step -o tests/test_gpu_participants_tsan
+	TSAN_OPTIONS=halt_on_error=1 ./tests/test_gpu_participants_tsan
+
+# Fresh captures on every invocation; callers may choose an explicit fresh path.
+GPU_PARTICIPANTS_GRAPHICS_OUTPUT ?= tests/evidence-frame-runtime-hardware-$$(date +%s)-$$$$
+gpu-participants-hardware:
+	python3 -E tests/test_gpu_participants_graphics.py --output "$(GPU_PARTICIPANTS_GRAPHICS_OUTPUT)"
+
+tests/test_fabric_graphics: tests/test_fabric_graphics.c $(filter-out src/main.o,$(HS_OBJ))
+	$(CC) $(CFLAGS) tests/test_fabric_graphics.c $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -Wl,--wrap=eglSwapBuffers -o $@
+
+tests/test_comparison_graphics: tests/test_comparison_graphics.c $(filter-out src/main.o,$(HS_OBJ))
+	$(CC) $(CFLAGS) tests/test_comparison_graphics.c $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -Wl,--wrap=eglSwapBuffers -o $@
 
 .PHONY: fabric-hardware
 fabric-hardware: tests/test_fabric_graphics
@@ -114,7 +135,7 @@ tests/test_p0: tests/test_p0.c $(filter-out src/main.o,$(HS_OBJ))
 SAN_FLAGS = -O1 -g -fno-omit-frame-pointer -Iinclude -I/usr/include/libdrm
 LIB_SRC = $(filter-out src/main.c,$(HS_SRC))
 
-sanitize: $(HS_TARGET)
+sanitize: $(HS_TARGET) gpu-participants-asan
 	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined tests/test_p0.c $(LIB_SRC) $(LDFLAGS) -o tests/test_p0_sanitize
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test_p0_sanitize
 	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined src/main.c $(LIB_SRC) $(LDFLAGS) -o tests/test_headless_sanitize
@@ -122,7 +143,7 @@ sanitize: $(HS_TARGET)
 	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined tools/neogpu_tool.c $(LDFLAGS) -o tests/test_tool_sanitize
 	NEOGPU_TOOL=./tests/test_tool_sanitize ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 python3 tests/test_cli.py
 
-tsan: $(HS_TARGET)
+tsan: $(HS_TARGET) gpu-participants-tsan
 	$(CC) $(SAN_FLAGS) -fsanitize=thread tests/test_p0.c $(LIB_SRC) $(LDFLAGS) -o tests/test_p0_tsan
 	TSAN_OPTIONS=halt_on_error=1 ./tests/test_p0_tsan
 	$(CC) $(SAN_FLAGS) -fsanitize=thread src/main.c $(LIB_SRC) $(LDFLAGS) -o tests/test_headless_tsan
@@ -146,12 +167,12 @@ test-hardware: build-tests tests/test_evdev
 	NEOGPU_CAPTURE=tests/p0-triangle.ppm ./tests/test_07_message_triangle
 	NEOGPU_CAPTURE=tests/p0-orbit.ppm ./tests/test_08_raycast_orbit
 	./tests/test_evdev
+	$(MAKE) gpu-participants-hardware
 
 tests/test_evdev: tests/test_evdev.c src/hs_input_stream.o
 	$(CC) $(CFLAGS) tests/test_evdev.c src/hs_input_stream.o $(LDFLAGS) -o $@
 
 -include $(HS_DEPS)
--include src/hs_fabric.d
 -include $(wildcard tests/*.d tools/*.d *.d)
 
 $(HS_TARGET): $(HS_OBJ)
@@ -164,12 +185,12 @@ neogpu_pong: tools/neogpu_pong.c src/hs_core.o src/hs_nodes.o src/hs_text.o
 	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o src/hs_text.o -o $@ $(LDFLAGS)
 	$(STRIP) $@
 
-neogpu_capture_demo: tools/neogpu_capture_demo.c src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_backend_gles.o
-	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_backend_gles.o -o $@ $(LDFLAGS)
+neogpu_capture_demo: tools/neogpu_capture_demo.c src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_fabric.o src/hs_backend_gles.o
+	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_fabric.o src/hs_backend_gles.o -o $@ $(LDFLAGS)
 	$(STRIP) $@
 
-neogpu_pong_ai: tools/neogpu_pong_ai.c src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_backend_gles.o
-	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_backend_gles.o -o $@ $(LDFLAGS)
+neogpu_pong_ai: tools/neogpu_pong_ai.c src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_fabric.o src/hs_backend_gles.o
+	$(CC) $(CFLAGS) $< src/hs_core.o src/hs_nodes.o src/hs_gpu.o src/hs_fabric.o src/hs_backend_gles.o -o $@ $(LDFLAGS)
 	$(STRIP) $@
 
 neogpu_procgame: tools/neogpu_procgame.c src/hs_core.o src/hs_nodes.o
@@ -191,9 +212,10 @@ tool: neogpu_tool
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
+	rm -f tests/test_gpu_participants tests/test_gpu_participants_sanitize tests/test_gpu_participants_tsan
 	rm -f tests/test_bedrock_hint tests/test_bedrock_split tests/test_bedrock_hint_sanitize tests/test_bedrock_split_sanitize tests/test_bedrock_hint_tsan tests/test_bedrock_split_tsan
 	rm -f tests/test_comparison_graphics
-	rm -f src/hs_fabric.o src/hs_fabric.d tests/test_fabric tests/test_fabric_sanitize tests/test_fabric_tsan
+	rm -f tests/test_fabric tests/test_fabric_sanitize tests/test_fabric_tsan
 	rm -f tests/test_fabric_graphics
 	rm -f tests/test_architecture
 	rm -f tests/test_architecture_latency
@@ -210,28 +232,28 @@ run: $(HS_TARGET)
 build-tests: $(HS_OBJ)
 	@echo "Building graphics tests..."
 	$(CC) $(CFLAGS) -c tests/test_01_clear.c -o tests/test_01_clear.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_01_clear.o $(LDFLAGS) -o tests/test_01_clear
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_fabric.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_01_clear.o $(LDFLAGS) -o tests/test_01_clear
 	$(STRIP) tests/test_01_clear
 	$(CC) $(CFLAGS) -c tests/test_02_triangle.c -o tests/test_02_triangle.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_02_triangle.o $(LDFLAGS) -o tests/test_02_triangle
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_fabric.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_02_triangle.o $(LDFLAGS) -o tests/test_02_triangle
 	$(STRIP) tests/test_02_triangle
 	$(CC) $(CFLAGS) -c tests/test_03_instancing.c -o tests/test_03_instancing.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_03_instancing.o $(LDFLAGS) -o tests/test_03_instancing
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_fabric.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_03_instancing.o $(LDFLAGS) -o tests/test_03_instancing
 	$(STRIP) tests/test_03_instancing
 	$(CC) $(CFLAGS) -c tests/test_04_blending.c -o tests/test_04_blending.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_04_blending.o $(LDFLAGS) -o tests/test_04_blending
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_fabric.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_04_blending.o $(LDFLAGS) -o tests/test_04_blending
 	$(STRIP) tests/test_04_blending
 	$(CC) $(CFLAGS) -c tests/test_05_cube3d.c -o tests/test_05_cube3d.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_05_cube3d.o $(LDFLAGS) -o tests/test_05_cube3d
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_fabric.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_05_cube3d.o $(LDFLAGS) -o tests/test_05_cube3d
 	$(STRIP) tests/test_05_cube3d
 	$(CC) $(CFLAGS) -c tests/test_06_raycast.c -o tests/test_06_raycast.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o $(SRC_DIR)/hs_text.o tests/test_06_raycast.o $(LDFLAGS) -o tests/test_06_raycast
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_fabric.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o $(SRC_DIR)/hs_text.o tests/test_06_raycast.o $(LDFLAGS) -o tests/test_06_raycast
 	$(STRIP) tests/test_06_raycast
 	$(CC) $(CFLAGS) -c tests/test_07_message_triangle.c -o tests/test_07_message_triangle.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_07_message_triangle.o $(LDFLAGS) -o tests/test_07_message_triangle
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_fabric.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_07_message_triangle.o $(LDFLAGS) -o tests/test_07_message_triangle
 	$(STRIP) tests/test_07_message_triangle
 	$(CC) $(CFLAGS) -c tests/test_08_raycast_orbit.c -o tests/test_08_raycast_orbit.o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_08_raycast_orbit.o $(LDFLAGS) -o tests/test_08_raycast_orbit
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_fabric.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_08_raycast_orbit.o $(LDFLAGS) -o tests/test_08_raycast_orbit
 	$(STRIP) tests/test_08_raycast_orbit
 	$(STRIP) tests/test_07_message_triangle
 
@@ -243,7 +265,7 @@ run-test: $(HS_OBJ)
 		exit 1; \
 	fi
 	$(CC) $(CFLAGS) -c tests/test_$(N)_*.c -o tests/test_$(N).o
-	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o $(SRC_DIR)/hs_text.o tests/test_$(N).o $(LDFLAGS) -o tests/test_$(N)
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_fabric.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o $(SRC_DIR)/hs_text.o tests/test_$(N).o $(LDFLAGS) -o tests/test_$(N)
 	$(STRIP) tests/test_$(N)
 	sudo tests/test_$(N)
 

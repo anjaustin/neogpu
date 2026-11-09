@@ -2,9 +2,19 @@
 #include "hs_msg.h"
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
+
+_Static_assert(offsetof(HSGpu, participants) % 64 == 0, "Embedded fabric must be cache-line aligned");
+_Static_assert(offsetof(HSGpu, participants_ready) % 64 == 0 &&
+               offsetof(HSGpu, participants) - offsetof(HSGpu, participants_ready) >= 64,
+               "Producer readiness must have a separate immutable cache line");
 
 void hs_gpu_init(HSGpu* gpu) {
     memset(gpu, 0, sizeof(*gpu));
+    atomic_init(&gpu->participant_count, 0);
+    atomic_init(&gpu->participant_limit, 0);
+    gpu->participants_ready = hs_fabric_init(&gpu->participants);
+    if (!gpu->participants_ready) fprintf(stderr, "Participant fabric initialization failed\n");
     hs_init(&gpu->system, gpu->log_buffer, HS_MAX_MSG_LOG, gpu->payload_buffer);
     gpu->system.render_list = &gpu->render;
 
@@ -51,8 +61,49 @@ void hs_gpu_shutdown(HSGpu* gpu) {
     if (gpu->backend && gpu->backend->ops && gpu->backend->ops->shutdown)
         gpu->backend->ops->shutdown(gpu->backend->ctx, gpu);
     gpu->backend = NULL;
+    if (gpu->participants_ready) hs_fabric_destroy(&gpu->participants);
+    gpu->participants_ready = false;
+    atomic_store_explicit(&gpu->participant_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&gpu->participant_limit, 0, memory_order_relaxed);
     hs_memory_free(&gpu->memory);
     hs_destroy(&gpu->system);
+}
+
+bool hs_gpu_participants_ready(const HSGpu* gpu) {
+    return gpu && gpu->participants_ready;
+}
+
+HSFabricResult hs_gpu_participant_join(HSGpu* gpu, HSParticipant* out) {
+    if (!hs_gpu_participants_ready(gpu)) return HS_FABRIC_INVALID;
+    HSFabricResult result = hs_fabric_join(&gpu->participants, out);
+    if (result == HS_FABRIC_OK) {
+        u32 limit = out->slot + 1;
+        u32 previous = atomic_load_explicit(&gpu->participant_limit, memory_order_relaxed);
+        /* Strong-CAS failures imply another monotonic advance (at most eight).
+         * Never reset this bound while callers are live: reuse may race retire. */
+        while (previous < limit && !atomic_compare_exchange_strong_explicit(
+                   &gpu->participant_limit, &previous, limit, memory_order_release, memory_order_relaxed)) { }
+        atomic_fetch_add_explicit(&gpu->participant_count, 1, memory_order_release);
+    }
+    return result;
+}
+
+HSFabricResult hs_gpu_participant_submit(HSGpu* gpu, HSParticipant owner, const HSParticipantFrame* frame) {
+    if (!hs_gpu_participants_ready(gpu)) return HS_FABRIC_INVALID;
+    return hs_fabric_submit(&gpu->participants, owner, frame);
+}
+
+HSFabricResult hs_gpu_participant_leave(HSGpu* gpu, HSParticipant owner) {
+    if (!hs_gpu_participants_ready(gpu)) return HS_FABRIC_INVALID;
+    return hs_fabric_leave(&gpu->participants, owner);
+}
+
+static u32 hs_gpu_service_participants(HSGpu* gpu) {
+    u64 retired = gpu->participants.retired;
+    u32 events = hs_fabric_step(&gpu->participants, HS_FABRIC_PARTICIPANTS);
+    u32 reclaimed = (u32)(gpu->participants.retired - retired);
+    if (reclaimed) atomic_fetch_sub_explicit(&gpu->participant_count, reclaimed, memory_order_release);
+    return events;
 }
 
 HSBuffer* hs_gpu_get_buffer(HSGpu* gpu, u8 bank) {
@@ -273,7 +324,11 @@ void hs_gpu_set_channel(HSGpu* gpu, u8 channel, u8 shader) {
 
 u32 hs_gpu_process(HSGpu* gpu) {
     u32 total = 0;
-    while (hs_step(&gpu->system) > 0) {
+    for (;;) {
+        u32 progress = hs_step(&gpu->system);
+        if (atomic_load_explicit(&gpu->participant_count, memory_order_acquire))
+            progress += hs_gpu_service_participants(gpu);
+        if (!progress) break;
         total++;
         if (total > 1000) break;
     }
@@ -281,7 +336,10 @@ u32 hs_gpu_process(HSGpu* gpu) {
 }
 
 u32 hs_gpu_step(HSGpu* gpu) {
-    return hs_step(&gpu->system);
+    u32 processed = hs_step(&gpu->system);
+    if (atomic_load_explicit(&gpu->participant_count, memory_order_acquire))
+        processed += hs_gpu_service_participants(gpu);
+    return processed;
 }
 
 void hs_gpu_start_recording(HSGpu* gpu) {
@@ -385,11 +443,73 @@ void hs_gpu_begin_frame(HSGpu* gpu) {
     }
 }
 
-void hs_gpu_end_frame(HSGpu* gpu) {
+static void hs_gpu_execute_frame(HSGpu* gpu) {
     if (gpu->backend && gpu->backend->ops) {
         HSFrameContext frame;
         hs_gpu_build_frame(gpu, &frame);
         if (gpu->backend->ops->execute) gpu->backend->ops->execute(gpu->backend->ctx, &frame);
         if (gpu->backend->ops->end_frame) gpu->backend->ops->end_frame(gpu->backend->ctx, &frame);
     }
+}
+
+/* Keep composition's larger live register set off the idle legacy hot path. */
+static __attribute__((noinline)) bool hs_gpu_end_participant_frame(HSGpu* gpu) {
+    hs_gpu_service_participants(gpu);
+    /* Read after service: acquiring a published frame also observes the bound
+     * established before that producer's join returned. Never shrinks live. */
+    u32 limit = atomic_load_explicit(&gpu->participant_limit, memory_order_relaxed);
+    HSRenderList* render = &gpu->render;
+    u32 added = 0;
+    for (u32 i = 0; i < limit; i++) {
+        const HSParticipantView* view = &gpu->participants.views[i];
+        if (!view->active) continue;
+        if (view->frame.count > HS_FABRIC_DRAWS) { render->overflow = true; return false; }
+        added += view->frame.count;
+    }
+    if (render->overflow || render->count > HS_RENDER_MAX_CMDS || added > HS_RENDER_MAX_CMDS - render->count) {
+        render->overflow = true;
+        return false;
+    }
+    u32 original = render->count, insertion = original;
+    u32 suffix = 0;
+    if (added) {
+        while (insertion && (render->cmds[insertion - 1].op == HS_RC_FRAME_END ||
+                             render->cmds[insertion - 1].op == HS_RC_PRESENT)) insertion--;
+        suffix = original - insertion;
+        if (suffix) memmove(&render->cmds[insertion + added], &render->cmds[insertion], suffix * sizeof(HSRenderCmd));
+        u32 next = insertion;
+        for (u32 i = 0; i < limit; i++) {
+            const HSParticipantView* view = &gpu->participants.views[i];
+            if (!view->active || !view->frame.count) continue;
+            memcpy(&render->cmds[next], view->frame.draws, view->frame.count * sizeof(HSRenderCmd));
+            next += view->frame.count;
+        }
+        render->count += added;
+    }
+    gpu->frame_executing = true;
+    hs_gpu_execute_frame(gpu);
+    if (added) {
+        if (suffix) memmove(&render->cmds[insertion], &render->cmds[insertion + added], suffix * sizeof(HSRenderCmd));
+        render->count = original;
+    }
+    gpu->frame_executing = false;
+    return true;
+}
+
+bool hs_gpu_end_frame_checked(HSGpu* gpu) {
+    if (!gpu || gpu->frame_executing) return false;
+    if (atomic_load_explicit(&gpu->participant_count, memory_order_acquire))
+        return hs_gpu_end_participant_frame(gpu);
+    if (gpu->render.overflow || gpu->render.count > HS_RENDER_MAX_CMDS) {
+        gpu->render.overflow = true;
+        return false;
+    }
+    gpu->frame_executing = true;
+    hs_gpu_execute_frame(gpu);
+    gpu->frame_executing = false;
+    return true;
+}
+
+void hs_gpu_end_frame(HSGpu* gpu) {
+    (void)hs_gpu_end_frame_checked(gpu);
 }

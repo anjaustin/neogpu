@@ -7,6 +7,9 @@
 #include "hs_backend.h"
 #include "hs_render.h"
 #include "hs_buffer.h"
+#include "hs_fabric.h"
+
+#define HS_GPU_PARTICIPANT_FRAMES 1
 
 typedef struct HSFrameContext {
     const HSGpu* gpu;
@@ -44,10 +47,28 @@ typedef struct HSGpu {
     HSRenderList render;
 
     HSMemory     memory;
+
+    /* Runtime-owned; use participant APIs, not direct fabric mutation.
+     * Never copy a live HSGpu: it owns mutexes and internal pointers. */
+    /* Immutable while producers run; do not share a line with consumer stores. */
+    bool participants_ready __attribute__((aligned(64)));
+    HSFabric participants __attribute__((aligned(64)));
+    atomic_uint participant_count; /* joined, including draining participants */
+    atomic_uint participant_limit; /* monotonic highest joined slot + 1 */
+    bool frame_executing; /* consumer-owned backend reentry guard */
 } HSGpu;
 
 void hs_gpu_init(HSGpu* gpu);
 void hs_gpu_shutdown(HSGpu* gpu);
+
+/* Producer-safe after init; teardown requires stopped/joined producers.
+ * Contributions use renderer-owned immutable banks and shared global state.
+ * HSSystem fences, capture and channel/IPC counters cover legacy messages,
+ * not participant contributions. Handles do not survive shutdown/reinit. */
+bool hs_gpu_participants_ready(const HSGpu* gpu);
+HSFabricResult hs_gpu_participant_join(HSGpu* gpu, HSParticipant* out);
+HSFabricResult hs_gpu_participant_submit(HSGpu* gpu, HSParticipant owner, const HSParticipantFrame* frame);
+HSFabricResult hs_gpu_participant_leave(HSGpu* gpu, HSParticipant owner);
 
 void hs_gpu_attach_backend(HSGpu* gpu, HSBackend* backend);
 
@@ -104,5 +125,14 @@ bool hs_gpu_fence(HSGpu* gpu, HSChannel target, u32 cid);
 
 void hs_gpu_begin_frame(HSGpu* gpu);
 void hs_gpu_end_frame(HSGpu* gpu);
+/* Consumer-only, externally serialized with begin/process/step. Backend callbacks
+ * must not reenter consumer APIs; checked end-frame rejects its own reentry.
+ * A zero-progress process/step call is not proof of completed retirement.
+ * Retained draws
+ * follow legacy commands, before trailing frame-end/present markers. Overflow
+ * skips backend execution/presentation and sets render.overflow; begin resets it.
+ * True means valid composition/callback dispatch, NOT GPU/display completion.
+ * Frame/render pointers are borrowed only for the duration of backend callbacks. */
+bool hs_gpu_end_frame_checked(HSGpu* gpu);
 
 #endif

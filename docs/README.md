@@ -9,6 +9,7 @@ Specifications and design documents for the core runtime.
 
 | Doc | What it covers |
 |-----|----------------|
+| [GENERAL-MESSAGE-POTENTIALS.md](GENERAL-MESSAGE-POTENTIALS.md) | Unimplemented general-message transaction opportunities, tradeoffs and measurement gates |
 | [architecture/PRD.md](architecture/PRD.md) | Product requirements: the message-native runtime vision |
 | [architecture/PRD_COMM_FABRIC.md](architecture/PRD_COMM_FABRIC.md) | Channel fabric: acks/results, structured errors, capture I/O, backpressure |
 | [architecture/P0_PRD.md](architecture/P0_PRD.md) | Thread-safety and atomics plan for the messaging layer |
@@ -67,6 +68,8 @@ See [../CREDITS.md](../CREDITS.md) for the full acknowledgment.
 | [audit/BEDROCK_RESULTS.md](audit/BEDROCK_RESULTS.md) | Reconciled mutex traffic, syscall costs, PMU evidence and rejected backoff generalization |
 | [audit/BEDROCK_P0.md](audit/BEDROCK_P0.md) | P0 optimization invariants, candidate and acceptance criteria |
 | [audit/BEDROCK_REDTEAM.md](audit/BEDROCK_REDTEAM.md) | Adversarial schedules, evidence-tool negative controls and remediation verification |
+| [audit/FRAME_RUNTIME_INTEGRATION.md](audit/FRAME_RUNTIME_INTEGRATION.md) | Default HSGpu participant integration contract and verification gates |
+| [audit/FRAME_RUNTIME_REDTEAM.md](audit/FRAME_RUNTIME_REDTEAM.md) | Second-pass invocation/provenance attacks and expanded composition/lifecycle checks |
 
 ## Archive
 

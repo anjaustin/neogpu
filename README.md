@@ -7,9 +7,10 @@ on the Raspberry Pi 4.**
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Language: C](https://img.shields.io/badge/language-C%20%7C%20Make-blue.svg)](https://en.wikipedia.org/wiki/C_(programming_language))
 
-NeoGPU is a small, complete GPU runtime where *every* operation is a message.
-Rendering commands and IPC requests travel the same lock-free channels — so
-one fabric carries the whole system.
+NeoGPU combines message-based state/resource/control operations with retained
+participant draw contributions. Both feed the normal `HSGpu` frame lifecycle.
+Message queues use SPSC/MPSC publication; the overall runtime also uses locks
+for lifecycle/state management and is not end-to-end lock-free.
 
 ```c
 HSGpu gpu;
@@ -47,11 +48,11 @@ and record them.
 
 Three consequences fall out of that design:
 
-- **One fabric, many workloads.** The same queue carries render commands and
-  IPC requests. Adding a new workload type does not mean adding a new
-  transport.
-- **Capture and replay come free.** Because work is messages, a frame *is* a
-  log. `HSCAP1` captures are portable, inspectable, and replayable.
+- **Shared rendering lifecycle.** State/resource messages and retained draw
+  contributions meet at the same backend, without pretending they have the
+  same admission or ordering contract.
+- **Message capture and replay.** `HSCAP1` owns the payloads of recorded legacy
+  messages. Participant contributions are not silently added to that format.
 - **A focused runtime.** Graphics, input, capture/replay, and tooling share
   the message substrate without model-loading or inference dependencies.
 
@@ -126,6 +127,54 @@ tests that drive the DRM/GBM backend do need the display and root:
 ```bash
 sudo ./tests/test_08_raycast_orbit
 ```
+
+### Retained participant frames
+
+`hs_gpu_init()` prepares the participant runtime by default. Producers can use
+the bounded join/submit/leave API; normal `hs_gpu_step()`, `hs_gpu_process()` and
+end-frame calls service it. No application-owned `HSFabric` or manual
+step/compose plumbing is required.
+
+This is the default runtime path, not an experimental build switch. `make test`
+includes participant lifecycle/composition and report-integrity regressions;
+`make sanitize` and `make tsan` include their participant checks. The standard
+`make test-hardware` (with sudo when device/capture ownership requires it) also
+runs normal-HSGpu participant GLES lifecycle and
+full-frame equivalence checks, saving a fresh `tests/evidence-frame-runtime-*`
+collection. `make gpu-participants-hardware` runs just those graphics checks.
+
+```c
+/* Renderer first prepares an immutable vertex bank for the returned slot. */
+HSParticipant owner;
+if (hs_gpu_participant_join(&gpu, &owner) != HS_FABRIC_OK) return 1;
+HSParticipantFrame contribution = {.sequence = 1, .count = 1};
+contribution.draws[0] = (HSRenderCmd){.op = HS_RC_DRAW, .a = owner.slot};
+if (hs_gpu_participant_submit(&gpu, owner, &contribution) != HS_FABRIC_OK) return 1;
+
+hs_gpu_begin_frame(&gpu);
+hs_gpu_clear(&gpu, v4_make(0, 0, 0, 1));
+hs_gpu_process(&gpu); /* Legacy messages still require explicit processing. */
+if (!hs_gpu_end_frame_checked(&gpu)) return 1;
+```
+
+The latest applied contribution persists until replaced by another complete
+submission, an empty contribution or retirement. Draws share renderer-global
+state and use renderer-owned immutable banks; this is not private shader/texture
+state or arbitrary upload ownership. Accepted FIFO application does not promise
+presentation of every intermediate contribution. Stop/join producers before
+shutdown; handles must not survive shutdown/reinitialization.
+
+Legacy `hs_gpu_*` message APIs remain supported. Their channel budgets, fences,
+IPC counters and capture/replay retain their message-only scope. End-frame does
+not implicitly drain legacy sends. Retained draws follow legacy commands before
+trailing frame-end/present markers. Combined overflow skips backend execution
+rather than presenting a partial scene; the checked API reports failure and
+begin-frame resets the overflow flag for recovery.
+
+See [integration contract/results](docs/audit/FRAME_RUNTIME_INTEGRATION.md) and
+[general-message opportunities](docs/GENERAL-MESSAGE-POTENTIALS.md). Existing
+message-only benchmark numbers do not establish an integration or display-FPS
+speedup.
 
 ## Demos
 
