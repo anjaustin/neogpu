@@ -6,6 +6,7 @@
 
 #define HS_FABRIC_PARTICIPANTS 8
 #define HS_FABRIC_QUEUE 4
+#define HS_FABRIC_SPLIT_PUBLICATION 1
 #define HS_FABRIC_DRAWS 64
 
 typedef enum {
@@ -26,7 +27,8 @@ typedef struct {
     pthread_mutex_t mutex;
     bool active, closing;
     u64 generation, admitted;
-    u32 head, count;
+    /* Monotonic modulo-2^32 ring cursors; never reset at join. */
+    u32 read_index, write_index;
     HSParticipantFrame queue[HS_FABRIC_QUEUE];
 } HSParticipantSlot;
 

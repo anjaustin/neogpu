@@ -124,7 +124,10 @@ int main(void) {
         expected_left = stage <= 3 ? 1 : stage == 6 ? 3 : 0;
         expected_right = stage == 2 ? 0 : 2;
         char path[128];
-        snprintf(path, sizeof(path), "tests/evidence-fabric-stage-%u.ppm", stage);
+        const char* capture_dir = getenv("NEOGPU_FABRIC_CAPTURE_DIR");
+        int length = capture_dir ? snprintf(path, sizeof(path), "%s/stage-%u.ppm", capture_dir, stage) :
+                                  snprintf(path, sizeof(path), "tests/evidence-fabric-stage-%u.ppm", stage);
+        REQUIRE(length > 0 && (size_t)length < sizeof(path));
         REQUIRE(setenv("NEOGPU_CAPTURE", path, 1) == 0);
         for (u32 repeat = 0; repeat < 3; repeat++) {
             hs_gpu_begin_frame(&gpu);

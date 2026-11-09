@@ -37,11 +37,21 @@ version:
 
 build: $(HS_TARGET)
 
-test: $(HS_TARGET) tests/test_p0 neogpu_tool tests/test_fabric
+test: $(HS_TARGET) tests/test_p0 neogpu_tool tests/test_fabric tests/test_bedrock_hint tests/test_bedrock_split
 	./$(HS_TARGET) --check
 	./tests/test_p0
 	python3 tests/test_cli.py
 	./tests/test_fabric
+	./tests/test_bedrock_hint
+	./tests/test_bedrock_split
+	python3 tests/test_bedrock_tools.py
+	python3 tests/test_bedrock_adversarial.py
+
+tests/test_bedrock_hint: tests/test_bedrock_hint.c src/hs_fabric.o
+	$(CC) $(CFLAGS) $< src/hs_fabric.o -lpthread -o $@
+
+tests/test_bedrock_split: tests/test_bedrock_split.c src/hs_fabric.o
+	$(CC) $(CFLAGS) $< src/hs_fabric.o -lpthread -o $@
 
 tests/test_fabric: tests/test_fabric.c src/hs_fabric.o
 	$(CC) $(CFLAGS) tests/test_fabric.c src/hs_fabric.o -lpthread -o $@
@@ -62,6 +72,15 @@ fabric-sanitize:
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test_fabric_sanitize
 	$(CC) $(SAN_FLAGS) -fsanitize=thread tests/test_fabric.c src/hs_fabric.c -lpthread -o tests/test_fabric_tsan
 	TSAN_OPTIONS=halt_on_error=1 ./tests/test_fabric_tsan
+	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined tests/test_bedrock_hint.c src/hs_fabric.c -lpthread -o tests/test_bedrock_hint_sanitize
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test_bedrock_hint_sanitize
+	$(CC) $(SAN_FLAGS) -fsanitize=thread tests/test_bedrock_hint.c src/hs_fabric.c -lpthread -o tests/test_bedrock_hint_tsan
+	TSAN_OPTIONS=halt_on_error=1 ./tests/test_bedrock_hint_tsan
+	$(CC) $(SAN_FLAGS) -fsanitize=address,undefined tests/test_bedrock_split.c src/hs_fabric.c -lpthread -o tests/test_bedrock_split_sanitize
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./tests/test_bedrock_split_sanitize
+	$(CC) $(SAN_FLAGS) -fsanitize=thread tests/test_bedrock_split.c src/hs_fabric.c -lpthread -o tests/test_bedrock_split_tsan
+	TSAN_OPTIONS=halt_on_error=1 ./tests/test_bedrock_split_tsan
+	python3 tests/test_bedrock_adversarial.py --sanitizers
 
 # Architectural findings are intentionally separate from the regression gate.
 .PHONY: evidence-probes
@@ -172,6 +191,7 @@ tool: neogpu_tool
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
+	rm -f tests/test_bedrock_hint tests/test_bedrock_split tests/test_bedrock_hint_sanitize tests/test_bedrock_split_sanitize tests/test_bedrock_hint_tsan tests/test_bedrock_split_tsan
 	rm -f tests/test_comparison_graphics
 	rm -f src/hs_fabric.o src/hs_fabric.d tests/test_fabric tests/test_fabric_sanitize tests/test_fabric_tsan
 	rm -f tests/test_fabric_graphics

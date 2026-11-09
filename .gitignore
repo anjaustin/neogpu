@@ -57,6 +57,7 @@ tests/*.o
 /build/
 /tests/p0-perf-baseline/
 /tests/evidence-*
+/tests/__pycache__/
 /tests/p0-*.perf.data
 
 # Editor / scratch backups

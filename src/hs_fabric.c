@@ -33,9 +33,8 @@ HSFabricResult hs_fabric_join(HSFabric* fabric, HSParticipant* out) {
         if (pthread_mutex_trylock(&slot->mutex) != 0) { busy = true; continue; }
         if (!slot->active && slot->generation != UINT64_MAX) {
             slot->active = true;
-            slot->closing = false;
+            __atomic_store_n(&slot->closing, false, __ATOMIC_RELEASE);
             slot->admitted = 0;
-            slot->head = slot->count = 0;
             *out = (HSParticipant){i, ++slot->generation};
             pthread_mutex_unlock(&slot->mutex);
             return HS_FABRIC_OK;
@@ -47,7 +46,7 @@ HSFabricResult hs_fabric_join(HSFabric* fabric, HSParticipant* out) {
 
 static HSFabricResult ownership(const HSParticipantSlot* slot, HSParticipant owner) {
     if (!slot->active || slot->generation != owner.generation) return HS_FABRIC_STALE;
-    return slot->closing ? HS_FABRIC_CLOSING : HS_FABRIC_OK;
+    return __atomic_load_n(&slot->closing, __ATOMIC_RELAXED) ? HS_FABRIC_CLOSING : HS_FABRIC_OK;
 }
 
 HSFabricResult hs_fabric_leave(HSFabric* fabric, HSParticipant owner) {
@@ -55,7 +54,7 @@ HSFabricResult hs_fabric_leave(HSFabric* fabric, HSParticipant owner) {
     HSParticipantSlot* slot = &fabric->slots[owner.slot];
     if (pthread_mutex_trylock(&slot->mutex) != 0) return HS_FABRIC_BUSY;
     HSFabricResult result = ownership(slot, owner);
-    if (result == HS_FABRIC_OK) slot->closing = true;
+    if (result == HS_FABRIC_OK) __atomic_store_n(&slot->closing, true, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&slot->mutex);
     return result;
 }
@@ -73,23 +72,31 @@ HSFabricResult hs_fabric_submit(HSFabric* fabric, HSParticipant owner,
     if (pthread_mutex_trylock(&slot->mutex) != 0) return HS_FABRIC_BUSY;
     HSFabricResult result = ownership(slot, owner);
     if (result == HS_FABRIC_OK) {
+        u32 read = __atomic_load_n(&slot->read_index, __ATOMIC_ACQUIRE);
+        u32 write = __atomic_load_n(&slot->write_index, __ATOMIC_RELAXED);
         if (slot->admitted == UINT64_MAX || frame->sequence != slot->admitted + 1)
             result = HS_FABRIC_SEQUENCE;
-        else if (slot->count == HS_FABRIC_QUEUE) result = HS_FABRIC_FULL;
+        else if ((u32)(write - read) >= HS_FABRIC_QUEUE) result = HS_FABRIC_FULL;
         else {
-            HSParticipantFrame* dest = &slot->queue[(slot->head + slot->count) % HS_FABRIC_QUEUE];
+            HSParticipantFrame* dest = &slot->queue[write % HS_FABRIC_QUEUE];
             dest->sequence = frame->sequence;
             dest->count = frame->count;
             /* Canonicalize unused fields: no borrowed pointers/payload/state. */
             for (u32 i = 0; i < frame->count; i++)
                 dest->draws[i] = (HSRenderCmd){.op = HS_RC_DRAW, .a = (u8)owner.slot};
-            slot->count++;
             slot->admitted = frame->sequence;
+            __atomic_store_n(&slot->write_index, write + 1, __ATOMIC_RELEASE);
         }
     }
     pthread_mutex_unlock(&slot->mutex);
     return result;
 }
+
+/* Cursor wrap preserves ring positions because capacity divides 2^32. */
+_Static_assert(HS_FABRIC_QUEUE > 0 && HS_FABRIC_QUEUE <= UINT32_MAX / 2 &&
+               (HS_FABRIC_QUEUE & (HS_FABRIC_QUEUE - 1)) == 0, "Ring capacity must be a bounded power of two");
+_Static_assert(__atomic_always_lock_free(sizeof(u32), 0), "Ring cursors must be lock-free");
+_Static_assert(__atomic_always_lock_free(sizeof(bool), 0), "Closing notification must be lock-free");
 
 u32 hs_fabric_step(HSFabric* fabric, u32 budget) {
     if (!fabric || !budget) return 0;
@@ -98,26 +105,36 @@ u32 hs_fabric_step(HSFabric* fabric, u32 budget) {
         u32 i = fabric->cursor;
         fabric->cursor = (i + 1) % HS_FABRIC_PARTICIPANTS;
         HSParticipantSlot* slot = &fabric->slots[i];
-        if (pthread_mutex_trylock(&slot->mutex) != 0) continue;
-        if (slot->active && slot->count) {
-            HSParticipantFrame* source = &slot->queue[slot->head];
+        u32 read = __atomic_load_n(&slot->read_index, __ATOMIC_RELAXED);
+        u32 write = __atomic_load_n(&slot->write_index, __ATOMIC_ACQUIRE);
+        if (read != write) {
+            HSParticipantFrame* source = &slot->queue[read % HS_FABRIC_QUEUE];
             HSParticipantView* view = &fabric->views[i];
+            /* Generation is published before write_index and cannot change
+             * until this same consumer retires the drained generation. */
             view->owner = (HSParticipant){i, slot->generation};
             view->active = true;
             view->frame.sequence = source->sequence;
             view->frame.count = source->count;
             memcpy(view->frame.draws, source->draws, source->count * sizeof(HSRenderCmd));
-            slot->head = (slot->head + 1) % HS_FABRIC_QUEUE;
-            slot->count--;
+            __atomic_store_n(&slot->read_index, read + 1, __ATOMIC_RELEASE);
             fabric->applied++;
             events++;
-        } else if (slot->active && slot->closing) {
-            fabric->views[i].active = false;
-            slot->active = false;
-            fabric->retired++;
-            events++;
+        } else if (__atomic_load_n(&slot->closing, __ATOMIC_ACQUIRE)) {
+            if (pthread_mutex_trylock(&slot->mutex) != 0) continue;
+            /* Recheck after excluding submit/leave/join. Closing rejects new
+             * admissions, and retirement never overtakes accepted frames. */
+            if (slot->active && __atomic_load_n(&slot->closing, __ATOMIC_RELAXED) &&
+                __atomic_load_n(&slot->read_index, __ATOMIC_RELAXED) ==
+                __atomic_load_n(&slot->write_index, __ATOMIC_ACQUIRE)) {
+                fabric->views[i].active = false;
+                slot->active = false;
+                __atomic_store_n(&slot->closing, false, __ATOMIC_RELEASE);
+                fabric->retired++;
+                events++;
+            }
+            pthread_mutex_unlock(&slot->mutex);
         }
-        pthread_mutex_unlock(&slot->mutex);
     }
     return events;
 }

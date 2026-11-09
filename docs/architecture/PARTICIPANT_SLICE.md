@@ -26,10 +26,14 @@ participant slot must not stop other slots. Preserve all prior regression gates.
   is accepted; global clears/state/frame markers and borrowed payloads are not.
   The renderer owns/preloads immutable vertex buffers. Uploads, arbitrary state,
   textures, and resource snapshots are **not** implemented by this slice.
-- Admission and service use per-slot `pthread_mutex_trylock`, never a global
-  fallback queue. This is **not lock-free**. The consumer skips busy slots and
-  retains their last applied contribution. A process dying while holding a
-  mutex is not recovered; this is not cross-process crash isolation.
+- Join, admission, leave and retirement use per-slot `pthread_mutex_trylock`,
+  never a global fallback queue. Steady-state consumer delivery uses atomic
+  acquire/release ring cursors: published frames remain consumable while a
+  producer holds its mutex. The consumer copies before releasing storage for
+  reuse. Cursors never reset between generations. Retirement rechecks closing
+  and emptiness under the lifecycle mutex. The overall protocol is **not
+  lock-free**; a process dying while holding a mutex is not recovered. This is
+  not cross-process crash isolation. See [P0 evidence](../audit/BEDROCK_P0.md).
 - One externally serialized consumer owns step, retained views, composition and
   backend execution. One call visits each slot at most once, applying at most
   one event per visit; successful events advance the rotating cursor. Under

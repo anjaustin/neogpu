@@ -63,6 +63,10 @@ See [../CREDITS.md](../CREDITS.md) for the full acknowledgment.
 | [audit/COMPARISON_PLAN.md](audit/COMPARISON_PLAN.md) | Pinned optimized-queue and equivalent GLES comparison controls |
 | [audit/COMPARISON_RESULTS.md](audit/COMPARISON_RESULTS.md) | Same-Pi throughput/latency and byte-identical direct-GLES measurements |
 | [audit/COMPARISON_GAP.md](audit/COMPARISON_GAP.md) | Profiled synchronization costs, call counts, and failed single-slot ablation |
+| [audit/BEDROCK_PLAN.md](audit/BEDROCK_PLAN.md) | Transport measurement contract and uncertainty controls |
+| [audit/BEDROCK_RESULTS.md](audit/BEDROCK_RESULTS.md) | Reconciled mutex traffic, syscall costs, PMU evidence and rejected backoff generalization |
+| [audit/BEDROCK_P0.md](audit/BEDROCK_P0.md) | P0 optimization invariants, candidate and acceptance criteria |
+| [audit/BEDROCK_REDTEAM.md](audit/BEDROCK_REDTEAM.md) | Adversarial schedules, evidence-tool negative controls and remediation verification |
 
 ## Archive
 
