@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include "hs_graphics.h"
+#include "graphics_capture.h"
 
 static const char* vertex_shader_src = R"(
     attribute vec2 a_position;
@@ -113,6 +114,7 @@ int main(int argc, char** argv) {
     glClear(GL_COLOR_BUFFER_BIT);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     
+    if (test_capture_frame() != 0) return 1;
     hs_graphics_present(&gfx);
     
     printf("Displaying triangle for 5 seconds...\n");

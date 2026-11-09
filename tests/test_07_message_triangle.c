@@ -10,6 +10,7 @@
 
 #include "hs_gpu.h"
 #include "hs_backend_gles.h"
+#include "graphics_capture.h"
 
 int main(int argc, char** argv) {
     (void)argc;
@@ -48,6 +49,7 @@ int main(int argc, char** argv) {
 
     HSBackend backend = hs_backend_gles_create();
     hs_gpu_attach_backend(&gpu, &backend);
+    if (!gpu.backend) return 1;
 
     for (int f = 0; f < 300; f++) {
         hs_gpu_begin_frame(&gpu);
@@ -58,11 +60,13 @@ int main(int argc, char** argv) {
         }
         hs_gpu_draw(&gpu, 0);
         hs_gpu_process(&gpu);
+        if (f == 120 && test_capture_frame() != 0) return 1;
 
         hs_gpu_end_frame(&gpu);
         usleep(16000);
     }
 
+    hs_gpu_shutdown(&gpu);
     printf("PASS: Message-driven triangle test\n");
     return 0;
 }

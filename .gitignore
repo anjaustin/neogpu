@@ -19,12 +19,11 @@ pico/
 *.a
 *.d
 neogpu_demo
-neogpu_demo_ml
-neogpu_bitnet_chat
 neogpu_tool
 test_*
 tests/test_
 !tests/test_*.c
+!tests/test_*.py
 index.html
 fmt.hdll
 mysql.hdll
@@ -35,12 +34,9 @@ ui.hdll
 uv.hdll
 hl
 libhl.so
-*.gguf
 *.bin
-models/
 neogpu_pong
 neogpu_pong_ai
-neogpu_pong_llm
 neogpu_capture_demo
 neogpu_procgame
 xfiles/
@@ -59,6 +55,8 @@ tests/*.o
 /tmp/
 /tmp
 /build/
+/tests/p0-perf-baseline/
+/tests/p0-*.perf.data
 
 # Editor / scratch backups
 *.bak
@@ -69,24 +67,3 @@ tests/*.o
 # never matched -- see AGENTS.md "do not use a pattern that matches both
 # binaries and source"). Add new built binaries here by name.
 /neogpu_procgame
-tests/bench_cpu_gpu_comm
-tests/bench_stable
-tests/bench_v3d_micro
-tests/bench_zero_copy
-tests/check_kernel_scalar
-tests/check_normed
-tests/check_scale
-tests/layer_trace
-tests/profile_step
-tests/profile_step_trit
-tests/redteam_lmhead_trit
-tests/redteam_lmhead_i8_bounds
-tests/redteam_mt11
-tests/redteam_ternary_v3
-tests/redteam_ternary_formats
-tests/redteam_code_mapping
-tests/redteam_i2s_repack
-tests/redteam_i2s_upstream
-tools/neogpu_bitnet_chat
-tools/neogpu_pix
-tools/neogpu_viz

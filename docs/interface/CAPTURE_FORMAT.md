@@ -26,7 +26,26 @@ Where `count` is the number of recorded messages in the capture.
 ## Notes
 
 - This format is intentionally strict: it rejects files if struct sizes do not match the current build.
-- Captures store payload blocks (64B) as-is; payload-bearing messages should reference capture-local payload indices.
+- Captures store native `Payload` structs (96 data bytes, 128-byte aligned struct
+  size on aarch64); payload-bearing messages reference capture-local indices.
+- The system lazily allocates a recording journal at the first recorded payload:
+  one slot per log entry, independent of the live 4,096-slot transport ring.
+  Allocation failure or log exhaustion sets overflow; capture then fails
+  explicitly, rather than returning a partial success. A caller may instead
+  supply `sys->log_payloads` with `log_capacity` slots before any recording;
+  leave `owns_log_payloads` false for caller-owned storage.
+- `hs_clear()` retains the journal for reuse. `hs_gpu_shutdown()` (or
+  `hs_destroy()` for raw systems) releases owned journal memory and synchronization
+  resources. Stop/join all producers and services before teardown. Initialize
+  before shutdown; do not reinitialize a live instance without tearing it down.
+- `hs_capture_from_log()` accepts the system's full log prefix, not arbitrary
+  message arrays. Callers must serialize recording/stepping with extraction.
+- At most 65,536 entries can be represented by the 16-bit payload index. Capture
+  writes validate capacity and report buffered flush/close errors. Writes are
+  not atomic file replacements; callers requiring crash durability must use
+  a temporary file, `fsync`, and rename at their application boundary.
+- The file is native-layout/native-endian, not a cross-architecture interchange
+  format. Header checks reject incompatible layouts.
 
 ## Capture Policy (Channel Filtering)
 

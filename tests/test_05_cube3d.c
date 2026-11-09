@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <math.h>
 #include "hs_graphics.h"
+#include "graphics_capture.h"
 
 static const char* vertex_shader_src = R"(
     attribute vec3 a_position;
@@ -74,6 +75,15 @@ int main(int argc, char** argv) {
     }
     
     printf("Screen: %dx%d\n", gfx.screen_width, gfx.screen_height);
+    GLint depth_bits = 0, stencil_bits = 0;
+    glGetIntegerv(GL_DEPTH_BITS, &depth_bits);
+    glGetIntegerv(GL_STENCIL_BITS, &stencil_bits);
+    printf("Measured framebuffer: depth=%d, stencil=%d bits\n", depth_bits, stencil_bits);
+    if (depth_bits < 24 || stencil_bits < 8) {
+        fprintf(stderr, "Missing required depth/stencil attachment\n");
+        hs_graphics_finish(&gfx);
+        return 1;
+    }
     
     GLuint program = create_program(vertex_shader_src, fragment_shader_src);
     if (!program) return 1;
@@ -149,6 +159,7 @@ int main(int argc, char** argv) {
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
         glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, 0);
         
+        if (frame == 120 && test_capture_frame() != 0) return 1;
         hs_graphics_present(&gfx);
         usleep(50000);
     }

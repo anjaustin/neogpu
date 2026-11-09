@@ -13,7 +13,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
+#include <GLES3/gl3.h>
 #include "hs_graphics.h"
+#include "graphics_capture.h"
 
 static const char* vertex_shader_src = R"(
     attribute vec2 a_position;
@@ -127,6 +129,14 @@ int main(int argc, char** argv) {
     glEnableVertexAttribArray(pos_loc);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
     glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(offset_loc);
+    glBindBuffer(GL_ARRAY_BUFFER, offset_vbo);
+    glVertexAttribPointer(offset_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glVertexAttribDivisor(offset_loc, 1);
+    glEnableVertexAttribArray(color_loc);
+    glBindBuffer(GL_ARRAY_BUFFER, color_vbo);
+    glVertexAttribPointer(color_loc, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glVertexAttribDivisor(color_loc, 1);
     
     glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
     
@@ -138,12 +148,9 @@ int main(int argc, char** argv) {
         glClear(GL_COLOR_BUFFER_BIT);
         glUniform1f(time_loc, t);
         
-        for (int i = 0; i < COUNT; i++) {
-            glVertexAttrib2f(offset_loc, offsets[i*2], offsets[i*2+1]);
-            glVertexAttrib3f(color_loc, colors[i*3], colors[i*3+1], colors[i*3+2]);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
-        }
+        glDrawArraysInstanced(GL_TRIANGLES, 0, 6, COUNT);
         
+        if (frame == 120 && test_capture_frame() != 0) return 1;
         hs_graphics_present(&gfx);
         usleep(50000);
     }

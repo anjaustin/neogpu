@@ -30,7 +30,6 @@ body:
         - IPC / tooling
         - Capture & replay
         - NEON math library
-        - Experimental ML / BitNet
         - Build system / tooling
         - Documentation
         - Not sure
@@ -38,12 +37,10 @@ body:
       required: true
 
   - type: checkboxes
-    id: ml-scope
+    id: scope
     attributes:
       label: Scope check
       options:
-        - label: This touches the BitNet / inference path
-          description: Inference is experimental and deliberately isolated from the core build. Changes there won't affect the default `make` build.
         - label: This affects the message ABI
           description: New or changed opcodes need docs/interface/MESSAGE_ABI.md updated in the same change.
 

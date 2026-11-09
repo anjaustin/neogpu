@@ -64,9 +64,15 @@ static inline void hs_buffer_free(HSBuffer* buf) {
 }
 
 /* Read 32-bit int at float-index (index into 4-byte slots) */
+static inline bool hs_buffer_range_valid(const HSBuffer* buf, u32 index, u32 bytes) {
+    if (!buf || !buf->data || buf->disposed || buf->length > buf->capacity) return false;
+    if (bytes > buf->length || bytes > buf->capacity) return false;
+    return index <= (buf->capacity - bytes) / 4 && index <= (buf->length - bytes) / 4;
+}
+
 static inline s32 hs_buffer_get_i32(const HSBuffer* buf, u32 index) {
+    if (!hs_buffer_range_valid(buf, index, 4)) return 0;
     u32 offset = index * 4;
-    if (offset + 4 > buf->length) return 0;
     s32 val;
     memcpy(&val, buf->data + offset, 4);
     return val;
@@ -74,17 +80,16 @@ static inline s32 hs_buffer_get_i32(const HSBuffer* buf, u32 index) {
 
 /* Write 32-bit int at float-index */
 static inline void hs_buffer_set_i32(HSBuffer* buf, u32 index, s32 val) {
+    if (!hs_buffer_range_valid(buf, index, 4)) return;
     u32 offset = index * 4;
-    if (offset + 4 > buf->length) return;
     memcpy(buf->data + offset, &val, 4);
     buf->dirty = true;
 }
 
 /* Read 32-bit float at float-index */
 static inline f32 hs_buffer_get_f32(const HSBuffer* buf, u32 index) {
-    if (!buf || !buf->data) return 0.0f;
+    if (!hs_buffer_range_valid(buf, index, 4)) return 0.0f;
     u32 offset = index * 4;
-    if (offset + 4 > buf->length) return 0.0f;
     f32 val;
     memcpy(&val, buf->data + offset, 4);
     return val;
@@ -95,18 +100,16 @@ static inline f32 hs_buffer_get_f32(const HSBuffer* buf, u32 index) {
 
 /* Write 32-bit float at float-index */
 static inline void hs_buffer_set_f32(HSBuffer* buf, u32 index, f32 val) {
-    if (!buf || !buf->data) return;
+    if (!hs_buffer_range_valid(buf, index, 4)) return;
     u32 offset = index * 4;
-    if (offset + 4 > buf->length) return;
     memcpy(buf->data + offset, &val, 4);
     buf->dirty = true;
 }
 
 /* Write vec4 (4 floats) starting at float-index */
 static inline void hs_buffer_set_vec4(HSBuffer* buf, u32 index, vec4 v) {
-    if (!buf || !buf->data) return;
+    if (!hs_buffer_range_valid(buf, index, 16)) return;
     u32 offset = index * 4;
-    if (offset + 16 > buf->length) return;
     f32 arr[4];
     arr[0] = vgetq_lane_f32(v, 0);
     arr[1] = vgetq_lane_f32(v, 1);
@@ -118,8 +121,8 @@ static inline void hs_buffer_set_vec4(HSBuffer* buf, u32 index, vec4 v) {
 
 /* Read vec4 (4 floats) starting at float-index */
 static inline vec4 hs_buffer_get_vec4(const HSBuffer* buf, u32 index) {
+    if (!hs_buffer_range_valid(buf, index, 16)) return v4_zero();
     u32 offset = index * 4;
-    if (offset + 16 > buf->length) return v4_zero();
     f32 arr[4];
     memcpy(arr, buf->data + offset, 16);
     return v4_make(arr[0], arr[1], arr[2], arr[3]);
@@ -127,8 +130,8 @@ static inline vec4 hs_buffer_get_vec4(const HSBuffer* buf, u32 index) {
 
 /* Write mat4 (16 floats) starting at float-index -- column-major */
 static inline void hs_buffer_set_mat4(HSBuffer* buf, u32 index, mat4 m) {
+    if (!hs_buffer_range_valid(buf, index, 64)) return;
     u32 offset = index * 4;
-    if (offset + 64 > buf->length) return;
     f32 arr[16];
     m4_to_array(m, arr);
     memcpy(buf->data + offset, arr, 64);
@@ -137,8 +140,8 @@ static inline void hs_buffer_set_mat4(HSBuffer* buf, u32 index, mat4 m) {
 
 /* Write mat3x4 (12 floats) starting at float-index -- first 3 columns */
 static inline void hs_buffer_set_mat3x4(HSBuffer* buf, u32 index, mat4 m) {
+    if (!hs_buffer_range_valid(buf, index, 48)) return;
     u32 offset = index * 4;
-    if (offset + 48 > buf->length) return;
     f32 arr[16];
     m4_to_array(m, arr);
     /* Write columns 0-2 (12 floats), skip column 3 */

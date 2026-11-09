@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
     printf("Input stream started. Press keys, move mouse, etc.\n");
     printf("Press Ctrl+C to exit.\n\n");
 
-    int last_frame = 0;
+    u32 last_frame = 0;
     while (g_run) {
         const HSInput* state = hs_input_stream_get_state(&stream);
         u32 cur_frame = state->frame;

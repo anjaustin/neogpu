@@ -5,6 +5,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <netdb.h>
+#include <netinet/tcp.h>
+#include <fcntl.h>
+#include <poll.h>
 
 #include "hs_core.h"
 #include "hs_msg.h"
@@ -41,6 +45,7 @@ static void usage(const char* argv0) {
     printf("neogpu_tool\n\n");
     printf("Usage:\n");
     printf("  %s --sock <path> <cmd> [args]\n\n", argv0 ? argv0 : "neogpu_tool");
+    printf("  %s --host <hostname> --port <port> <cmd> [args]\n\n", argv0 ? argv0 : "neogpu_tool");
     printf("Commands:\n");
     printf("  query-stats\n");
     printf("  query-fabric\n");
@@ -56,7 +61,7 @@ static int write_full(int fd, const void* buf, size_t len) {
     const u8* p = (const u8*)buf;
     size_t off = 0;
     while (off < len) {
-        ssize_t w = write(fd, p + off, len - off);
+        ssize_t w = send(fd, p + off, len - off, MSG_NOSIGNAL);
         if (w < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -89,12 +94,50 @@ static int connect_sock(const char* path) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    if (strlen(path) >= sizeof(addr.sun_path)) { close(fd); errno = ENAMETOOLONG; return -1; }
+    memcpy(addr.sun_path, path, strlen(path) + 1);
     if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         close(fd);
         return -1;
     }
     return fd;
+}
+
+static int connect_tcp(const char* host, const char* port) {
+    struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
+    struct addrinfo* addresses;
+    if (getaddrinfo(host, port, &hints, &addresses) != 0) { errno = EINVAL; return -1; }
+    int fd = -1;
+    for (struct addrinfo* address = addresses; address; address = address->ai_next) {
+        fd = socket(address->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) continue;
+        int rc = connect(fd, address->ai_addr, address->ai_addrlen);
+        if (rc != 0 && errno == EINPROGRESS) {
+            struct pollfd wait = {.fd = fd, .events = POLLOUT};
+            int error = 0;
+            socklen_t length = sizeof(error);
+            rc = poll(&wait, 1, 2000) > 0 &&
+                 getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == 0 ? 0 : -1;
+        }
+        if (!rc && fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK) == 0) {
+            int enabled = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+            break;
+        }
+        close(fd); fd = -1;
+    }
+    freeaddrinfo(addresses);
+    return fd;
+}
+
+static bool parse_u32(const char* text, u32 maximum, u32* value) {
+    if (!text || !text[0] || text[0] == '-') return false;
+    errno = 0;
+    char* end;
+    unsigned long parsed = strtoul(text, &end, 0);
+    if (errno || *end || parsed > maximum) return false;
+    *value = (u32)parsed;
+    return true;
 }
 
 static int ngip_request(int fd, u8 op, u8 flags, u32 cid, const void* payload, u32 payload_len,
@@ -124,8 +167,8 @@ static int ngip_request(int fd, u8 op, u8 flags, u32 cid, const void* payload, u
 
     NgipHdr rh;
     if (read_full(fd, &rh, sizeof(rh)) != 0) return -1;
-    if (rh.magic != NGIP_MAGIC || rh.version != NGIP_VERSION || rh.type != NGIP_TYPE_RESP) return -1;
-    if (rh.len < sizeof(NgipResp)) return -1;
+    if (rh.magic != NGIP_MAGIC || rh.version != NGIP_VERSION || rh.type != NGIP_TYPE_RESP || rh.cid != cid) return -1;
+    if (rh.len < sizeof(NgipResp) || rh.len > sizeof(NgipResp) + HS_TOOLBUS_PAYLOAD_MAX) return -1;
 
     NgipResp resp;
     if (read_full(fd, &resp, sizeof(resp)) != 0) return -1;
@@ -160,6 +203,7 @@ static int ngip_request(int fd, u8 op, u8 flags, u32 cid, const void* payload, u
     }
 
     if (resp.result_len > out_cap) return -1;
+    if (resp.result_op != op) return -1;
     if (resp.result_len) {
         if (read_full(fd, out, resp.result_len) != 0) return -1;
     }
@@ -167,12 +211,12 @@ static int ngip_request(int fd, u8 op, u8 flags, u32 cid, const void* payload, u
     return 0;
 }
 
-static void print_stats(const u8* payload, u32 len) {
+static bool print_stats(const u8* payload, u32 len) {
     u32 tick = 0, log_head = 0, record_mask = 0, prod = 0, flags = 0;
     u32 budgets[3] = {0}, dropped[4] = {0};
     if (!hs_unpack_result_system_stats(payload, len, &tick, &log_head, &record_mask, budgets, dropped, &prod, &flags)) {
         printf("stats: <decode failed>\n");
-        return;
+        return false;
     }
     printf("stats: tick=%u log_head=%u prod=%u record_mask=0x%08x\n",
            (unsigned)tick, (unsigned)log_head, (unsigned)prod, (unsigned)record_mask);
@@ -183,14 +227,15 @@ static void print_stats(const u8* payload, u32 len) {
     printf("flags: recording=%u validate=%u block_rt=%u block_render=%u block_telem=%u\n",
            (unsigned)((flags >> 0) & 1u), (unsigned)((flags >> 1) & 1u),
            (unsigned)((flags >> 2) & 1u), (unsigned)((flags >> 3) & 1u), (unsigned)((flags >> 4) & 1u));
+    return true;
 }
 
-static void print_fabric(const u8* payload, u32 len) {
+static bool print_fabric(const u8* payload, u32 len) {
     u32 spsc_ok3[3] = {0}, spsc_full3[3] = {0}, mpsc_ok3[3] = {0}, submit_full3[3] = {0}, submit_hw3[3] = {0}, telem_dropped3[3] = {0};
     u32 prod = 0, waiters = 0;
     if (!hs_unpack_result_fabric(payload, len, spsc_ok3, spsc_full3, mpsc_ok3, submit_full3, submit_hw3, telem_dropped3, &prod, &waiters)) {
         printf("fabric: <decode failed>\n");
-        return;
+        return false;
     }
     printf("fabric: prod=%u waiters=%u\n", (unsigned)prod, (unsigned)waiters);
     printf("spsc_ok:    rt=%u render=%u telem=%u\n", (unsigned)spsc_ok3[0], (unsigned)spsc_ok3[1], (unsigned)spsc_ok3[2]);
@@ -199,24 +244,37 @@ static void print_fabric(const u8* payload, u32 len) {
     printf("submit_full:rt=%u render=%u telem=%u\n", (unsigned)submit_full3[0], (unsigned)submit_full3[1], (unsigned)submit_full3[2]);
     printf("submit_hw:  rt=%u render=%u telem=%u\n", (unsigned)submit_hw3[0], (unsigned)submit_hw3[1], (unsigned)submit_hw3[2]);
     printf("telem_drop: rt=%u render=%u telem=%u\n", (unsigned)telem_dropped3[0], (unsigned)telem_dropped3[1], (unsigned)telem_dropped3[2]);
+    return true;
 }
 
 int main(int argc, char** argv) {
     const char* sock = "/tmp/neogpu.sock";
+    const char* host = NULL;
+    char port_number[6] = "8765";
+    const char* port = port_number;
+    bool explicit_socket = false;
     int argi = 1;
     if (argc < 2) {
         usage(argv[0]);
         return 2;
     }
 
-    if (argi < argc && strcmp(argv[argi], "--sock") == 0) {
+    while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
         if (argi + 1 >= argc) {
-            fprintf(stderr, "missing value for --sock\n");
+            fprintf(stderr, "missing connection option value\n");
             return 2;
         }
-        sock = argv[argi + 1];
+        if (!strcmp(argv[argi], "--sock")) { sock = argv[argi + 1]; explicit_socket = true; }
+        else if (!strcmp(argv[argi], "--host")) host = argv[argi + 1];
+        else if (!strcmp(argv[argi], "--port")) {
+            u32 parsed;
+            if (!parse_u32(argv[argi + 1], 65535, &parsed) || !parsed) return 2;
+            snprintf(port_number, sizeof(port_number), "%u", parsed);
+            if (!host) host = "127.0.0.1";
+        } else return 2;
         argi += 2;
     }
+    if (explicit_socket && host) return 2;
 
     if (argi >= argc) {
         usage(argv[0]);
@@ -224,11 +282,18 @@ int main(int argc, char** argv) {
     }
 
     const char* cmd = argv[argi++];
-    int fd = connect_sock(sock);
+    int required = !strcmp(cmd, "query-stats") || !strcmp(cmd, "query-fabric") ? 0 :
+                   !strcmp(cmd, "set-record-mask") ? 1 :
+                   !strcmp(cmd, "set-budget") || !strcmp(cmd, "set-block") || !strcmp(cmd, "fence") ? 2 : -1;
+    if (required < 0 || argc - argi != required) return 2;
+    int fd = host ? connect_tcp(host, port) : connect_sock(sock);
     if (fd < 0) {
         fprintf(stderr, "connect failed: %s\n", strerror(errno));
         return 1;
     }
+    struct timeval timeout = {.tv_sec = 2};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     u8 out[HS_TOOLBUS_PAYLOAD_MAX];
     u32 out_len = 0;
@@ -236,33 +301,36 @@ int main(int argc, char** argv) {
 
     if (strcmp(cmd, "query-stats") == 0) {
         if (ngip_request(fd, OP_QUERY_STATS, 0, cid, NULL, 0, out, &out_len, sizeof(out)) != 0) return 1;
-        print_stats(out, out_len);
+        if (!print_stats(out, out_len)) return 1;
 
     } else if (strcmp(cmd, "query-fabric") == 0) {
         if (ngip_request(fd, OP_QUERY_FABRIC, 0, cid, NULL, 0, out, &out_len, sizeof(out)) != 0) return 1;
-        print_fabric(out, out_len);
+        if (!print_fabric(out, out_len)) return 1;
 
     } else if (strcmp(cmd, "set-record-mask") == 0) {
         if (argi >= argc) {
             fprintf(stderr, "missing mask\n");
             return 2;
         }
-        u32 mask = (u32)strtoul(argv[argi++], NULL, 0);
+        u32 mask;
+        if (!parse_u32(argv[argi++], UINT32_MAX, &mask)) return 2;
         u8 p[4];
         hs_pack_set_record_mask(p, mask);
         if (ngip_request(fd, OP_SET_RECORD_MASK, 0, cid, p, sizeof(p), out, &out_len, sizeof(out)) != 0) return 1;
         u32 oldv = 0, newv = 0;
         if (hs_unpack_u32x2(out, out_len, &oldv, &newv)) {
             printf("set-record-mask: 0x%08x -> 0x%08x\n", (unsigned)oldv, (unsigned)newv);
-        }
+        } else return 1;
 
     } else if (strcmp(cmd, "set-budget") == 0) {
         if (argi + 1 >= argc) {
             fprintf(stderr, "missing args\n");
             return 2;
         }
-        u8 ch = (u8)strtoul(argv[argi++], NULL, 0);
-        u32 bud = (u32)strtoul(argv[argi++], NULL, 0);
+        u32 channel, bud;
+        if (!parse_u32(argv[argi++], 3, &channel) || !channel ||
+            !parse_u32(argv[argi++], UINT32_MAX, &bud)) return 2;
+        u8 ch = (u8)channel;
         u8 p[8];
         hs_pack_set_chan_budget(p, ch, bud);
         if (ngip_request(fd, OP_SET_CHAN_BUDGET, 0, cid, p, sizeof(p), out, &out_len, sizeof(out)) != 0) return 1;
@@ -270,15 +338,17 @@ int main(int argc, char** argv) {
         if (hs_unpack_u32x2(out, out_len, &oldv, &newv)) {
             if (oldv == 0xFFFFFFFFu || newv == 0xFFFFFFFFu) printf("set-budget: invalid channel %u\n", (unsigned)ch);
             else printf("set-budget: ch=%u %u -> %u\n", (unsigned)ch, (unsigned)oldv, (unsigned)newv);
-        }
+        } else return 1;
 
     } else if (strcmp(cmd, "set-block") == 0) {
         if (argi + 1 >= argc) {
             fprintf(stderr, "missing args\n");
             return 2;
         }
-        u8 ch = (u8)strtoul(argv[argi++], NULL, 0);
-        u8 v = (u8)strtoul(argv[argi++], NULL, 0);
+        u32 channel, value;
+        if (!parse_u32(argv[argi++], 3, &channel) || !channel ||
+            !parse_u32(argv[argi++], 1, &value)) return 2;
+        u8 ch = (u8)channel, v = (u8)value;
         u8 p[2];
         hs_pack_set_block_policy(p, ch, v);
         if (ngip_request(fd, OP_SET_BLOCK_POLICY, 0, cid, p, sizeof(p), out, &out_len, sizeof(out)) != 0) return 1;
@@ -286,21 +356,23 @@ int main(int argc, char** argv) {
         if (hs_unpack_u32x2(out, out_len, &oldv, &newv)) {
             if (oldv == 0xFFFFFFFFu || newv == 0xFFFFFFFFu) printf("set-block: invalid channel %u\n", (unsigned)ch);
             else printf("set-block: ch=%u %u -> %u\n", (unsigned)ch, (unsigned)oldv, (unsigned)newv);
-        }
+        } else return 1;
 
     } else if (strcmp(cmd, "fence") == 0) {
         if (argi + 1 >= argc) {
             fprintf(stderr, "missing args\n");
             return 2;
         }
-        u8 ch = (u8)strtoul(argv[argi++], NULL, 0);
-        cid = (u32)strtoul(argv[argi++], NULL, 0);
+        u32 channel;
+        if (!parse_u32(argv[argi++], 3, &channel) || !channel ||
+            !parse_u32(argv[argi++], UINT32_MAX, &cid)) return 2;
+        u8 ch = (u8)channel;
         if (ngip_request(fd, OP_FENCE, ch, cid, NULL, 0, out, &out_len, sizeof(out)) != 0) return 1;
         u32 tick = 0;
         u8 out_ch = 0;
         if (hs_unpack_result_fence(out, out_len, &tick, &out_ch)) {
             printf("fence: cid=%u tick=%u channel=%u\n", (unsigned)cid, (unsigned)tick, (unsigned)out_ch);
-        }
+        } else return 1;
     } else {
         usage(argv[0]);
         return 2;

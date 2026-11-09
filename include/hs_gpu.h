@@ -47,6 +47,7 @@ typedef struct HSGpu {
 } HSGpu;
 
 void hs_gpu_init(HSGpu* gpu);
+void hs_gpu_shutdown(HSGpu* gpu);
 
 void hs_gpu_attach_backend(HSGpu* gpu, HSBackend* backend);
 

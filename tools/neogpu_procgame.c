@@ -254,7 +254,6 @@ int main(int argc, char** argv) {
     ProcAudio audio;
     proc_audio_init(&audio);
     
-    int ch = 0;
     while (g_run) {
         frame_count++;
         

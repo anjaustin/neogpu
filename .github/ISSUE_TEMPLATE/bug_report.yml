@@ -49,7 +49,6 @@ body:
         - IPC / tooling
         - Capture & replay
         - NEON math library
-        - Experimental ML / BitNet
         - Build system
         - Documentation
         - Not sure

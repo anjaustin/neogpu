@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Buffer/storage index overflow; record-mask/stencil codec lengths; truncated
+  fabric-result decoder overread; buffered capture-write error reporting.
+- Capture payload ownership beyond the live transport ring, with lazy aligned
+  storage and explicit `hs_destroy()` / `hs_gpu_shutdown()` teardown.
+- Transport-to-actor inbox loss, reentrant consumer waits, and shared block-policy
+  data races. Benchmarks now verify applied counts, not only admissions.
+- IPC accepted-client cancellation, bounded I/O/admission, failed-start cleanup,
+  Unix path preservation, and documented Unix/TCP server/client CLI modes.
+- Async slot ownership, serialized worker startup, drain/reclamation on shutdown;
+  unsupported texture decoding now rejects explicitly with `ENOTSUP`.
+- Input queue wrap/wakeup, multi-producer serialization, synchronized held-state
+  snapshots, and evdev hot-add/remove lifecycle.
+- Missing depth/stencil framebuffer attachments. Graphics tests now capture
+  evidence, the clear test terminates, and instancing uses an instanced draw.
+
+### Verification
+- Runnable `make test`, `make sanitize`, `make tsan`, `make check-sources`,
+  `make benchmark`, and opt-in `make test-hardware`; ARM CI workflow added.
+- Unique in-tree fixtures, complete/correlated IPC reads, malformed peer tests,
+  100/100 response assertions, and monotonic observable benchmark work.
+- Full evidence and retained limitations: `docs/audit/P0_REMEDIATION.md`.
+
+### Removed
+- BitNet/ML inference code, model sidecars, vendored reference implementation,
+  ML-only tests, benchmarks, tools, and build targets. The experiment now lives
+  in a separate repository.
+- ML IPC handlers and public opcodes. Wire values 43–48 remain retired so
+  existing input opcode values and captures do not shift.
+
+### Changed
+- Project documentation and contribution templates now focus on the graphics
+  runtime and tooling. Mixed historical notes remain for provenance.
+- Headless IPC tests verify rejection of all six retired wire values and pin
+  the existing input opcode ABI at compile time.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),

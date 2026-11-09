@@ -26,7 +26,6 @@ body:
         - label: `make clean && make && make build-tests` succeeds
         - label: `./neogpu_demo` runs clean (headless suite)
         - label: Verified on real hardware (Pi 4) — describe below
-        - label: `make ml` succeeds (if the experimental path is touched)
         - label: Benchmarked before and after (if performance is touched)
         - label: Documentation updated alongside the change
 
@@ -45,7 +44,7 @@ body:
     attributes:
       label: Scope notes
       description: |
-        Does this touch the experimental ML path, the message ABI, or the
+        Does this touch the message ABI or the
         public API surface? If so, list what a reviewer should scrutinize.
     validations:
       required: false
@@ -55,7 +54,7 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: No source files were deleted; anything removed was archived instead
-        - label: The core build still has no ML dependencies
+        - label: Source deletions are explicitly requested and explained, if any
+        - label: The runtime remains focused on graphics and tooling
         - label: New build artifacts are gitignored (by explicit name, not a pattern that could match source)
         - label: `docs/interface/MESSAGE_ABI.md` reflects any opcode changes

@@ -105,7 +105,6 @@ Typical examples:
 - `OP_DRAW_TEXT`
 - `OP_CLEAR`
 - `OP_CLEAR_DS`
-- ML load/forward/generate requests
 
 ### Class D: Observable Stream Commands
 
@@ -210,7 +209,6 @@ This plan does not currently propose:
 
 - dropping or coalescing draw commands
 - changing `OP_RESULT` / `OP_ACK` semantics
-- making ML operationally first-class yet
 - adding more heuristic fast paths inside the current universal route
 
 ## Acceptance Criteria For Future Implementation

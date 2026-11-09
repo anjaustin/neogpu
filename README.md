@@ -1,16 +1,15 @@
 # NeoGPU
 
-**A message-native runtime substrate for ARM/NEON — graphics, tooling, and
-experimental inference on the Raspberry Pi 4.**
+**A message-native runtime substrate for ARM/NEON — graphics and tooling
+on the Raspberry Pi 4.**
 
 [![Build](https://github.com/anjaustin/neogpu/actions/workflows/ci.yml/badge.svg)](https://github.com/anjaustin/neogpu/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Language: C](https://img.shields.io/badge/language-C%20%7C%20Make-blue.svg)](https://en.wikipedia.org/wiki/C_(programming_language))
 
 NeoGPU is a small, complete GPU runtime where *every* operation is a message.
-Rendering commands, IPC requests, and (in the experimental path) inference ops
-all travel the same lock-free channels — so one fabric carries the whole
-system.
+Rendering commands and IPC requests travel the same lock-free channels — so
+one fabric carries the whole system.
 
 ```c
 HSGpu gpu;
@@ -53,9 +52,8 @@ Three consequences fall out of that design:
   transport.
 - **Capture and replay come free.** Because work is messages, a frame *is* a
   log. `HSCAP1` captures are portable, inspectable, and replayable.
-- **The substrate is separable.** The graphics core builds with no inference
-  dependencies at all. The BitNet work is a real experiment, not a
-  load-bearing part of the runtime.
+- **A focused runtime.** Graphics, input, capture/replay, and tooling share
+  the message substrate without model-loading or inference dependencies.
 
 ## Status
 
@@ -64,61 +62,49 @@ Three consequences fall out of that design:
 | Message fabric | **Production-shaped** | Lock-free SPSC/MPSC, channel QoS, overflow accounting |
 | Graphics (GBM/EGL/GLES3) | **Working on hardware** | Verified on Raspberry Pi 4, DRM/GBM, 800x480 DSI |
 | Tooling / IPC | **Working** | Unix socket + TCP server, query/control surface |
-| Capture & replay | **Working** | `HSCAP1` format, round-trip verified |
+| Capture & replay | **Working** | `HSCAP1`, owned payload journal, strict native-layout file format |
 | NEON math library | **Working** | vec4/mat4/quat, SIMD-backed |
-| BitNet inference | **Experimental** | Opt-in, off by default — see [below](#architecture) |
 
-The honest summary: **the runtime and the renderer are the product; the
-inference engine is a contained experiment.**
+**The runtime and the renderer are the product.** The former BitNet/ML
+experiment has moved to a separate repository and is no longer included here.
 
 ## Performance
 
-Measured on a Raspberry Pi 4 (Cortex-A72, 800x480 DSI display).
-
-| Metric | Value | Source |
-|--------|-------|--------|
-| **Message layer throughput** | **12,780,000 msg/s** | 2 producers, producer benchmark via `./neogpu_demo` |
-| Message layer (1–16 producers) | 6.36M – 12.78M msg/s | Current accepted configuration |
-| GPU frames | ~414K fps | Message-path frame rate |
-| NEON math | ~14B ops/sec | Scalar vs NEON mat4/vec4 |
-| IPC throughput | ~4,700 req/sec | Round-trip latency test |
-
-Throughput by producer count, as measured on the current configuration:
+Measured on the Raspberry Pi 4 with GCC 15.2.0. Three-run medians of **applied**
+messages per second, with every admitted message verified as applied:
 
 | Producers | 1 | 2 | 4 | 8 | 16 |
-|-----------|---|---|---|---|----|
-| msg/s | 10.67M | **12.78M** | 7.91M | 6.91M | 6.36M |
+|-----------|---:|---:|---:|---:|---:|
+| Applied msg/s | 7,161,610 | 6,607,669 | 6,569,234 | 7,382,018 | 6,754,508 |
 
-Throughput peaks at two producers and then falls off as producers contend for
-the same cache lines — which is precisely the bottleneck the optimization work
-targeted.
+Runs used the OS scheduler, not pinned CPUs. The single-producer samples ranged
+from 6,003,134 to 11,826,346 msg/s; do not treat a peak as a sustained guarantee.
+The ledger retains every sample and the exact completion intervals.
 
-**Reproduce the message-layer number:**
+Other verified measurements:
+
+- Unix CLI: **100/100** correlated responses; three-run median **39.605 ms** total.
+- TCP CLI: **100/100** correlated responses; three-run median **48.781 ms** total.
+- Orbit renderer: **1,092 frames in 10.004662 seconds**, **109.149 display-path FPS**.
+
+**Reproduce:**
 
 ```bash
-make && ./neogpu_demo
+make benchmark
+./neogpu_demo --benchmark-producers 1  # a single producer count, 2-second window
 ```
 
-The `Comms Producer Benchmark` section prints throughput per producer count:
+Old admission-only, eliminated-work math, and desynchronized IPC benchmark
+headlines are not comparable to these measurements. See
+[the P0 ledger](docs/audit/P0_REMEDIATION.md) for the failures, fixes, raw samples,
+and rejected experiments. Message-only frame rates are not displayed GPU FPS.
 
-```
-  1 thr,  500 ms: 10670000 msg/s (ok=5335000 fail=0 spsc_ok=5335000 ...)
-  2 thr,  500 ms: 12780000 msg/s (ok=6390000 fail=0 spsc_ok=6390000 ...)
-```
-
-That figure is the headline because it is the one that is *hard*. Rendering
-performance is bounded by the display; the fabric's throughput is bounded by
-cache-line contention between producers and the consumer, and it took a dozen
-red-teamed optimization rounds to get there. The full optimization log,
-including the rejected ideas, is in
-[docs/benchmarks/ATOMICS_PROFILE_2026-03-13.md](docs/benchmarks/ATOMICS_PROFILE_2026-03-13.md).
-
-> **Binary size:** the core runtime is ~25 KB of `text`+`data` (stripped).
-> Verify it yourself with `size neogpu_demo` after `make` — `text` and `data`
-> are the loadable code, while `bss` is the ~2 MB of buffers allocated at
-> runtime. Older notes in this repo also quote a "73 KB" figure for the whole
-> file; that was a different measurement of a different artifact, and the
-> `size` output is the number to trust.
+> **Size and memory:** measure the actual artifact with `size neogpu_demo`.
+> This executable contains numerous static test fixtures; it is not a minimal
+> runtime-size benchmark. `bss` is not executable file size or measured resident
+> memory. Recording allocates its independent payload journal lazily and releases
+> it with `hs_gpu_shutdown()`. Exact layout/memory measurements are in the P0
+> ledger; earlier tiny-binary and ~2 MB buffer claims are not current evidence.
 
 ## Quick Start
 
@@ -129,7 +115,7 @@ development packages.
 git clone https://github.com/anjaustin/neogpu.git
 cd neogpu
 
-make                 # build the core (no ML required)
+make                 # build the core
 make build-tests     # build the graphics test suite
 ./neogpu_demo        # run the headless test suite + benchmarks
 ```
@@ -171,7 +157,6 @@ Additional demos live in `tools/`:
 |------|-----------|
 | `neogpu_pong` | Pong, driven by the message fabric |
 | `neogpu_pong_ai` | Pong with simulated commentary |
-| `neogpu_pong_llm` | Pong alongside real BitNet inference *(experimental)* |
 | `neogpu_capture_demo` | Records an `HSCAP1` capture to disk |
 | `neogpu_tool` | Standalone IPC client for querying a running instance |
 
@@ -198,22 +183,6 @@ Additional demos live in `tools/`:
         │   Backend: GBM / EGL / GLES3 → DRM        │
         └──────────────────────────────────────────┘
 ```
-
-### Core vs. experimental
-
-The build is split so the two concerns are structurally separate, not just
-nominally:
-
-| | Core (`make`) | ML (`make ml`) |
-|---|---|---|
-| Sources | `src/hs_core.c`, `hs_nodes.c`, `hs_gpu.c`, `hs_async.c`, `hs_backend_gles.c`, `hs_ipc.c`, `hs_text.c`, `main.c` | Core **plus** `hs_ml.c`, `hs_ml_loader.c`, `hs_ml_ternary_mt.c` |
-| `hs_ipc.c` ML ops | Compiled out (`#ifdef HS_ENABLE_ML`) | Compiled in |
-| Object tree | `src/*.o` | `build/ml/*.o` (separate) |
-| Binary | `neogpu_demo` | `neogpu_demo_ml` |
-
-The object trees are deliberately separate so the two builds can never
-contaminate each other — a plain `make` after `make ml` cannot silently
-reuse ML-enabled objects.
 
 ## Tooling & IPC
 
@@ -242,6 +211,10 @@ make tool
 ./neogpu_tool --host localhost --port 8765 query-fabric
 ```
 
+TCP server mode binds to loopback by default. Start the matching server before
+running a client; Unix and TCP are separate server modes. Services have finite
+I/O deadlines and bounded admission; callers still need trusted local access.
+
 **Channel semantics:**
 
 | Channel | QoS | Budget (msgs/tick) | Behavior |
@@ -261,9 +234,8 @@ include/            Public headers
   hs_graphics.h       GBM/EGL/GLES graphics backend
   hs_text.h           Text rendering
   hs_math_neon.h      NEON vec4/mat4/quat math
-  hs_ml*.h            Experimental ML interfaces
 
-src/                Core runtime (graphics + substrate, no ML)
+src/                Core runtime (graphics + substrate)
   hs_core.c           Message queue, OpCodes, system core
   hs_nodes.c          Node handlers (Shader, Buffer, Texture, Output, Sound)
   hs_gpu.c            High-level GPU API
@@ -272,13 +244,10 @@ src/                Core runtime (graphics + substrate, no ML)
   hs_ipc.c            IPC server (Unix + TCP), tool-bus
   hs_text.c           Text rendering
   main.c              Headless test suite + benchmarks
-  hs_ml*.c            Experimental ML (only in the `make ml` build)
-  archive_ternary_kernels/  Historical ternary kernel variants
 
 tests/              Graphics + system tests (test_01 … test_08)
 tools/              Standalone demos and utilities
 docs/               Documentation (see docs/README.md)
-experimental/BitNet/  Vendored Microsoft bitnet.cpp reference (MIT)
 ```
 
 ## Building
@@ -287,7 +256,6 @@ experimental/BitNet/  Vendored Microsoft bitnet.cpp reference (MIT)
 
 ```bash
 make                  # core + tests
-make ml               # opt-in experimental ML build → neogpu_demo_ml
 ```
 
 **Cross-compile:**
@@ -302,7 +270,6 @@ make CC=aarch64-linux-gnu-gcc STRIP=aarch64-linux-gnu-strip build
 |--------|--------------|
 | `make` / `make build` | Build `neogpu_demo` (core only) |
 | `make build-tests` | Build the graphics test suite |
-| `make ml` | Build `neogpu_demo_ml` (core + experimental ML) |
 | `make tool` | Build the standalone IPC client |
 | `make run-test N=06` | Build and run one test (needs display + root) |
 | `make clean` | Remove build artifacts |
@@ -311,13 +278,19 @@ make CC=aarch64-linux-gnu-gcc STRIP=aarch64-linux-gnu-strip build
 ## Testing
 
 ```bash
-make build && ./neogpu_demo        # headless: system tests + benchmarks
+make test                          # headless checks + P0 + Unix/TCP CLI contracts
+make sanitize                      # AddressSanitizer + UndefinedBehaviorSanitizer
+make tsan                          # ThreadSanitizer, including producer benchmark
+make benchmark                     # explicitly separate performance measurement
 make build-tests                    # graphics tests (need display + root)
 sudo ./tests/test_08_raycast_orbit  # the ray tracer
 ```
 
-`neogpu_demo` exercises the message fabric, node handlers, IPC, thread safety,
-overflow handling, and the producer benchmark — all without a display.
+`make test` exercises the message fabric, node handlers, IPC, thread safety,
+overflow handling, capture persistence, and synthetic input — without a display.
+`sudo make test-hardware` additionally records framebuffer evidence and exercises
+virtual evdev devices; it requires DRM and `/dev/uinput` access. It does not grab
+physical input devices.
 
 ## Documentation
 
@@ -327,7 +300,6 @@ Full documentation index: **[docs/README.md](docs/README.md)**
 |------|---------------|
 | Design & architecture | [docs/architecture/](docs/architecture/) |
 | Wire formats & interfaces | [docs/interface/](docs/interface/) |
-| Research & concepts | [docs/research/](docs/research/) |
 | Benchmarks & methodology | [docs/benchmarks/](docs/benchmarks/) |
 | PicoGPU relationship | [docs/lineage/](docs/lineage/) |
 | Self-audit | [docs/audit/DIAMOND.md](docs/audit/DIAMOND.md) |
@@ -346,7 +318,7 @@ software and still be genuinely useful.
 
 NeoGPU takes that spark somewhere new — a header-oriented **C** implementation
 targeting the **Raspberry Pi 4's V3D** on bare-metal DRM/GBM, with a
-message-native core and experimental BitNet inference. The architectures have
+message-native core. The architectures have
 diverged a great deal; that divergence is a measure of how far a good idea
 travels, not a reason to forget where it started.
 
@@ -355,14 +327,10 @@ runtime; the feature surface NeoGPU still mirrors (vertex/fragment buffers,
 blending, culling, depth/stencil, color mask, render targets, instancing,
 matrix/vector/quaternion math, textured UV mapping); and the 4-channel, 48 kHz
 audio model. Where NeoGPU goes its own way — native ARM/NEON, Pi4 V3D, a
-message-passing substrate, ML in the same runtime — it does so standing on that
+message-passing substrate — it does so standing on that
 foundation.
 
 Thank you, Nicolas. See [CREDITS.md](CREDITS.md) for the full lineage.
-
-NeoGPU also incorporates the experimental `bitnet.cpp` reference
-implementation from Microsoft (MIT, see [experimental/BitNet/](experimental/BitNet/)),
-used for comparison against NeoGPU's own ternary kernels.
 
 ## License
 

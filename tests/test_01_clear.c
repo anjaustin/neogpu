@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include "hs_graphics.h"
+#include "graphics_capture.h"
 
 static const char* vertex_shader_src = R"(
     attribute vec2 a_position;
@@ -119,22 +120,23 @@ int main(int argc, char** argv) {
         {1.0f, 0.0f, 1.0f, 1.0f},  // Magenta
     };
     
-    printf("Rendering color cycle (Ctrl+C to exit)...\n");
+    printf("Rendering six-color cycle...\n");
     
     int frame = 0;
-    while (1) {
+    while (frame < 6) {
         float* color = colors[frame % 6];
         
         glClearColor(color[0], color[1], color[2], color[3]);
         glClear(GL_COLOR_BUFFER_BIT);
         
+        if (frame == 2 && test_capture_frame() != 0) return 1;
         hs_graphics_present(&gfx);
         
         usleep(500000);  // 0.5 seconds
         frame++;
     }
     
-    // Cleanup (never reached in demo mode)
+    // Cleanup after the bounded test.
     glDeleteBuffers(1, &vbo);
     glDeleteProgram(program);
     hs_graphics_finish(&gfx);

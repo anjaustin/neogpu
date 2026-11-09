@@ -89,7 +89,7 @@ static inline bool hs_unpack_u16x4(const void* data, u32 len, u16 out_xywh[4]) {
 }
 
 static inline bool hs_unpack_u8x4(const void* data, u32 len, u8 out_vals[4]) {
-    if (!data || len < 8) return false;
+    if (!data || !out_vals || len < 4) return false;
     memcpy(out_vals, data, 4);
     return true;
 }
@@ -205,7 +205,7 @@ static inline void hs_pack_set_record_mask(u8 out[4], u32 mask) {
 }
 
 static inline bool hs_unpack_set_record_mask(const void* data, u32 len, u32* out_mask) {
-    if (!data || len < 8) return false;
+    if (!data || len < 4) return false;
     if (out_mask) memcpy(out_mask, data, 4);
     return true;
 }
@@ -299,7 +299,7 @@ static inline bool hs_unpack_result_system_stats(const void* data, u32 len,
     return true;
 }
 
-/* OP_QUERY_FABRIC result payload (64B)
+/* OP_QUERY_FABRIC result payload (96B)
  * Layout: u32 arrays per channel (RT, RENDER, TELEM):
  *  0..11  spsc_ok[3], spsc_full[3], mpsc_ok[3], submit_full[3]
  * 48 producer_count(u32)
@@ -330,7 +330,7 @@ static inline bool hs_unpack_result_fabric(const void* data, u32 len, u32 spsc_o
                                           u32 mpsc_ok3[3], u32 submit_full3[3], u32 submit_hw3[3],
                                           u32 telem_dropped3[3],
                                           u32* out_producer_count, u32* out_bp_waiters) {
-    if (!data || len < 64) return false;
+    if (!data || len < 96) return false;
     const u8* b = (const u8*)data;
     if (spsc_ok3) memcpy(spsc_ok3, &b[0], 12);
     if (spsc_full3) memcpy(spsc_full3, &b[12], 12);

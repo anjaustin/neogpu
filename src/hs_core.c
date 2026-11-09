@@ -358,6 +358,40 @@ static bool hs_spsc_push(HSSpscQueue* q, const Message* msg, const void* payload
     return true;
 }
 
+static int hs_process_node(Node* node) {
+    if (!node || !node->process_fn || node->processing) return 0;
+    node->processing = true;
+    int processed = node->process_fn(node);
+    node->processing = false;
+    return processed;
+}
+
+static void hs_record_message(HSSystem* sys, const Message* msg) {
+    if (!sys->log || sys->log_head >= sys->log_capacity || sys->log_head > UINT16_MAX ||
+        (msg->payload_len && (!sys->payloads ||
+         msg->payload_idx >= sys->payload_capacity || msg->payload_len > HS_PAYLOAD_SIZE))) {
+        sys->log_overflow = true;
+        sys->recording = false;
+        return;
+    }
+    u32 slot = sys->log_head;
+    if (msg->payload_len) {
+        if (!sys->log_payloads) {
+            if (sys->log_capacity > UINT16_MAX + 1u) {
+                sys->log_overflow = true; sys->recording = false; return;
+            }
+            sys->log_payloads = aligned_alloc(64, (size_t)sys->log_capacity * sizeof(Payload));
+            if (!sys->log_payloads) {
+                sys->log_overflow = true; sys->recording = false; return;
+            }
+            sys->owns_log_payloads = true;
+        }
+        memset(&sys->log_payloads[slot], 0, sizeof(Payload));
+        memcpy(sys->log_payloads[slot].data, sys->payloads[msg->payload_idx].data, msg->payload_len);
+    }
+    sys->log[sys->log_head++] = *msg;
+}
+
 static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload, u32 payload_len) {
     /* Called by the step thread only. */
     if (!sys || !msg) return false;
@@ -403,7 +437,7 @@ static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload,
     if ((OpCode)msg->op == OP_FRAME_BEGIN || (OpCode)msg->op == OP_FRAME_END || (OpCode)msg->op == OP_PRESENT) {
         hs_render_record(sys, msg);
         if (record_this) {
-            sys->log[sys->log_head++] = *msg;
+            hs_record_message(sys, msg);
         }
         return true;
     }
@@ -437,14 +471,14 @@ static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload,
             } else {
                 if (sys->recording && (sys->record_mask & (1u << (u32)CHAN_RT))) {
                     if (sys->log_head < sys->log_capacity) {
-                        sys->log[sys->log_head++] = res;
+                        hs_record_message(sys, &res);
                     }
                 }
             }
         }
 
         if (record_this) {
-            sys->log[sys->log_head++] = *msg;
+            hs_record_message(sys, msg);
         }
         return true;
     }
@@ -467,13 +501,18 @@ static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload,
         }
     }
 
+    /* Transport admission must not become loss at the smaller actor inbox.
+     * Apply the full inbox on the sole step thread, then retry the handoff. */
+    if (dest->inbox.count == HS_QUEUE_SIZE && !dest->processing) {
+        sys->inline_processed += (u32)hs_process_node(dest);
+    }
     if (!mq_push(&dest->inbox, msg)) {
         hs_report_queue_full(sys, msg, msg->to);
         return false;
     }
 
     if (record_this) {
-        sys->log[sys->log_head++] = *msg;
+        hs_record_message(sys, msg);
     }
 
     hs_render_record(sys, msg);
@@ -954,7 +993,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->payload_head = 0;
     sys->recording = true;
     sys->validate_on_send = false;
-    sys->block_on_full = false;
+    atomic_init(&sys->block_on_full, false);
     sys->render_list = NULL;
     sys->log_overflow = false;
     sys->dropped_error_ex = 0;
@@ -1009,7 +1048,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
 
     /* default channel policies */
     for (u32 c = 0; c < CHAN_COUNT; c++) {
-        sys->block_on_full_chan[c] = false;
+        atomic_init(&sys->block_on_full_chan[c], false);
     }
     sys->block_on_full_chan[CHAN_RT] = true;
     sys->block_on_full_chan[CHAN_RENDER] = true;
@@ -1043,6 +1082,26 @@ void hs_register(HSSystem* sys, Node* node) {
     node->next = NULL;
     sys->nodes[sys->node_count++] = node;
     sys->node_map[node->id] = node;
+    node->processing = false;
+}
+
+void hs_destroy(HSSystem* sys) {
+    if (!sys) return;
+    if (sys->owns_log_payloads) free(sys->log_payloads);
+    sys->log_payloads = NULL;
+    sys->owns_log_payloads = false;
+    if (sys->toolbus_inited) {
+        pthread_cond_destroy(&sys->toolbus_cv);
+        pthread_mutex_destroy(&sys->toolbus_lock);
+        sys->toolbus_inited = false;
+    }
+    if (sys->lock_inited) {
+        pthread_cond_destroy(&sys->bp_cv);
+        pthread_mutex_destroy(&sys->bp_lock);
+        pthread_mutex_destroy(&sys->lock);
+        sys->lock_inited = false;
+    }
+    if (g_tls_prod.sys == sys) memset(&g_tls_prod, 0, sizeof(g_tls_prod));
 }
 
 void hs_capture_init(HSCapture* cap, Message* msg_buf, Payload* payload_buf, u32 capacity) {
@@ -1055,31 +1114,31 @@ void hs_capture_init(HSCapture* cap, Message* msg_buf, Payload* payload_buf, u32
 
 bool hs_capture_from_log(const HSSystem* sys, const Message* msgs, u32 count, HSCapture* out) {
     /* Capturing is read-only but depends on stable payload storage; caller should serialize appropriately. */
+    if (out) out->count = 0;
     if (!sys || !msgs || !out || !out->msgs || !out->payloads) return false;
     if (count == 0) return false;
     if (count > out->capacity) return false;
     if (!sys->payloads || sys->payload_capacity == 0) return false;
 
-    u32 effective_count = count;
-    if (effective_count > sys->payload_capacity) {
-        effective_count = sys->payload_capacity;
-        fprintf(stderr, "Warning: truncating capture from %u to %u messages (payload limit)\n", 
-                count, effective_count);
-    }
-
-    for (u32 i = 0; i < effective_count; i++) {
+    if (count > UINT16_MAX + 1u || msgs != sys->log || count > sys->log_head ||
+        sys->log_overflow) return false;
+    for (u32 i = 0; i < count; i++) {
         Message m = msgs[i];
+        memset(&out->payloads[i], 0, sizeof(Payload));
         if (m.payload_len != 0) {
-            if (m.payload_idx >= sys->payload_capacity) return false;
-            memcpy(out->payloads[i].data, sys->payloads[m.payload_idx].data, HS_PAYLOAD_SIZE);
+            if (!sys->log_payloads || m.payload_len > HS_PAYLOAD_SIZE) return false;
+            memcpy(out->payloads[i].data, sys->log_payloads[i].data, m.payload_len);
             m.payload_idx = (u16)i;
         }
         out->msgs[i] = m;
     }
 
-    out->count = effective_count;
+    out->count = count;
     return true;
 }
+
+static bool hs_replay_source(HSSystem* sys, Message* msgs, u32 count,
+                             const Payload* source, u32 source_capacity, bool journal);
 
 bool hs_capture_replay(HSSystem* sys, const HSCapture* cap) {
     if (!sys || !cap || !cap->msgs || !cap->payloads) return false;
@@ -1088,22 +1147,12 @@ bool hs_capture_replay(HSSystem* sys, const HSCapture* cap) {
     fprintf(stderr, "Warning: replay assumes deterministic execution (rand/time will replay identically)\n");
     fflush(stderr);
 
-    Payload* saved_payloads = sys->payloads;
-    u32 saved_cap = sys->payload_capacity;
-
-    sys->payloads = cap->payloads;
-    sys->payload_capacity = cap->capacity;
-
-    bool ok = hs_replay(sys, cap->msgs, cap->count);
-
-    sys->payloads = saved_payloads;
-    sys->payload_capacity = saved_cap;
-
-    return ok;
+    return hs_replay_source(sys, cap->msgs, cap->count, cap->payloads, cap->capacity, false);
 }
 
 bool hs_capture_write_file(const HSCapture* cap, const char* path) {
     if (!cap || !path || !cap->msgs || !cap->payloads) return false;
+    if (cap->count > cap->capacity || cap->count > UINT16_MAX + 1u) return false;
     FILE* f = fopen(path, "wb");
     if (!f) return false;
 
@@ -1115,7 +1164,7 @@ bool hs_capture_write_file(const HSCapture* cap, const char* path) {
     ok = ok && (fwrite(cap->msgs, sizeof(Message), cap->count, f) == cap->count);
     ok = ok && (fwrite(cap->payloads, sizeof(Payload), cap->count, f) == cap->count);
 
-    fclose(f);
+    if (fclose(f) != 0) ok = false;
     return ok;
 }
 
@@ -1158,10 +1207,16 @@ bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Pa
     return true;
 }
 
+bool hs_try_send(HSSystem* sys, Message* msg, const void* payload, u32 len) {
+    if (!sys || !msg || len > HS_PAYLOAD_SIZE || (len && !payload)) return false;
+    return hs_send_enqueue(sys, msg, payload, len);
+}
+
 bool hs_send(HSSystem* sys, Message* msg) {
     if (!sys || !msg) return false;
     for (;;) {
         if (hs_send_enqueue(sys, msg, NULL, 0)) return true;
+        if (g_tls_in_step == sys) return false; /* consumer cannot wait on itself */
         HSChannel ch = (HSChannel)msg->channel;
         bool block = (ch != CHAN_TELEM) && (sys->block_on_full || (ch < CHAN_COUNT && sys->block_on_full_chan[(u32)ch]));
         if (!block) return false;
@@ -1173,6 +1228,7 @@ bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len
     if (!sys || !msg) return false;
     for (;;) {
         if (hs_send_enqueue(sys, msg, data, len)) return true;
+        if (g_tls_in_step == sys) return false;
         HSChannel ch = (HSChannel)msg->channel;
         bool block = (ch != CHAN_TELEM) && (sys->block_on_full || (ch < CHAN_COUNT && sys->block_on_full_chan[(u32)ch]));
         if (!block) return false;
@@ -1197,6 +1253,7 @@ u32 hs_step(HSSystem* sys) {
     u32 processed = 0;
 
     g_tls_in_step = sys;
+    sys->inline_processed = 0;
 
     u32 prod_count = atomic_load_explicit(&sys->producer_count, memory_order_acquire);
     if (prod_count > HS_MAX_PRODUCERS) prod_count = HS_MAX_PRODUCERS;
@@ -1247,7 +1304,7 @@ u32 hs_step(HSSystem* sys) {
     for (u8 i = 0; i < sys->node_count; i++) {
         Node* node = sys->nodes[i];
         if (node->process_fn) {
-            processed += node->process_fn(node);
+            processed += (u32)hs_process_node(node);
         }
     }
     
@@ -1261,6 +1318,7 @@ u32 hs_step(HSSystem* sys) {
     }
     
     sys->tick++;
+    processed += sys->inline_processed;
     g_tls_in_step = NULL;
     hs_backpressure_wake(sys);
     hs_unlock(sys);
@@ -1288,8 +1346,16 @@ bool hs_has_overflow(HSSystem* sys) {
     return of;
 }
 
-bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
+static bool hs_replay_source(HSSystem* sys, Message* msgs, u32 count,
+                             const Payload* source, u32 source_capacity, bool journal) {
+    if (!sys || !msgs || count > UINT16_MAX + 1u) return false;
     hs_lock(sys);
+    if (journal) {
+        if (count > sys->log_head || sys->log_overflow) {
+            hs_unlock(sys);
+            return false;
+        }
+    }
     for (u8 i = 0; i < sys->node_count; i++) {
         Node* node = sys->nodes[i];
         if (node->reset_fn) {
@@ -1302,6 +1368,15 @@ bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
     
     for (u32 i = 0; i < count; i++) {
         Message msg = msgs[i];
+        if (source && msg.payload_len) {
+            u32 idx = journal ? i : msg.payload_idx;
+            if (idx >= source_capacity || msg.payload_len > HS_PAYLOAD_SIZE ||
+                !hs_payload_alloc_and_copy(sys, source[idx].data, msg.payload_len,
+                                           &msg.payload_idx, &msg.payload_len)) {
+                hs_unlock(sys);
+                return false;
+            }
+        }
         msg.tick = sys->tick;
 
         if (sys->validate_on_send) {
@@ -1318,7 +1393,7 @@ bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
             if (sys->nodes[j]->id == msg.to) {
                 hs_render_record(sys, &msg);
                 mq_push(&sys->nodes[j]->inbox, &msg);
-                sys->nodes[j]->process_fn(sys->nodes[j]);
+                hs_process_node(sys->nodes[j]);
                 found = true;
                 break;
             }
@@ -1332,6 +1407,13 @@ bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
     }
     hs_unlock(sys);
     return true;
+}
+
+bool hs_replay(HSSystem* sys, Message* msgs, u32 count) {
+    if (!sys) return false;
+    bool journal = msgs == sys->log;
+    return hs_replay_source(sys, msgs, count, journal ? sys->log_payloads : NULL,
+                            journal ? sys->log_capacity : 0, journal);
 }
 
 void hs_clear(HSSystem* sys) {
@@ -1436,12 +1518,11 @@ const char* hs_op_name(OpCode op) {
         case OP_SET_RECORD_MASK: return "SET_RECORD_MASK";
         case OP_SET_CHAN_BUDGET: return "SET_CHAN_BUDGET";
         case OP_SET_BLOCK_POLICY: return "SET_BLOCK_POLICY";
-        case OP_ML_LOAD:       return "ML_LOAD";
-        case OP_ML_UNLOAD:     return "ML_UNLOAD";
-        case OP_ML_FORWARD:    return "ML_FORWARD";
-        case OP_ML_GENERATE:   return "ML_GENERATE";
-        case OP_ML_TOKENIZE:   return "ML_TOKENIZE";
-        case OP_ML_DETOKENIZE: return "ML_DETOKENIZE";
+        case OP_INPUT_KEY:     return "INPUT_KEY";
+        case OP_INPUT_MOUSE:   return "INPUT_MOUSE";
+        case OP_INPUT_GAMEPAD: return "INPUT_GAMEPAD";
+        case OP_INPUT_DEVICE_ADD: return "INPUT_DEVICE_ADD";
+        case OP_INPUT_DEVICE_REMOVE: return "INPUT_DEVICE_REMOVE";
         case OP_COUNT:         return "COUNT";
     }
     return "UNKNOWN";

@@ -40,7 +40,7 @@ its own direction:
 | Language | Haxe / HScript | C (header-oriented) |
 | Target | WebGL, HashLink | Raspberry Pi 4 V3D (bare-metal DRM/GBM) |
 | Architecture | GPU runtime | message-native runtime substrate |
-| Compute | graphics + audio | graphics + tooling/IPC + experimental ML (BitNet) |
+| Compute | graphics + audio | graphics + tooling/IPC |
 | Optimization | cross-target VM | native ARM/NEON, Cortex-A72 |
 
 The architectures have diverged substantially. That is a measure of how far a

@@ -27,7 +27,7 @@ static inline void hs_storage_init(HSStorage* store) {
 }
 
 static inline HSStorageSlot* hs_storage_load(HSStorage* store, const char* name) {
-    if (!store->initialized) return NULL;
+    if (!store || !name || !store->initialized) return NULL;
     
     for (int i = 0; i < HS_STORAGE_SLOTS; i++) {
         if (store->slots[i].loaded && 
@@ -65,7 +65,7 @@ static inline void hs_storage_set_u8(HSStorage* store, const char* name, u32 off
 
 static inline f32 hs_storage_get_f32(HSStorage* store, const char* name, u32 offset) {
     HSStorageSlot* slot = hs_storage_load(store, name);
-    if (!slot || offset + 4 > HS_STORAGE_SIZE) return 0.0f;
+    if (!slot || offset > HS_STORAGE_SIZE - sizeof(f32)) return 0.0f;
     f32 val;
     memcpy(&val, slot->data + offset, 4);
     return val;
@@ -73,7 +73,7 @@ static inline f32 hs_storage_get_f32(HSStorage* store, const char* name, u32 off
 
 static inline void hs_storage_set_f32(HSStorage* store, const char* name, u32 offset, f32 value) {
     HSStorageSlot* slot = hs_storage_load(store, name);
-    if (!slot || offset + 4 > HS_STORAGE_SIZE) return;
+    if (!slot || offset > HS_STORAGE_SIZE - sizeof(f32)) return;
     memcpy(slot->data + offset, &value, 4);
     slot->dirty = 1;
 }

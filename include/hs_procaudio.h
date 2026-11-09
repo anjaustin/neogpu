@@ -49,12 +49,12 @@ typedef struct {
     int write_pos;
 } ProcAudio;
 
-static void proc_audio_init(ProcAudio* audio) {
+static inline void proc_audio_init(ProcAudio* audio) {
     memset(audio, 0, sizeof(*audio));
     audio->sample_rate = (f32)HS_PROC_AUDIO_SAMPLE_RATE;
 }
 
-static void proc_audio_voice_on(ProcAudio* audio, int ch, f32 freq, WaveType wave) {
+static inline void proc_audio_voice_on(ProcAudio* audio, int ch, f32 freq, WaveType wave) {
     if (ch < 0 || ch >= HS_PROC_MAX_CHANNELS) return;
     
     Voice* v = &audio->voices[ch];
@@ -71,12 +71,12 @@ static void proc_audio_voice_on(ProcAudio* audio, int ch, f32 freq, WaveType wav
     v->envelope_stage = 1; // Start with attack
 }
 
-static void proc_audio_voice_off(ProcAudio* audio, int ch) {
+static inline void proc_audio_voice_off(ProcAudio* audio, int ch) {
     if (ch < 0 || ch >= HS_PROC_MAX_CHANNELS) return;
     audio->voices[ch].envelope_stage = 4; // Release
 }
 
-static f32 proc_audio_sample(Voice* v, f32 t) {
+static inline f32 proc_audio_sample(Voice* v, f32 t) {
     f32 phase = v->phase + t * v->frequency / 48000.0f;
     
     switch (v->wave) {
@@ -99,7 +99,7 @@ static f32 proc_audio_sample(Voice* v, f32 t) {
     return 0.0f;
 }
 
-static void proc_audio_tick(Voice* v) {
+static inline void proc_audio_tick(Voice* v) {
     switch (v->envelope_stage) {
         case 1: // Attack
             v->envelope += v->target_volume / (v->attack * 48000.0f);
@@ -127,7 +127,7 @@ static void proc_audio_tick(Voice* v) {
     }
 }
 
-static f32* proc_audio_render(ProcAudio* audio, int samples) {
+static inline f32* proc_audio_render(ProcAudio* audio, int samples) {
     for (int i = 0; i < samples && i < HS_PROC_AUDIO_BUFFER_SIZE; i++) {
         f32 sample = 0.0f;
         
@@ -149,12 +149,12 @@ static f32* proc_audio_render(ProcAudio* audio, int samples) {
     return audio->buffer;
 }
 
-static f32 note_to_freq(int note) {
+static inline f32 note_to_freq(int note) {
     // MIDI note to frequency
     return 440.0f * powf(2.0f, (note - 69) / 12.0f);
 }
 
-static void proc_audio_play_note(ProcAudio* audio, int ch, int note, WaveType wave) {
+static inline void proc_audio_play_note(ProcAudio* audio, int ch, int note, WaveType wave) {
     proc_audio_voice_on(audio, ch, note_to_freq(note), wave);
 }
 

@@ -66,21 +66,21 @@ static u32 g_prng_state = 12345;
 #define FMIN(a,b) ((a)<(b)?(a):(b))
 #endif
 
-static u32 prng_next(void) {
+static inline u32 prng_next(void) {
     g_prng_state = g_prng_state * 1103515245 + 12345;
     return (g_prng_state >> 16) & 0x7FFF;
 }
 
-static void prng_seed(u32 seed) {
+static inline void prng_seed(u32 seed) {
     g_prng_state = seed;
 }
 
-static f32 noise2D(f32 x, f32 y, u32 seed) {
+static inline f32 noise2D(f32 x, f32 y, u32 seed) {
     f32 n = sinf(x * 12.9898f + y * 78.233f + seed * 43758.5453f);
     return n - floorf(n);
 }
 
-static f32 fbm(f32 x, f32 y, u32 seed, int octaves) {
+static inline f32 fbm(f32 x, f32 y, u32 seed, int octaves) {
     f32 val = 0.0f;
     f32 amp = 1.0f;
     f32 freq = 1.0f;
@@ -92,32 +92,32 @@ static f32 fbm(f32 x, f32 y, u32 seed, int octaves) {
     return val;
 }
 
-static void proc_tex_init(ProcTexture* tex, u8 w, u8 h) {
+static inline void proc_tex_init(ProcTexture* tex, u8 w, u8 h) {
     memset(tex, 0, sizeof(*tex));
     tex->width = w;
     tex->height = h;
 }
 
-static void proc_tex_add_layer(ProcTexture* tex) {
+static inline void proc_tex_add_layer(ProcTexture* tex) {
     if (tex->num_layers < HS_PROC_MAX_LAYERS) {
         tex->num_layers++;
     }
 }
 
-static void proc_tex_layer_coverage(ProcTexture* tex, u8 layer, u8 coverage) {
+static inline void proc_tex_layer_coverage(ProcTexture* tex, u8 layer, u8 coverage) {
     if (layer < tex->num_layers) {
         tex->layers[layer].coverage = coverage;
     }
 }
 
-static void proc_tex_layer_color(ProcTexture* tex, u8 layer, u8 r, u8 g, u8 b, u8 a) {
+static inline void proc_tex_layer_color(ProcTexture* tex, u8 layer, u8 r, u8 g, u8 b, u8 a) {
     if (layer < tex->num_layers) {
         tex->layers[layer].has_color = 1;
         tex->layers[layer].color = ((r >> 4) << 12) | ((g >> 4) << 8) | ((b >> 4) << 4) | (a >> 4);
     }
 }
 
-static void proc_tex_layer_noise(ProcTexture* tex, u8 layer, f32 freq, f32 amp) {
+static inline void proc_tex_layer_noise(ProcTexture* tex, u8 layer, f32 freq, f32 amp) {
     if (layer < tex->num_layers) {
         tex->layers[layer].has_noise = 1;
         tex->layers[layer].noise_freq = freq;
@@ -125,7 +125,7 @@ static void proc_tex_layer_noise(ProcTexture* tex, u8 layer, f32 freq, f32 amp) 
     }
 }
 
-static void proc_tex_layer_bevel(ProcTexture* tex, u8 layer, f32 depth, f32 softness) {
+static inline void proc_tex_layer_bevel(ProcTexture* tex, u8 layer, f32 depth, f32 softness) {
     if (layer < tex->num_layers) {
         tex->layers[layer].has_bevel = 1;
         tex->layers[layer].bevel_depth = depth;
@@ -133,7 +133,7 @@ static void proc_tex_layer_bevel(ProcTexture* tex, u8 layer, f32 depth, f32 soft
     }
 }
 
-static void proc_tex_layer_rect(ProcTexture* tex, u8 layer, f32 x, f32 y, f32 w, f32 h) {
+static inline void proc_tex_layer_rect(ProcTexture* tex, u8 layer, f32 x, f32 y, f32 w, f32 h) {
     if (layer < tex->num_layers) {
         tex->layers[layer].rect_x = x;
         tex->layers[layer].rect_y = y;
@@ -142,13 +142,13 @@ static void proc_tex_layer_rect(ProcTexture* tex, u8 layer, f32 x, f32 y, f32 w,
     }
 }
 
-static void proc_tex_layer_emissive(ProcTexture* tex, u8 layer, u8 emissive) {
+static inline void proc_tex_layer_emissive(ProcTexture* tex, u8 layer, u8 emissive) {
     if (layer < tex->num_layers) {
         tex->layers[layer].is_emissive = emissive;
     }
 }
 
-static void proc_tex_generate(const ProcTexture* tex, u8* output) {
+static inline void proc_tex_generate(const ProcTexture* tex, u8* output) {
     u8 bg_r = 30, bg_g = 30, bg_b = 35;
     
     for (int y = 0; y < tex->height; y++) {
@@ -229,7 +229,7 @@ static void proc_tex_generate(const ProcTexture* tex, u8* output) {
     }
 }
 
-static void proc_tex_to_rgba8888(const ProcTexture* tex, u8* output) {
+static inline void proc_tex_to_rgba8888(const ProcTexture* tex, u8* output) {
     proc_tex_generate(tex, output);
 }
 

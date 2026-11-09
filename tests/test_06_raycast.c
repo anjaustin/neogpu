@@ -16,6 +16,7 @@
 #include <string.h>
 #include <time.h>
 #include "hs_graphics.h"
+#include "graphics_capture.h"
 
 static const char* vertex_shader_src = R"(
     attribute vec2 a_position;
@@ -301,6 +302,7 @@ int main(int argc, char** argv) {
                             1.0f, 1.0f, 0.0f, 1.0f);
         }
         
+        if (frame == 120 && test_capture_frame() != 0) return 1;
         hs_graphics_present(&gfx);
         
         if (frame % 30 == 0) {

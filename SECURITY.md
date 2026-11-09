@@ -9,8 +9,10 @@ the **IPC server**, which can listen on a TCP port:
 ./neogpu_demo --ipc-tcp 8765 --ipc-ms 5000
 ```
 
-The IPC protocol supports message submission, camera/buffer operations,
-record-mask and channel-budget control, and result queries. It is designed
+The IPC protocol allows stats/fabric queries, record-mask/channel-budget/block
+policy control, and fences. It does not accept arbitrary render, camera, or
+buffer messages. Accepted-client I/O has a 250ms deadline per header/body write
+or read, and shutdown cancels the active connection. It is designed
 for **trusted local use** — a developer tool on a bench or an embedded
 device.
 
@@ -36,6 +38,7 @@ If you are running the IPC server on a network you do not fully control:
 
 - **Bind to loopback** unless you specifically need remote access. The Unix
   socket mode (`--ipc-server`) is local by default and is the safer choice.
+  TCP CLI mode also defaults to `127.0.0.1`; `--ipc-bind` explicitly overrides it.
 - **Put it behind a VPN or SSH tunnel** rather than exposing the TCP port
   directly. The protocol is not designed to be exposed to an untrusted
   network.

@@ -40,6 +40,8 @@ typedef struct {
     pthread_t thread;
     HSInputSpscQueue* queue;
     _Atomic(uint64_t)* dropped_events;
+    void* owner;
+    bool thread_started;
 } HSEvdevDevice;
 
 typedef struct {
@@ -62,8 +64,13 @@ typedef struct {
     _Atomic(uint64_t) dropped_events;
 
     pthread_mutex_t queue_mutex;
+    pthread_mutex_t device_mutex;
     pthread_cond_t queue_not_empty;
     pthread_cond_t queue_not_full;
+    bool initialized;
+    bool process_started;
+    bool hotplug_started;
+    int hotplug_fd;
 } HSInputStream;
 
 void hs_input_spsc_init(HSInputSpscQueue* q);
@@ -79,6 +86,10 @@ void hs_input_stream_stop(HSInputStream* stream);
 void hs_input_stream_shutdown(HSInputStream* stream);
 
 void hs_input_stream_process_events(HSInputStream* stream);
+/* Multi-producer admission; also usable for synthetic events without evdev. */
+bool hs_input_stream_submit(HSInputStream* stream, const HSInputEvent* event);
+/* Snapshot is thread-local and valid until this thread's next get_state call.
+ * Lifecycle (init/start/stop/shutdown) is externally serialized. */
 const HSInput* hs_input_stream_get_state(const HSInputStream* stream);
 void hs_input_stream_swap_buffers(HSInputStream* stream);
 

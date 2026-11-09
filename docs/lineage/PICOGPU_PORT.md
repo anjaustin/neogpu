@@ -106,7 +106,7 @@ setChannel(channel:Int, shader:Int)  // channel 0-3, shader index
 // shader sets sound = sin(time * frequency)
 ```
 
-**Current**: `hs_ml_audio.c` exists - verify state
+**Current**: See `include/hs_audio.h` and `include/hs_procaudio.h` for audio support.
 
 **Required**:
 1. Extend SoundNode to support synthesis shaders

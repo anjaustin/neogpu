@@ -20,6 +20,7 @@
 #include <string.h>
 #include <time.h>
 #include "hs_graphics.h"
+#include "graphics_capture.h"
 
 static const char* vertex_shader_src = R"(
     attribute vec2 a_position;
@@ -363,6 +364,7 @@ int main(int argc, char** argv) {
                             1.0f, 1.0f, 0.0f, 1.0f);
         }
 
+        if (frame == 120 && test_capture_frame() != 0) return 1;
         hs_graphics_present(&gfx);
 
         if (frame % 30 == 0) {
@@ -377,5 +379,8 @@ int main(int argc, char** argv) {
     hs_graphics_finish(&gfx);
 
     printf("PASS: Ray cast orbit test\n");
+    printf("Measured frames: %d in %.6f seconds (%.3f display-path FPS)\n", frame,
+           (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9,
+           frame / ((now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9));
     return 0;
 }

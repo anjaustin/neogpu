@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <math.h>
 #include "hs_graphics.h"
+#include "graphics_capture.h"
 
 static const char* vertex_shader_src = R"(
     attribute vec2 a_position;
@@ -130,6 +131,7 @@ int main(int argc, char** argv) {
             glDrawArrays(GL_TRIANGLES, 0, SEGMENTS * 3);
         }
         
+        if (frame == 120 && test_capture_frame() != 0) return 1;
         hs_graphics_present(&gfx);
         usleep(50000);
     }

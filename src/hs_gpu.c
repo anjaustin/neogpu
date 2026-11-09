@@ -46,6 +46,15 @@ void hs_gpu_init(HSGpu* gpu) {
     hs_register(&gpu->system, &gpu->system_node);
 }
 
+void hs_gpu_shutdown(HSGpu* gpu) {
+    if (!gpu) return;
+    if (gpu->backend && gpu->backend->ops && gpu->backend->ops->shutdown)
+        gpu->backend->ops->shutdown(gpu->backend->ctx, gpu);
+    gpu->backend = NULL;
+    hs_memory_free(&gpu->memory);
+    hs_destroy(&gpu->system);
+}
+
 HSBuffer* hs_gpu_get_buffer(HSGpu* gpu, u8 bank) {
     return hs_memory_get_buffer(&gpu->memory, bank);
 }
@@ -53,7 +62,11 @@ HSBuffer* hs_gpu_get_buffer(HSGpu* gpu, u8 bank) {
 void hs_gpu_attach_backend(HSGpu* gpu, HSBackend* backend) {
     gpu->backend = backend;
     if (gpu->backend && gpu->backend->ops && gpu->backend->ops->init) {
-        (void)gpu->backend->ops->init(gpu->backend->ctx, gpu);
+        if (!gpu->backend->ops->init(gpu->backend->ctx, gpu)) {
+            fprintf(stderr, "Backend initialization failed\n");
+            if (gpu->backend->ops->shutdown) gpu->backend->ops->shutdown(gpu->backend->ctx, gpu);
+            gpu->backend = NULL;
+        }
     }
 }
 

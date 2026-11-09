@@ -4,6 +4,9 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
+#include <signal.h>
+#include <sched.h>
 #include "hs_gpu.h"
 #include "hs_msg.h"
 #include "hs_ipc.h"
@@ -22,6 +25,18 @@ static int tests_failed = 0;
     if (cond) { tests_passed++; printf("  [PASS] %s\n", name); } \
     else      { tests_failed++; printf("  [FAIL] %s\n", name); } \
 } while(0)
+
+static bool test_fixture(char* path) {
+    int fd = mkstemp(path);
+    if (fd < 0) return false;
+    return close(fd) == 0;
+}
+
+static double monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
 
 /* ============================================================
  * Tooling CLI
@@ -974,7 +989,8 @@ static void test_async_done(void) {
     hs_async_init(&async, NULL);
     hs_async_attach_system(&async, &gpu.system, NODE_SYSTEM);
 
-    const char* path = "/tmp/neogpu_async_test.bin";
+    char path[] = "tests/async-XXXXXX";
+    TEST("async_fixture", test_fixture(path));
     const char data[] = "abc";
     bool enq_ok = hs_async_save_file(&async, path, data, 3);
     TEST("async_enqueued", enq_ok);
@@ -1007,6 +1023,7 @@ static void test_async_done(void) {
     }
 
     hs_async_shutdown(&async);
+    unlink(path);
 }
 
 static void test_async_atomic_running(void) {
@@ -1016,12 +1033,15 @@ static void test_async_atomic_running(void) {
     hs_async_init(&async, NULL);
 
     /* start */
-    bool ok = hs_async_save_file(&async, "/tmp/neogpu_async_atomic.bin", "x", 1);
+    char path[] = "tests/async-atomic-XXXXXX";
+    TEST("async_atomic_fixture", test_fixture(path));
+    bool ok = hs_async_save_file(&async, path, "x", 1);
     TEST("async_start", ok);
 
     /* stop */
     hs_async_shutdown(&async);
     TEST("async_stop", true);
+    unlink(path);
 }
 
 /* ============================================================
@@ -1250,6 +1270,8 @@ static void test_redteam_overproducers(void) {
 typedef struct {
     HSSystem* sys;
     atomic_bool* stop;
+    atomic_bool* start;
+    atomic_uint* ready;
     u32 ok;
     u32 fail;
 } BenchArgs;
@@ -1257,6 +1279,8 @@ typedef struct {
 static void* bench_sender(void* arg) {
     BenchArgs* a = (BenchArgs*)arg;
     u32 i = 0;
+    atomic_fetch_add_explicit(a->ready, 1, memory_order_release);
+    while (!atomic_load_explicit(a->start, memory_order_acquire)) sched_yield();
     while (!atomic_load_explicit(a->stop, memory_order_acquire)) {
         Message m = {
             .to = NODE_SHADER,
@@ -1286,6 +1310,13 @@ static u64 ns_now(void) {
     return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
 }
 
+static u64 bench_applied;
+static int bench_process_shader(Node* node) {
+    int processed = shader_node_process(node);
+    bench_applied += (u64)processed;
+    return processed;
+}
+
 static void bench_producers(int threads, int ms) {
     static HSGpu gpu;
     static bool inited = false;
@@ -1294,6 +1325,8 @@ static void bench_producers(int threads, int ms) {
         inited = true;
     }
     hs_clear(&gpu.system);
+    gpu.shader_node.process_fn = bench_process_shader;
+    bench_applied = 0;
     gpu.system.validate_on_send = false;
     gpu.system.recording = false;
     gpu.system.render_list = NULL;
@@ -1305,16 +1338,29 @@ static void bench_producers(int threads, int ms) {
     pthread_t th[32];
     BenchArgs args[32];
     if (threads > 32) threads = 32;
+    atomic_bool start;
+    atomic_uint ready;
+    atomic_init(&start, false);
+    atomic_init(&ready, 0);
+    int created = 0;
 
     for (int i = 0; i < threads; i++) {
         args[i].sys = &gpu.system;
         args[i].stop = &stop;
+        args[i].start = &start;
+        args[i].ready = &ready;
         args[i].ok = 0;
         args[i].fail = 0;
-        pthread_create(&th[i], NULL, bench_sender, &args[i]);
+        if (pthread_create(&th[i], NULL, bench_sender, &args[i]) != 0) break;
+        created++;
     }
 
-    u64 end = ns_now() + (u64)ms * 1000000ull;
+    TEST("bench_threads_created", created == threads);
+    threads = created;
+    while (atomic_load_explicit(&ready, memory_order_acquire) < (u32)threads) sched_yield();
+    u64 begin = ns_now();
+    atomic_store_explicit(&start, true, memory_order_release);
+    u64 end = begin + (u64)ms * 1000000ull;
     while (ns_now() < end) {
         hs_step(&gpu.system);
     }
@@ -1328,6 +1374,7 @@ static void bench_producers(int threads, int ms) {
 
     /* Drain remaining */
     for (int i = 0; i < 1000; i++) hs_step(&gpu.system);
+    u64 elapsed_ns = ns_now() - begin;
 
     u64 ok = 0, fail = 0;
     for (int i = 0; i < threads; i++) {
@@ -1345,14 +1392,18 @@ static void bench_producers(int threads, int ms) {
     u32 submit_full = atomic_load_explicit(&gpu.system.submit_full[CHAN_RENDER], memory_order_relaxed);
     u32 prod_count = atomic_load_explicit(&gpu.system.producer_count, memory_order_relaxed);
 
-    double sec = (double)ms / 1000.0;
-    double mps = sec > 0.0 ? (double)ok / sec : 0.0;
+    double sec = (double)elapsed_ns / 1e9;
+    double mps = sec > 0.0 ? (double)bench_applied / sec : 0.0;
 
     printf("  %2d thr, %4d ms: %.0f msg/s (ok=%llu fail=%llu) spsc_ok=%u mpsc_ok=%u spsc_full=%u submit_full=%u prod=%u\n",
            threads, ms, mps, (unsigned long long)ok, (unsigned long long)fail,
            (unsigned)spsc_ok, (unsigned)mpsc_ok, (unsigned)spsc_full, (unsigned)submit_full, (unsigned)prod_count);
 
+    printf("    measured completion interval: %.6f ms (includes producer stop/join and drain)\n", elapsed_ns / 1e6);
+    printf("    measured applied messages: %llu of %llu admitted\n",
+           (unsigned long long)bench_applied, (unsigned long long)ok);
     TEST("bench_no_fail", fail == 0);
+    TEST("bench_all_applied", bench_applied == ok);
 }
 
 static void bench_comm_layer(void) {
@@ -1456,14 +1507,16 @@ static void test_gpu(void) {
     TEST("gpu_capture", cap_ok);
 
     /* Capture I/O */
-    const char* cap_path = "/tmp/neogpu_capture.bin";
-    bool cap_write_ok = hs_capture_write_file(&cap, cap_path);
+    char cap_path[] = "tests/capture-XXXXXX";
+    bool fixture_ok = test_fixture(cap_path);
+    TEST("capture_fixture", fixture_ok);
+    bool cap_write_ok = cap_ok && fixture_ok && hs_capture_write_file(&cap, cap_path);
     TEST("gpu_capture_write", cap_write_ok);
 
     static Message cap2_msgs[HS_MAX_MSG_LOG];
     static Payload cap2_payloads[HS_MAX_MSG_LOG];
-    HSCapture cap2;
-    bool cap_read_ok = hs_capture_read_file(&cap2, cap_path, cap2_msgs, cap2_payloads, HS_MAX_MSG_LOG);
+    HSCapture cap2 = {0};
+    bool cap_read_ok = cap_write_ok && hs_capture_read_file(&cap2, cap_path, cap2_msgs, cap2_payloads, HS_MAX_MSG_LOG);
     TEST("gpu_capture_read", cap_read_ok);
 
     /* Replay -- replay BEFORE clearing, so payload data is still valid */
@@ -1472,12 +1525,13 @@ static void test_gpu(void) {
     TEST("gpu_replay", replay_ok);
 
     /* Replay the self-contained capture */
-    bool cap_replay_ok = hs_capture_replay(&gpu.system, &cap);
+    bool cap_replay_ok = cap_ok && hs_capture_replay(&gpu.system, &cap);
     TEST("gpu_replay_capture", cap_replay_ok);
 
     /* Replay the capture loaded from disk */
-    bool cap2_replay_ok = hs_capture_replay(&gpu.system, &cap2);
+    bool cap2_replay_ok = cap_read_ok && hs_capture_replay(&gpu.system, &cap2);
     TEST("gpu_replay_capture_io", cap2_replay_ok);
+    unlink(cap_path);
 }
 
 /* ============================================================
@@ -1492,39 +1546,42 @@ static void benchmark_math(void) {
     mat4 m2 = m4_translation(1, 2, 3);
     mat4 m3 = m4_rotation_x(0.5f);
     
-    clock_t start = clock();
+    double start = monotonic_ms();
     for (int i = 0; i < 100000; i++) {
+        __asm__ volatile("" : "+m"(m1), "+m"(m2), "+m"(m3));
         mat4 r = m4_multiply(m1, m2);
         r = m4_multiply(r, m3);
-        (void)r;
+        __asm__ volatile("" : "+m"(r));
+        m1 = r;
     }
-    clock_t end = clock();
-    double ms = (end - start) * 1000.0 / CLOCKS_PER_SEC;
-    printf("  m4_multiply x100k: %.2f ms (%.0f ops/sec)\n", 
-           ms, 100000.0 / (ms / 1000.0));
+    double ms = monotonic_ms() - start;
+    printf("  m4_multiply x200k: %.6f ms, checksum=%.9g (includes observation barriers)\n",
+           ms, (double)vgetq_lane_f32(m1.val[0], 0));
     
     vec4 v1 = v4_make(1, 2, 3, 4);
     vec4 v2 = v4_make(5, 6, 7, 8);
     
-    start = clock();
+    start = monotonic_ms();
+    vec4 cross_result = v4_zero();
     for (int i = 0; i < 1000000; i++) {
-        vec4 r = v4_cross(v1, v2);
-        (void)r;
+        __asm__ volatile("" : "+m"(v1), "+m"(v2));
+        cross_result = v4_cross(v1, v2);
+        __asm__ volatile("" : "+m"(cross_result));
     }
-    end = clock();
-    ms = (end - start) * 1000.0 / CLOCKS_PER_SEC;
-    printf("  v4_cross x1M: %.2f ms (%.0f ops/sec)\n", 
-           ms, 1000000.0 / (ms / 1000.0));
+    ms = monotonic_ms() - start;
+    printf("  v4_cross x1M: %.6f ms, checksum=%.9g (includes observation barriers)\n",
+           ms, (double)vgetq_lane_f32(cross_result, 0));
     
-    start = clock();
+    start = monotonic_ms();
+    mat4 inverse = m4_identity();
     for (int i = 0; i < 100000; i++) {
-        mat4 r = m4_invert(m2);
-        (void)r;
+        __asm__ volatile("" : "+m"(m2));
+        inverse = m4_invert(m2);
+        __asm__ volatile("" : "+m"(inverse));
     }
-    end = clock();
-    ms = (end - start) * 1000.0 / CLOCKS_PER_SEC;
-    printf("  m4_invert x100k: %.2f ms (%.0f ops/sec)\n", 
-           ms, 100000.0 / (ms / 1000.0));
+    ms = monotonic_ms() - start;
+    printf("  m4_invert x100k: %.6f ms, checksum=%.9g (includes observation barriers)\n",
+           ms, (double)vgetq_lane_f32(inverse.val[3], 0));
 }
 
 static void benchmark_gpu(void) {
@@ -1533,7 +1590,7 @@ static void benchmark_gpu(void) {
     static HSGpu gpu;
     hs_gpu_init(&gpu);
     
-    clock_t start = clock();
+    double start = monotonic_ms();
     for (int frame = 0; frame < 1000; frame++) {
         hs_gpu_start_recording(&gpu);
         
@@ -1554,9 +1611,8 @@ static void benchmark_gpu(void) {
         hs_gpu_process(&gpu);
         hs_gpu_stop_recording(&gpu);
     }
-    clock_t end = clock();
-    double ms = (end - start) * 1000.0 / CLOCKS_PER_SEC;
-    printf("  1000 frames: %.2f ms (%.0f fps)\n", 
+    double ms = monotonic_ms() - start;
+    printf("  1000 message-only frames: %.6f ms (%.0f frames/sec; not display FPS)\n",
            ms, 1000.0 / (ms / 1000.0));
     
     /* Message count */
@@ -1569,26 +1625,25 @@ static void benchmark_buffer(void) {
     HSBuffer buf;
     hs_buffer_init(&buf, 0, 65536);
     
-    clock_t start = clock();
+    double start = monotonic_ms();
+    f32 checksum = 0;
     for (int i = 0; i < 100000; i++) {
         hs_buffer_set_f32(&buf, i & 0x3FFF, (float)i);
         float v = hs_buffer_get_f32(&buf, i & 0x3FFF);
-        (void)v;
+        checksum += v;
+        __asm__ volatile("" : "+m"(buf));
     }
-    clock_t end = clock();
-    double ms = (end - start) * 1000.0 / CLOCKS_PER_SEC;
-    printf("  buffer get/set x100k: %.2f ms (%.0f ops/sec)\n", 
-           ms, 100000.0 / (ms / 1000.0));
+    double ms = monotonic_ms() - start;
+    printf("  buffer get/set x100k: %.6f ms, checksum=%.9g\n", ms, (double)checksum);
     
     vec4 v = v4_make(1, 2, 3, 4);
-    start = clock();
+    start = monotonic_ms();
     for (int i = 0; i < 100000; i++) {
         hs_buffer_set_vec4(&buf, i & 0x3FFF, v);
+        __asm__ volatile("" : "+m"(buf));
     }
-    end = clock();
-    ms = (end - start) * 1000.0 / CLOCKS_PER_SEC;
-    printf("  buffer set_vec4 x100k: %.2f ms (%.0f ops/sec)\n", 
-           ms, 100000.0 / (ms / 1000.0));
+    ms = monotonic_ms() - start;
+    printf("  buffer set_vec4 x100k: %.6f ms, checksum=%.9g\n", ms, (double)hs_buffer_get_f32(&buf, 0));
     
     hs_buffer_free(&buf);
 }
@@ -1651,9 +1706,21 @@ static int ipc_connect(const char* path) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    size_t length = strlen(path);
+    if (length >= sizeof(addr.sun_path)) { close(fd); return -1; }
+    memcpy(addr.sun_path, path, length + 1);
     if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) { close(fd); return -1; }
     return fd;
+}
+
+static bool ipc_response(int fd, u32 cid, NgipHdr* header, NgipResp* response) {
+    u8 payload[HS_TOOLBUS_PAYLOAD_MAX];
+    if (ipc_read_full(fd, header, sizeof(*header)) ||
+        ipc_read_full(fd, response, sizeof(*response))) return false;
+    if (header->magic != 0x4E474950u || header->version != 1 || header->type != 2 ||
+        header->cid != cid || response->result_len > sizeof(payload) ||
+        header->len != sizeof(*response) + response->result_len) return false;
+    return ipc_read_full(fd, payload, response->result_len) == 0;
 }
 
 static void* stepper_thread(void* arg) {
@@ -1667,6 +1734,13 @@ static void* stepper_thread(void* arg) {
 }
 
 static void test_ipc(void) {
+    _Static_assert(OP_SET_BLOCK_POLICY == 42, "control opcode ABI changed");
+    _Static_assert(OP_INPUT_KEY == 49, "input opcode ABI changed");
+    _Static_assert(OP_INPUT_MOUSE == 50, "input opcode ABI changed");
+    _Static_assert(OP_INPUT_GAMEPAD == 51, "input opcode ABI changed");
+    _Static_assert(OP_INPUT_DEVICE_ADD == 52, "input opcode ABI changed");
+    _Static_assert(OP_INPUT_DEVICE_REMOVE == 53, "input opcode ABI changed");
+    _Static_assert(OP_COUNT == 54, "opcode ABI changed");
     printf("\n--- IPC Tests ---\n");
     signal(SIGPIPE, SIG_IGN);
 
@@ -1676,7 +1750,7 @@ static void test_ipc(void) {
     gpu.system.recording = false;
 
     char sock[128];
-    snprintf(sock, sizeof(sock), "/tmp/neogpu_ipc_test_%d.sock", (int)getpid());
+    snprintf(sock, sizeof(sock), "tests/ipc-%d.sock", (int)getpid());
 
     HSIpcServer srv;
     bool ok = hs_ipc_start(&srv, &gpu.system, sock);
@@ -1686,6 +1760,32 @@ static void test_ipc(void) {
     pthread_t th;
     pthread_create(&th, NULL, stepper_thread, &gpu.system);
     usleep(50000);
+
+    /* Retired wire values must not become valid operations after removal. */
+    for (u8 op = 43; op <= 48; op++) {
+        int retired_fd = ipc_connect(sock);
+        bool rejected = false;
+        if (retired_fd >= 0) {
+            struct timeval timeout = {.tv_sec = 2};
+            setsockopt(retired_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            NgipHdr h = {.magic = 0x4E474950u, .version = 1, .type = 1,
+                        .len = sizeof(NgipReq), .cid = op};
+            NgipReq r = {.op = op};
+            NgipHdr rh;
+            NgipResp rr;
+            rejected = ipc_write_full(retired_fd, &h, sizeof(h)) == 0 &&
+                       ipc_write_full(retired_fd, &r, sizeof(r)) == 0 &&
+                       ipc_read_full(retired_fd, &rh, sizeof(rh)) == 0 &&
+                       ipc_read_full(retired_fd, &rr, sizeof(rr)) == 0 &&
+                       rh.magic == h.magic && rh.version == 1 && rh.type == 2 &&
+                       rh.cid == op && rh.len == sizeof(rr) &&
+                       rr.status == 5 && rr.result_op == 0 && rr.result_len == 0;
+            close(retired_fd);
+        }
+        char label[48];
+        snprintf(label, sizeof(label), "ipc_retired_opcode_%u_rejected", op);
+        TEST(label, rejected);
+    }
 
     int fd = ipc_connect(sock);
     TEST("ipc_connect", fd >= 0);
@@ -1697,7 +1797,7 @@ static void test_ipc(void) {
 
         NgipHdr rh;
         NgipResp rr;
-        ok = (ipc_read_full(fd, &rh, sizeof(rh)) == 0 && ipc_read_full(fd, &rr, sizeof(rr)) == 0);
+        ok = ipc_response(fd, h.cid, &rh, &rr);
         TEST("ipc_query_recv", ok && rr.status == 0 && rr.result_len == 64);
 
         usleep(100000);  /* Let stepper thread warm up */
@@ -1714,7 +1814,7 @@ static void test_ipc(void) {
                 clock_gettime(CLOCK_MONOTONIC, &t0);
                 if (ipc_write_full(fd, &h, sizeof(h)) == 0 && ipc_write_full(fd, &r, sizeof(r)) == 0) {
                     clock_gettime(CLOCK_MONOTONIC, &t1);
-                    if (ipc_read_full(fd, &rh, sizeof(rh)) == 0 && ipc_read_full(fd, &rr, sizeof(rr)) == 0) {
+                    if (ipc_response(fd, h.cid, &rh, &rr)) {
                         clock_gettime(CLOCK_MONOTONIC, &t2);
                         if (rr.status == 0) good++;
                         send_ns += (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec);
@@ -1726,30 +1826,31 @@ static void test_ipc(void) {
             printf("  IPC latency (%d/%d req): send=%.2f ms, wait=%.2f ms, total=%.2f ms\n",
                    good, iterations, send_ns / 1000000.0, wait_ns / 1000000.0, total_ms);
             printf("  IPC throughput: %.0f req/sec\n", good * 1000.0 / (total_ms > 0 ? total_ms : 1));
+            TEST("ipc_latency_all_responses", good == iterations);
         }
 
         /* Quick benchmark: 100 queries */
         {
-            clock_t start = clock();
+            double start = monotonic_ms();
             int good = 0;
             for (int i = 0; i < 100; i++) {
                 h.cid = 1000 + i;
                 if (ipc_write_full(fd, &h, sizeof(h)) == 0 && ipc_write_full(fd, &r, sizeof(r)) == 0) {
-                    if (ipc_read_full(fd, &rh, sizeof(rh)) == 0 && ipc_read_full(fd, &rr, sizeof(rr)) == 0) {
+                    if (ipc_response(fd, h.cid, &rh, &rr)) {
                         if (rr.status == 0) good++;
                     }
                 }
             }
-            double ms = (double)(clock() - start) * 1000.0 / CLOCKS_PER_SEC;
+            double ms = monotonic_ms() - start;
             printf("  IPC: %d req in %.2f ms (%.0f req/sec)\n", good, ms, good * 1000.0 / ms);
+            TEST("ipc_queries_all_responses", good == 100);
         }
 
-        /* bad op - server closes connection, so this is expected to fail reading */
+        /* Unsupported operations must produce a correlated error response. */
         h.cid = 124; h.len = sizeof(NgipReq);
         r.op = OP_DRAW;
         ok = (ipc_write_full(fd, &h, sizeof(h)) == 0 && ipc_write_full(fd, &r, sizeof(r)) == 0);
-        /* Read may fail because server closes on bad op - this is OK per spec */
-        TEST("ipc_bad_op", ok);
+        TEST("ipc_bad_op", ok && ipc_response(fd, h.cid, &rh, &rr) && rr.status == 5 && rr.result_len == 0);
 
         /* Close this connection, open new one for flood test */
         close(fd);
@@ -1760,19 +1861,19 @@ static void test_ipc(void) {
         TEST("ipc_flood_connect", fd >= 0);
         if (fd >= 0) {
             h.cid = 100; h.len = sizeof(NgipReq); r.op = OP_QUERY_STATS;
-            clock_t start = clock();
+            double start = monotonic_ms();
             int good = 0, total = 30;
             for (int i = 0; i < total; i++) {
                 h.cid = 3000 + i;
                 if (ipc_write_full(fd, &h, sizeof(h)) == 0 && ipc_write_full(fd, &r, sizeof(r)) == 0) {
-                    if (ipc_read_full(fd, &rh, sizeof(rh)) == 0 && ipc_read_full(fd, &rr, sizeof(rr)) == 0) {
+                    if (ipc_response(fd, h.cid, &rh, &rr)) {
                         if (rr.status == 0) good++;
                     }
                 }
             }
-            double ms = (double)(clock() - start) * 1000.0 / CLOCKS_PER_SEC;
+            double ms = monotonic_ms() - start;
             printf("  IPC flood (%d req): %d ok, %.0f req/sec\n", total, good, total * 1000.0 / ms);
-            TEST("ipc_flood_no_crash", good > 0);
+            TEST("ipc_flood_all_responses", good == total);
             close(fd);
         }
     }
@@ -1784,13 +1885,85 @@ static void test_ipc(void) {
 /* ============================================================
  * Main
  * ============================================================ */
+static volatile sig_atomic_t server_stop;
+static void stop_server_signal(int signal_number) { (void)signal_number; server_stop = 1; }
+
+static bool parse_number(const char* text, unsigned long maximum, u32* out) {
+    if (!text || !text[0] || text[0] == '-') return false;
+    errno = 0;
+    char* end;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno || *end || value > maximum) return false;
+    *out = (u32)value;
+    return true;
+}
+
+static int run_server_mode(int argc, char** argv) {
+    const char* path = NULL;
+    const char* bind_address = "127.0.0.1";
+    u32 port = 0, duration = 5000;
+    for (int i = 1; i < argc; i++) {
+        const char* option = argv[i];
+        if (i + 1 >= argc) return 2;
+        if (strcmp(option, "--ipc-server") == 0) {
+            if (path || port) return 2;
+            path = argv[++i];
+        } else if (strcmp(option, "--ipc-tcp") == 0) {
+            if (path || port || !parse_number(argv[++i], 65535, &port) || !port) return 2;
+        } else if (strcmp(option, "--ipc-ms") == 0) {
+            if (!parse_number(argv[++i], UINT32_MAX, &duration) || !duration) return 2;
+        } else if (strcmp(option, "--ipc-bind") == 0) {
+            bind_address = argv[++i];
+        } else return 2;
+    }
+    if (!path && !port) return 2;
+    static HSGpu gpu;
+    hs_gpu_init(&gpu);
+    gpu.system.validate_on_send = true;
+    gpu.system.recording = false;
+    HSIpcServer server = {0};
+    bool started = path ? hs_ipc_start(&server, &gpu.system, path) :
+                         hs_ipc_start_tcp(&server, &gpu.system, bind_address, (u16)port);
+    if (!started) { fprintf(stderr, "IPC server startup failed\n"); return 1; }
+    signal(SIGINT, stop_server_signal);
+    signal(SIGTERM, stop_server_signal);
+    printf("IPC ready: %s\n", path ? path : bind_address);
+    double deadline = monotonic_ms() + duration;
+    while (!server_stop && monotonic_ms() < deadline) {
+        hs_step(&gpu.system);
+        usleep(100);
+    }
+    hs_ipc_stop(&server);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     setbuf(stdout, NULL);  /* Unbuffered stdout */
+    if (argc > 1 && (!strcmp(argv[1], "--ipc-server") || !strcmp(argv[1], "--ipc-tcp")))
+        return run_server_mode(argc, argv);
+    if (argc == 2 && !strcmp(argv[1], "--benchmark")) {
+        bench_comm_layer(); benchmark_math(); benchmark_buffer(); benchmark_gpu();
+        return tests_failed ? 1 : 0;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--benchmark-producers")) {
+        u32 producers;
+        if (!parse_number(argv[2], 32, &producers) || !producers) return 2;
+        bench_producers((int)producers, 2000);
+        return tests_failed ? 1 : 0;
+    }
+    if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+        printf("Usage: %s [--check | --benchmark | --tool ... | --ipc-server PATH | --ipc-tcp PORT]\n"
+               "IPC options: --ipc-ms MILLISECONDS (default 5000), --ipc-bind IPv4 (default 127.0.0.1)\n", argv[0]);
+        tool_usage(argv[0]);
+        return 0;
+    }
     for (int i = 1; i < argc; i++) {
         if (argv[i] && strcmp(argv[i], "--tool") == 0) {
             return run_tool_mode(argc, argv);
         }
     }
+    bool check_only = argc == 2 && !strcmp(argv[1], "--check");
+    if (argc > 1 && !check_only) { fprintf(stderr, "Unknown arguments; use --help\n"); return 2; }
     printf("=== HS-GPU NEON Test Suite ===\n");
 
     test_math();
@@ -1811,15 +1984,17 @@ int main(int argc, char** argv) {
     test_redteam_overproducers();
     test_gpu();
 
-    bench_comm_layer();
+    if (!check_only) bench_comm_layer();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);
 
     /* Benchmarks */
-    benchmark_math();
-    benchmark_buffer();
-    benchmark_gpu();
+    if (!check_only) {
+        benchmark_math();
+        benchmark_buffer();
+        benchmark_gpu();
+    }
 
     return tests_failed > 0 ? 1 : 0;
 }

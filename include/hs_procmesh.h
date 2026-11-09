@@ -37,11 +37,11 @@ typedef struct {
     u8 bone_count;
 } ProcMesh;
 
-static void proc_mesh_init(ProcMesh* m) {
+static inline void proc_mesh_init(ProcMesh* m) {
     memset(m, 0, sizeof(*m));
 }
 
-static void proc_mesh_add_vertex(ProcMesh* m, f32 x, f32 y, f32 z, f32 u, f32 v, u8 bone) {
+static inline void proc_mesh_add_vertex(ProcMesh* m, f32 x, f32 y, f32 z, f32 u, f32 v, u8 bone) {
     if (m->num_vertices >= HS_PROC_MAX_VERTICES) return;
     
     ProcVertex* vtx = &m->vertices[m->num_vertices++];
@@ -60,7 +60,7 @@ static void proc_mesh_add_vertex(ProcMesh* m, f32 x, f32 y, f32 z, f32 u, f32 v,
     if (bone >= m->bone_count) m->bone_count = bone + 1;
 }
 
-static void proc_mesh_add_quad(ProcMesh* m, f32 x, f32 y, f32 z, f32 w, f32 h, f32 u, f32 v, u8 bone) {
+static inline void proc_mesh_add_quad(ProcMesh* m, f32 x, f32 y, f32 z, f32 w, f32 h, f32 u, f32 v, u8 bone) {
     u16 base = (u16)m->num_vertices;
     
     proc_mesh_add_vertex(m, x,     y,     z, u,       v,       bone);
@@ -76,7 +76,7 @@ static void proc_mesh_add_quad(ProcMesh* m, f32 x, f32 y, f32 z, f32 w, f32 h, f
     m->indices[m->num_indices++] = base + 2;
 }
 
-static void proc_mesh_add_box(ProcMesh* m, f32 x, f32 y, f32 z, f32 w, f32 h, f32 d, u8 bone) {
+static inline void proc_mesh_add_box(ProcMesh* m, f32 x, f32 y, f32 z, f32 w, f32 h, f32 d, u8 bone) {
     // Front
     proc_mesh_add_quad(m, x, y, z+d, w, h, 0, 0, bone);
     // Back
@@ -91,7 +91,7 @@ static void proc_mesh_add_box(ProcMesh* m, f32 x, f32 y, f32 z, f32 w, f32 h, f3
     proc_mesh_add_quad(m, x, y, z, d, h, 0, 0, bone);
 }
 
-static void proc_mesh_add_sphere(ProcMesh* m, f32 cx, f32 cy, f32 cz, f32 r, int segs, u8 bone) {
+static inline void proc_mesh_add_sphere(ProcMesh* m, f32 cx, f32 cy, f32 cz, f32 r, int segs, u8 bone) {
     u16 base = (u16)m->num_vertices;
     
     for (int i = 0; i <= segs; i++) {
@@ -125,7 +125,7 @@ static void proc_mesh_add_sphere(ProcMesh* m, f32 cx, f32 cy, f32 cz, f32 r, int
     }
 }
 
-static void proc_mesh_mirror_x(ProcMesh* m) {
+static inline void proc_mesh_mirror_x(ProcMesh* m) {
     u16 base = (u16)m->num_vertices;
     u32 orig_count = m->num_vertices;
     
@@ -148,7 +148,7 @@ static void proc_mesh_mirror_x(ProcMesh* m) {
     }
 }
 
-static u32 proc_mesh_size_bytes(const ProcMesh* m) {
+static inline u32 proc_mesh_size_bytes(const ProcMesh* m) {
     return m->num_vertices * 4 + m->num_indices * 2;
 }
 

@@ -77,6 +77,8 @@ static GLuint create_program(const char* vs_src, const char* fs_src) {
 }
 
 int main(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
     printf("=== NeoGPU GLES Compute (Render-to-Texture) ===\n\n");
     
     int drm_fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);

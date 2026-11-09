@@ -61,6 +61,12 @@ make clean && make && make build-tests
 This exercises the message fabric, node handlers, IPC, thread safety,
 overflow handling, and the producer benchmark.
 
+The automated gate is `make test` (headless checks, P0 regressions, and real
+Unix/TCP CLI contracts). Run `make sanitize` and `make tsan` for memory/undefined
+behavior and race checks. `make check-sources` syntax-checks every C source;
+`make benchmark` measures performance separately. Privileged display and virtual
+evdev checks are opt-in with `sudo make test-hardware`.
+
 **If you touched the graphics path**, verify it on real hardware — the DRM /
 GBM backend cannot be meaningfully tested off-device:
 
@@ -68,19 +74,12 @@ GBM backend cannot be meaningfully tested off-device:
 sudo ./tests/test_08_raycast_orbit
 ```
 
-**If you touched the ML path**, the experimental build is separate and must
-build on its own:
-
-```bash
-make ml
-```
-
 ## Where things live
 
 | Path | What goes here |
 |------|----------------|
 | `include/` | Public headers. Inline helpers belong in headers. |
-| `src/` | Core runtime: graphics and the message substrate. No ML in the core build. |
+| `src/` | Core runtime: graphics and the message substrate. |
 | `tests/` | Test and benchmark programs. |
 | `tools/` | Standalone demos and utilities. |
 | `docs/` | Documentation. See [`docs/README.md`](docs/README.md). |
@@ -102,11 +101,9 @@ a source file.
 
 ## Scope
 
-The BitNet inference engine is **experimental** and deliberately separated
-from the core build. Contributions there are welcome, but the core runtime and
-the renderer are the project. Please don't let inference work pull inference
-dependencies back into the default build — the separation is enforced by
-`#ifdef HS_ENABLE_ML` and by separate object trees.
+NeoGPU focuses on the message-native runtime, renderer, input, capture/replay,
+and tooling. The former BitNet/ML experiment lives in a separate repository;
+model loaders, inference kernels, and ML demos do not belong in this tree.
 
 ## Reporting bugs
 

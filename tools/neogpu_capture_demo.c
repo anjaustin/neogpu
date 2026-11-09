@@ -104,7 +104,6 @@ int main(int argc, char** argv) {
     printf("Captured %d messages\n", log_count);
 
     Message* msgs = gpu.log_buffer;
-    Payload* payloads = gpu.payload_buffer;
     
     static Message cap_msgs[MAX_MSG_LOG];
     static Payload cap_payloads[MAX_MSG_LOG];

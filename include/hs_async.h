@@ -2,7 +2,7 @@
  * NeoGPU - Async Operations
  * 
  * Non-blocking operations via message queue.
- * File I/O, texture decoding, shader compilation run async.
+ * File saves run on a worker. Other operation kinds are reserved/unsupported.
  */
 
 #ifndef HS_ASYNC_H
@@ -42,6 +42,10 @@ typedef struct {
     u8           pending_count;
     u8           head;
     u8           tail;
+    u8           queued[HS_ASYNC_MAX_PENDING];
+    bool         initialized;
+    bool         worker_started;
+    bool         closing;
     u32          next_task_id;
     sem_t        sem;
     pthread_t    thread;
@@ -54,11 +58,14 @@ typedef struct {
 
 void hs_async_init(HSAsync* async, HSGraphics* gfx);
 void hs_async_shutdown(HSAsync* async);
+/* Init/shutdown are externally serialized. Shutdown drains accepted saves and
+ * releases uncollected completions. Concurrent save submissions are supported. */
 
 /* If attached, hs_async_process emits OP_ASYNC_DONE messages to notify_to. */
 void hs_async_attach_system(HSAsync* async, HSSystem* sys, u8 notify_to);
 
 bool hs_async_load_texture(HSAsync* async, u8 slot, const char* path);
+/* Texture decoding is unsupported; returns false with errno=ENOTSUP. */
 bool hs_async_save_file(HSAsync* async, const char* path, const void* data, u32 size);
 bool hs_async_process(HSAsync* async);
 

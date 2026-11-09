@@ -83,16 +83,8 @@ typedef enum {
     OP_SET_CHAN_BUDGET,
     OP_SET_BLOCK_POLICY,
     
-    /* ML inference */
-    OP_ML_LOAD,
-    OP_ML_UNLOAD,
-    OP_ML_FORWARD,
-    OP_ML_GENERATE,
-    OP_ML_TOKENIZE,
-    OP_ML_DETOKENIZE,
-    
-    /* Input */
-    OP_INPUT_KEY,
+    /* Input: values 43..48 are retired; preserve the capture/wire ABI. */
+    OP_INPUT_KEY = 49,
     OP_INPUT_MOUSE,
     OP_INPUT_GAMEPAD,
     OP_INPUT_DEVICE_ADD,
@@ -203,6 +195,7 @@ struct Node {
     void*          state;
     HSSystem*      sys;
     Node*          next;
+    bool           processing;
 };
 
 struct HSSystem {
@@ -211,11 +204,12 @@ struct HSSystem {
     u8          node_count;
     u32         tick;
     Message*    log;
+    Payload*    log_payloads; /* lazy owned journal, or caller-supplied slots */
     u32         log_head;
     u32         log_capacity;
     bool        recording;
     bool        validate_on_send; /* runtime opt-in validation in hs_send */
-    bool        block_on_full;    /* if true, hs_send waits instead of failing */
+    atomic_bool block_on_full;    /* if true, hs_send waits instead of failing */
     HSRenderList* render_list;
     Payload*    payloads;
     u32         payload_capacity;
@@ -255,7 +249,7 @@ struct HSSystem {
     HSSpscQueue producers[CHAN_COUNT][HS_MAX_PRODUCERS];
 
     /* Channel policies */
-    bool block_on_full_chan[CHAN_COUNT];
+    atomic_bool block_on_full_chan[CHAN_COUNT];
 
     pthread_mutex_t bp_lock;
     pthread_cond_t  bp_cv;
@@ -270,6 +264,8 @@ struct HSSystem {
     u32             toolbus_count;
     u32             toolbus_dropped;
     HSToolbusEntry  toolbus[HS_TOOLBUS_SIZE];
+    u32            inline_processed;
+    bool           owns_log_payloads;
 };
 
 static inline u32 hs_channel_bit(HSChannel ch) {
@@ -292,8 +288,12 @@ bool mq_empty(MessageQueue* q);
 u16  mq_count(MessageQueue* q);
 
 void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payload_buffer);
+/* Exclusive teardown: stop/join producers and services before calling. */
+void hs_destroy(HSSystem* sys);
 void hs_register(HSSystem* sys, Node* node);
 bool hs_send(HSSystem* sys, Message* msg);
+/* Bounded admission for external services: never waits for queue space. */
+bool hs_try_send(HSSystem* sys, Message* msg, const void* payload, u32 len);
 u32  hs_step(HSSystem* sys);
 
 /* Wake threads blocked in hs_send when block_on_full is enabled. */

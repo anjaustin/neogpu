@@ -1,8 +1,5 @@
 #include "hs_ipc.h"
 #include "hs_nodes.h"
-#ifdef HS_ENABLE_ML
-#include "hs_ml.h"   /* optional: ML tool-bus ops, enabled via `make ml` */
-#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -16,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <poll.h>
 
 enum {
     HS_IPC_MAGIC = 0x4E474950u, /* 'NGIP' */
@@ -59,210 +57,6 @@ typedef struct {
     /* result bytes follow */
 } __attribute__((packed)) HSIpcResp;
 
-#ifdef HS_ENABLE_ML
-/* P0-3: Thread-safe global ML state with mutex protection */
-static HSMLSystem g_ml_system;
-static bool g_ml_initialized = false;
-static pthread_mutex_t g_ml_mutex = PTHREAD_MUTEX_INITIALIZER;
-#endif
-
-/*
- * P0-1: Path validation for IPC file operations.
- * 
- * Security policy:
- * - Reject embedded null bytes
- * - Reject path traversal sequences (..)
- * - Reject absolute paths (starting with /)
- * - Reject paths with control characters
- * - Require .gguf extension for ML model files
- * 
- * Returns true if path is safe, false otherwise.
- */
-static bool hs_ipc_path_is_safe(const char* path, u32 len) {
-    if (!path || len == 0) return false;
-    
-    /* Reject absolute paths */
-    if (path[0] == '/') return false;
-    
-    /* Scan for dangerous patterns */
-    for (u32 i = 0; i < len; i++) {
-        char c = path[i];
-        
-        /* Reject embedded null bytes */
-        if (c == '\0') return false;
-        
-        /* Reject control characters (0x00-0x1F, 0x7F) */
-        if (c < 0x20 || c == 0x7F) return false;
-        
-        /* Check for path traversal: .. at start, end, or surrounded by / */
-        if (c == '.' && i + 1 < len && path[i + 1] == '.') {
-            /* .. at start of path */
-            if (i == 0) return false;
-            /* /.. pattern */
-            if (path[i - 1] == '/') return false;
-            /* ../ pattern at start */
-            if (i == 0 && i + 2 < len && path[i + 2] == '/') return false;
-        }
-    }
-    
-    /* Require .gguf extension for model files */
-    if (len < 5) return false;
-    const char* ext = path + len - 5;
-    if (ext[0] != '.' || ext[1] != 'g' || ext[2] != 'g' || ext[3] != 'u' || ext[4] != 'f') {
-        return false;
-    }
-    
-    return true;
-}
-
-#ifdef HS_ENABLE_ML
-static int hs_ipc_handle_ml_op(u8 op, const u8* payload, u32 payload_len, u8* out, u32* out_len) {
-    if (!out || !out_len) return -1;
-
-    /* P0-3: Lock mutex for all ML operations */
-    pthread_mutex_lock(&g_ml_mutex);
-
-    if (!g_ml_initialized) {
-        hs_ml_init(&g_ml_system);
-        g_ml_initialized = true;
-    }
-
-    switch ((OpCode)op) {
-        case OP_ML_LOAD: {
-            if (payload_len == 0 || payload_len > HS_PAYLOAD_SIZE) {
-                out[0] = 0;
-                *out_len = 1;
-                break;
-            }
-
-            char path[HS_PAYLOAD_SIZE + 1];
-            memcpy(path, payload, payload_len);
-            path[payload_len] = '\0';
-
-            /* P0-1: Validate path before file access */
-            if (!hs_ipc_path_is_safe(path, payload_len)) {
-                out[0] = 0;
-                *out_len = 1;
-                break;
-            }
-
-            out[0] = (hs_ml_load_gguf(&g_ml_system, path) == 0) ? 1 : 0;
-            *out_len = 1;
-            break;
-        }
-
-        case OP_ML_UNLOAD:
-            hs_ml_free(&g_ml_system);
-            g_ml_initialized = false;
-            out[0] = 1;
-            *out_len = 1;
-            break;
-
-        case OP_ML_FORWARD: {
-            if (payload_len < 8) {
-                out[0] = 0;
-                *out_len = 1;
-                break;
-            }
-
-            u32 seq_len = 0;
-            memcpy(&seq_len, payload, 4);
-            u32 available_tokens = (payload_len - 4) / (u32)sizeof(u32);
-            if (seq_len == 0 || seq_len > available_tokens || !g_ml_system.loaded || g_ml_system.vocab_size == 0) {
-                out[0] = 0;
-                *out_len = 1;
-                break;
-            }
-
-            float* logits = malloc(g_ml_system.vocab_size * sizeof(float));
-            if (!logits) {
-                out[0] = 0;
-                *out_len = 1;
-                break;
-            }
-
-            if (hs_ml_forward(&g_ml_system, (const u32*)(payload + 4), seq_len, logits) == 0) {
-                u32 max_logits = (HS_TOOLBUS_PAYLOAD_MAX - 1) / (u32)sizeof(float);
-                u32 copy_len = g_ml_system.vocab_size;
-                if (copy_len > max_logits) copy_len = max_logits;
-                out[0] = 1;
-                memcpy(out + 1, logits, (size_t)copy_len * sizeof(float));
-                *out_len = 1 + copy_len * (u32)sizeof(float);
-            } else {
-                out[0] = 0;
-                *out_len = 1;
-            }
-            free(logits);
-            break;
-        }
-
-        case OP_ML_GENERATE: {
-            if (payload_len < 16) {
-                out[0] = 0;
-                *out_len = 1;
-                break;
-            }
-
-            u32 prompt_len = 0;
-            u32 max_new = 0;
-            float temperature = 0.0f;
-            u32 top_k = 0;
-            memcpy(&prompt_len, payload, 4);
-            memcpy(&max_new, payload + 4, 4);
-            memcpy(&temperature, payload + 8, 4);
-            memcpy(&top_k, payload + 12, 4);
-
-            if (prompt_len > payload_len - 16 || !g_ml_system.loaded) {
-                out[0] = 0;
-                *out_len = 1;
-                break;
-            }
-            if (max_new > 256) max_new = 256;
-
-            char prompt[HS_PAYLOAD_SIZE - 16 + 1];
-            memcpy(prompt, payload + 16, prompt_len);
-            prompt[prompt_len] = '\0';
-
-            u32 output_cap = prompt_len + max_new + 1;
-            u32* output = malloc((size_t)output_cap * sizeof(u32));
-            if (!output) {
-                out[0] = 0;
-                *out_len = 1;
-                break;
-            }
-
-            u32 num_gen = hs_ml_generate(&g_ml_system, prompt, max_new, temperature, top_k, output);
-            if (num_gen == 0 && max_new != 0) {
-                out[0] = 0;
-                *out_len = 1;
-                free(output);
-                break;
-            }
-
-            u32 max_tokens = (HS_TOOLBUS_PAYLOAD_MAX - 5) / (u32)sizeof(u32);
-            u32 copy_len = num_gen;
-            if (copy_len > max_tokens) copy_len = max_tokens;
-            out[0] = 1;
-            memcpy(out + 1, &num_gen, 4);
-            memcpy(out + 5, output, (size_t)copy_len * sizeof(u32));
-            *out_len = 5 + copy_len * (u32)sizeof(u32);
-            free(output);
-            break;
-        }
-
-        default:
-            out[0] = 0;
-            *out_len = 1;
-            break;
-    }
-
-    /* P0-3: Unlock mutex */
-    pthread_mutex_unlock(&g_ml_mutex);
-
-    return 0;
-}
-#endif /* HS_ENABLE_ML */
-
 static bool hs_ipc_op_allowed(u8 op) {
     switch ((OpCode)op) {
         case OP_QUERY_STATS:
@@ -271,12 +65,6 @@ static bool hs_ipc_op_allowed(u8 op) {
         case OP_SET_CHAN_BUDGET:
         case OP_SET_BLOCK_POLICY:
         case OP_FENCE:
-        case OP_ML_LOAD:
-        case OP_ML_UNLOAD:
-        case OP_ML_FORWARD:
-        case OP_ML_GENERATE:
-        case OP_ML_TOKENIZE:
-        case OP_ML_DETOKENIZE:
             return true;
         default:
             return false;
@@ -291,16 +79,7 @@ static bool hs_ipc_payload_valid(u8 op, u32 payload_len) {
         case OP_QUERY_STATS:
         case OP_QUERY_FABRIC:
         case OP_FENCE:
-        case OP_ML_UNLOAD:
-        case OP_ML_TOKENIZE:
-        case OP_ML_DETOKENIZE:
             return payload_len == 0;
-        case OP_ML_LOAD:
-            return payload_len > 0 && payload_len <= HS_PAYLOAD_SIZE;
-        case OP_ML_FORWARD:
-            return payload_len >= 8 && payload_len <= HS_PAYLOAD_SIZE && ((payload_len - 4) % sizeof(u32) == 0);
-        case OP_ML_GENERATE:
-            return payload_len >= 16 && payload_len <= HS_PAYLOAD_SIZE;
         default:
             return false;
     }
@@ -309,10 +88,19 @@ static bool hs_ipc_payload_valid(u8 op, u32 payload_len) {
 static int hs_write_full(int fd, const void* buf, size_t len) {
     const u8* p = (const u8*)buf;
     size_t off = 0;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     while (off < len) {
-        ssize_t w = write(fd, p + off, len - off);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long remaining = 250 - ((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000);
+        if (remaining <= 0) return -1;
+        struct pollfd wait = {.fd = fd, .events = POLLOUT};
+        int ready = poll(&wait, 1, (int)remaining);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) return -1;
+        ssize_t w = send(fd, p + off, len - off, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (w < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             return -1;
         }
         if (w == 0) return -1;
@@ -324,10 +112,19 @@ static int hs_write_full(int fd, const void* buf, size_t len) {
 static int hs_read_full(int fd, void* buf, size_t len) {
     u8* p = (u8*)buf;
     size_t off = 0;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     while (off < len) {
-        ssize_t r = read(fd, p + off, len - off);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long remaining = 250 - ((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000);
+        if (remaining <= 0) return -1;
+        struct pollfd wait = {.fd = fd, .events = POLLIN};
+        int ready = poll(&wait, 1, (int)remaining);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) return -1;
+        ssize_t r = recv(fd, p + off, len - off, MSG_DONTWAIT);
         if (r < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             return -1;
         }
         if (r == 0) return -1;
@@ -381,44 +178,7 @@ static int hs_ipc_handle_req(HSIpcServer* srv, int cfd, const HSIpcHdr* hdr) {
         hs_ipc_send_error(cfd, hdr->cid, HS_IPC_ERR_BAD_LEN);
         return 0;
     }
-    
-#ifdef HS_ENABLE_ML
-    /* Handle ML ops directly without going through toolbus */
-    switch ((OpCode)req->op) {
-        case OP_ML_LOAD:
-        case OP_ML_UNLOAD:
-        case OP_ML_FORWARD:
-        case OP_ML_GENERATE: {
-            u8 ml_out[HS_TOOLBUS_PAYLOAD_MAX];
-            u32 ml_out_len = 0;
-            
-            hs_ipc_handle_ml_op(req->op, payload, req->payload_len, ml_out, &ml_out_len);
-            
-            HSIpcHdr rh = {
-                .magic = HS_IPC_MAGIC,
-                .version = HS_IPC_VERSION,
-                .type = HS_IPC_TYPE_RESP,
-                .len = (u32)(sizeof(HSIpcResp) + ml_out_len),
-                .cid = hdr->cid,
-            };
-            HSIpcResp rr = {
-                .status = HS_IPC_OK,
-                .result_op = req->op,
-                .result_len = ml_out_len,
-            };
-            
-            if (hs_write_full(cfd, &rh, sizeof(rh)) != 0) return -1;
-            if (hs_write_full(cfd, &rr, sizeof(rr)) != 0) return -1;
-            if (ml_out_len) {
-                if (hs_write_full(cfd, ml_out, ml_out_len) != 0) return -1;
-            }
-            return 0;
-        }
-        default:
-            break;  /* Continue with normal toolbus handling */
-    }
-#endif /* HS_ENABLE_ML */
-    
+
     HSSystem* sys = srv->sys;
     if (!sys) {
         hs_ipc_send_error(cfd, hdr->cid, HS_IPC_ERR_INTERNAL);
@@ -446,8 +206,7 @@ static int hs_ipc_handle_req(HSIpcServer* srv, int cfd, const HSIpcHdr* hdr) {
     }
 
     bool ok = false;
-    if (req->payload_len) ok = hs_send_with_payload(sys, &m, payload, req->payload_len);
-    else ok = hs_send(sys, &m);
+    ok = hs_try_send(sys, &m, req->payload_len ? payload : NULL, req->payload_len);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long send_us = (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000;
@@ -494,10 +253,53 @@ static void* hs_ipc_thread_main(void* arg) {
     HSIpcServer* srv = (HSIpcServer*)arg;
     if (!srv) return NULL;
 
+    int fd = srv->listen_fd;
+    atomic_store_explicit(&srv->running, true, memory_order_release);
+    while (!atomic_load_explicit(&srv->stop, memory_order_acquire)) {
+        struct pollfd wait = {.fd = fd, .events = POLLIN};
+        int ready = poll(&wait, 1, 100);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) break;
+        if (ready == 0) continue;
+        int client = accept(fd, NULL, NULL);
+        if (client < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            break;
+        }
+        if (srv->mode == HS_IPC_MODE_TCP) {
+            int enabled = 1;
+            setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+        }
+        pthread_mutex_lock(&srv->connection_lock);
+        srv->client_fd = client;
+        bool stopping = atomic_load_explicit(&srv->stop, memory_order_acquire);
+        pthread_mutex_unlock(&srv->connection_lock);
+        while (!stopping && !atomic_load_explicit(&srv->stop, memory_order_acquire)) {
+            HSIpcHdr h;
+            if (hs_read_full(client, &h, sizeof(h)) != 0) break;
+            u32 error = h.magic != HS_IPC_MAGIC ? HS_IPC_ERR_BAD_MAGIC :
+                        h.version != HS_IPC_VERSION ? HS_IPC_ERR_BAD_VERSION :
+                        h.type != HS_IPC_TYPE_REQ ? HS_IPC_ERR_BAD_TYPE : 0;
+            if (error) {
+                hs_ipc_send_error(client, h.cid, error);
+                break;
+            }
+            if (hs_ipc_handle_req(srv, client, &h) != 0) break;
+        }
+        pthread_mutex_lock(&srv->connection_lock);
+        srv->client_fd = -1;
+        close(client);
+        pthread_mutex_unlock(&srv->connection_lock);
+    }
+    atomic_store_explicit(&srv->running, false, memory_order_release);
+    return NULL;
+}
+
+static bool hs_ipc_start_common(HSIpcServer* srv) {
     int fd;
     if (srv->mode == HS_IPC_MODE_TCP) {
         fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) return NULL;
+        if (fd < 0) return false;
         srv->listen_fd = fd;
 
         int opt = 1;
@@ -510,23 +312,27 @@ static void* hs_ipc_thread_main(void* arg) {
         if (!srv->addr[0] || strcmp(srv->addr, "0.0.0.0") == 0) {
             tcp_addr.sin_addr.s_addr = INADDR_ANY;
         } else {
-            inet_pton(AF_INET, srv->addr, &tcp_addr.sin_addr);
+            if (inet_pton(AF_INET, srv->addr, &tcp_addr.sin_addr) != 1) {
+                close(fd);
+                srv->listen_fd = -1;
+                return false;
+            }
         }
 
         if (bind(fd, (struct sockaddr*)&tcp_addr, sizeof(tcp_addr)) != 0) {
             close(fd);
             srv->listen_fd = -1;
-            return NULL;
+            return false;
         }
 
         if (listen(fd, 4) != 0) {
             close(fd);
             srv->listen_fd = -1;
-            return NULL;
+            return false;
         }
     } else {
         fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (fd < 0) return NULL;
+        if (fd < 0) return false;
         srv->listen_fd = fd;
 
         struct sockaddr_un addr;
@@ -537,128 +343,91 @@ static void* hs_ipc_thread_main(void* arg) {
         memcpy(addr.sun_path, srv->path, pathlen);
         addr.sun_path[pathlen] = '\0';
 
-        (void)unlink(srv->path);
+        /* Never remove a caller's existing file/socket to claim its name. */
         if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
             close(fd);
             srv->listen_fd = -1;
-            return NULL;
+            return false;
         }
-        (void)chmod(srv->path, 0600);
+        if (chmod(srv->path, 0600) != 0) {
+            close(fd);
+            srv->listen_fd = -1;
+            unlink(srv->path);
+            return false;
+        }
         if (listen(fd, 4) != 0) {
             close(fd);
             srv->listen_fd = -1;
-            return NULL;
+            unlink(srv->path);
+            return false;
         }
     }
 
-    atomic_store_explicit(&srv->running, true, memory_order_release);
-
-    while (!atomic_load_explicit(&srv->stop, memory_order_acquire)) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 200000; /* 200ms */
-
-        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
-        if (rc < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (rc == 0) continue;
-        if (!FD_ISSET(fd, &rfds)) continue;
-
-        int cfd = accept(fd, NULL, NULL);
-        if (cfd < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-
-        /* single connection, sequential request/response */
-        for (;;) {
-            HSIpcHdr h;
-            if (hs_read_full(cfd, &h, sizeof(h)) != 0) break;
-
-            if (h.magic != HS_IPC_MAGIC) {
-                hs_ipc_send_error(cfd, h.cid, HS_IPC_ERR_BAD_MAGIC);
-                break;
-            }
-            if (h.version != HS_IPC_VERSION) {
-                hs_ipc_send_error(cfd, h.cid, HS_IPC_ERR_BAD_VERSION);
-                break;
-            }
-            if (h.type != HS_IPC_TYPE_REQ) {
-                hs_ipc_send_error(cfd, h.cid, HS_IPC_ERR_BAD_TYPE);
-                break;
-            }
-
-            if (hs_ipc_handle_req(srv, cfd, &h) != 0) break;
-        }
-
-        close(cfd);
+    if (pthread_mutex_init(&srv->connection_lock, NULL) != 0) {
+        close(fd);
+        srv->listen_fd = -1;
+        if (srv->mode == HS_IPC_MODE_UNIX) unlink(srv->path);
+        return false;
     }
-
-    close(fd);
-    srv->listen_fd = -1;
-    if (srv->mode == HS_IPC_MODE_UNIX) {
-        (void)unlink(srv->path);
+    srv->lock_inited = true;
+    if (pthread_create(&srv->thread, NULL, hs_ipc_thread_main, srv) != 0) {
+        close(fd);
+        srv->listen_fd = -1;
+        if (srv->mode == HS_IPC_MODE_UNIX) unlink(srv->path);
+        pthread_mutex_destroy(&srv->connection_lock);
+        srv->lock_inited = false;
+        return false;
     }
-    atomic_store_explicit(&srv->running, false, memory_order_release);
-    return NULL;
+    srv->thread_started = true;
+    return true;
 }
 
 bool hs_ipc_start(HSIpcServer* srv, HSSystem* sys, const char* path) {
-    if (!srv || !sys || !path) return false;
+    if (!srv) return false;
     memset(srv, 0, sizeof(*srv));
     srv->sys = sys;
     srv->mode = HS_IPC_MODE_UNIX;
     srv->listen_fd = -1;
+    srv->client_fd = -1;
     atomic_init(&srv->running, false);
     atomic_init(&srv->stop, false);
+    if (!sys || !path || !path[0] || strlen(path) >= sizeof(srv->path)) return false;
     strncpy(srv->path, path, sizeof(srv->path) - 1);
 
-    int rc = pthread_create(&srv->thread, NULL, hs_ipc_thread_main, srv);
-    if (rc != 0) return false;
-
-    /* wait briefly for running */
-    for (int i = 0; i < 50; i++) {
-        if (atomic_load_explicit(&srv->running, memory_order_acquire)) return true;
-        usleep(1000);
-    }
-    return atomic_load_explicit(&srv->running, memory_order_acquire);
+    return hs_ipc_start_common(srv);
 }
 
 bool hs_ipc_start_tcp(HSIpcServer* srv, HSSystem* sys, const char* addr, u16 port) {
-    if (!srv || !sys) return false;
+    if (!srv) return false;
     memset(srv, 0, sizeof(*srv));
     srv->sys = sys;
     srv->mode = HS_IPC_MODE_TCP;
     srv->port = port ? port : HS_IPC_DEFAULT_PORT;
-    if (addr) strncpy(srv->addr, addr, sizeof(srv->addr) - 1);
     srv->listen_fd = -1;
+    srv->client_fd = -1;
     atomic_init(&srv->running, false);
     atomic_init(&srv->stop, false);
+    if (!sys || (addr && strlen(addr) >= sizeof(srv->addr))) return false;
+    if (addr) memcpy(srv->addr, addr, strlen(addr) + 1);
 
-    int rc = pthread_create(&srv->thread, NULL, hs_ipc_thread_main, srv);
-    if (rc != 0) return false;
-
-    /* wait briefly for running */
-    for (int i = 0; i < 50; i++) {
-        if (atomic_load_explicit(&srv->running, memory_order_acquire)) return true;
-        usleep(1000);
-    }
-    return atomic_load_explicit(&srv->running, memory_order_acquire);
+    return hs_ipc_start_common(srv);
 }
 
 void hs_ipc_stop(HSIpcServer* srv) {
-    if (!srv) return;
+    if (!srv || !srv->thread_started) return;
     atomic_store_explicit(&srv->stop, true, memory_order_release);
+    pthread_mutex_lock(&srv->connection_lock);
+    if (srv->client_fd >= 0) shutdown(srv->client_fd, SHUT_RDWR);
     if (srv->listen_fd >= 0) {
         shutdown(srv->listen_fd, SHUT_RDWR);
     }
-    if (atomic_load_explicit(&srv->running, memory_order_acquire)) {
-        pthread_join(srv->thread, NULL);
-    }
+    pthread_mutex_unlock(&srv->connection_lock);
+    pthread_join(srv->thread, NULL);
+    srv->thread_started = false;
+    close(srv->listen_fd);
+    srv->listen_fd = -1;
+    if (srv->mode == HS_IPC_MODE_UNIX) unlink(srv->path);
+    pthread_mutex_destroy(&srv->connection_lock);
+    srv->lock_inited = false;
     atomic_store_explicit(&srv->running, false, memory_order_release);
 }

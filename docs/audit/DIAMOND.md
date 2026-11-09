@@ -1,5 +1,9 @@
 # NeoGPU Audit
 
+> Historical audit, written before the ML experiment moved out of NeoGPU.
+> References to inference code and benchmarks describe the former tree, not
+> the current runtime.
+
 ## What is Novel
 
 ### 1. Message-Native GPU Architecture

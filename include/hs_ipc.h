@@ -15,6 +15,10 @@ typedef struct {
     HSSystem* sys;
     pthread_t thread;
     int listen_fd;
+    int client_fd;
+    pthread_mutex_t connection_lock;
+    bool thread_started;
+    bool lock_inited;
     atomic_bool running;
     atomic_bool stop;
     HSIpcMode mode;
@@ -24,6 +28,8 @@ typedef struct {
 } HSIpcServer;
 
 bool hs_ipc_start(HSIpcServer* srv, HSSystem* sys, const char* path);
+/* Start initializes storage, including on failure. Never restart a live server;
+ * start/stop calls are externally serialized; stop is idempotent after start. */
 bool hs_ipc_start_tcp(HSIpcServer* srv, HSSystem* sys, const char* addr, u16 port);
 void hs_ipc_stop(HSIpcServer* srv);
 

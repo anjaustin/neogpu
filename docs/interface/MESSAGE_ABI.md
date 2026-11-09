@@ -19,9 +19,11 @@ The goal is to make the existing implicit ABI explicit so it can be validated, c
 
 ## Payload Storage
 
-- Payload bytes live in `HSSystem.payloads` as fixed-size 64B blocks (`HS_PAYLOAD_SIZE`).
+- Payload bytes live in `HSSystem.payloads` as fixed-size 96-byte data blocks (`HS_PAYLOAD_SIZE`).
 - For payload-bearing ops, `payload_idx` is an index into the payload ring.
-- Payloads larger than 64B are currently truncated by send helpers.
+- Payloads larger than 96 bytes are truncated by legacy send helpers; bounded
+  `hs_try_send()` rejects them. `Payload` has 64-byte alignment and a 128-byte
+  struct size on the supported aarch64 ABI; alignment padding is not payload data.
 
 Implementation notes:
 
@@ -47,6 +49,10 @@ Current node ids (see `include/hs_nodes.h`):
 - `NODE_SYSTEM` (6) (reserved for system ops)
 
 ## Opcode Table
+
+Opcode values 43 through 48 are retired and must not be reused. Input opcodes
+remain at 49 through 53, preserving existing capture and wire values. IPC
+requests using retired opcodes return `HS_IPC_ERR_UNSUPPORTED_OP` (status 5).
 
 In the table below, "Immediate" means the opcode uses `payload_idx` as its argument and has `payload_len = 0`.
 
@@ -86,8 +92,8 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
   - Immediate: `payload_idx = buffer_index`
 - `OP_DRAW` (Immediate)
   - Immediate: `payload_idx = buffer_index`
-- `OP_DRAW_INSTANCE` (Payload, 4B)
-  - Payload layout: `[u8 buffer][u8 instance_buffer][u8 count_lo][u8 count_hi]`
+- `OP_DRAW_INSTANCE` (Payload, 8B)
+  - Payload layout: `[u8 buffer][u8 instance_buffer][u16 reserved][u32 count]`
 - `OP_DRAW_TEXT` (Payload, 1..64B)
   - Payload layout: C string, null-terminated, truncated to fit 64B.
 
@@ -147,7 +153,7 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
 
 - `OP_QUERY_FABRIC` (Immediate)
   - Emits `OP_RESULT` with `flags = OP_QUERY_FABRIC`
-  - Payload (64B): packed fabric counters; see `hs_pack_result_fabric()` / `hs_unpack_result_fabric()` in `include/hs_msg.h`
+  - Payload (96B): packed fabric counters; see `hs_pack_result_fabric()` / `hs_unpack_result_fabric()` in `include/hs_msg.h`
   - Channel: treated as `CHAN_RT` (forced)
 
 - `OP_SET_RECORD_MASK` (Payload, 4B)

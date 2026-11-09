@@ -4,12 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../LICENSE)
 [![Language: C](https://img.shields.io/badge/language-C%20%7C%20Make-blue.svg)](https://en.wikipedia.org/wiki/C_(programming_language))
 
-**A message-native runtime substrate for ARM/NEON — graphics, tooling, and
-experimental inference on the Raspberry Pi 4.**
+**A message-native runtime substrate for ARM/NEON — graphics and tooling
+on the Raspberry Pi 4.**
 
-Every operation is a message. Render commands, IPC requests, and inference ops
-all travel the same lock-free channels, so one fabric carries the whole
-system.
+Every operation is a message. Render commands and IPC requests travel the same
+lock-free channels, so one fabric carries the whole system.
 
 ```c
 HSGpu gpu;
@@ -42,13 +41,16 @@ Measured on a Raspberry Pi 4 (Cortex-A72, 800x480 DSI).
 
 | Metric | Value |
 |--------|-------|
-| **Message layer throughput** | **12,780,000 msg/s** (2 producers) |
-| Message layer (1–16 producers) | 6.36M – 12.78M msg/s |
-| GPU frames | ~414K fps |
-| NEON math | ~14B ops/sec |
-| IPC throughput | ~4,700 req/sec |
+| Applied message throughput | Three-run medians: 6,569,234–7,382,018 msg/s across 1/2/4/8/16 producers |
+| Unix CLI | 100/100 responses; three-run median 39.605 ms total |
+| TCP CLI | 100/100 responses; three-run median 48.781 ms total |
 
-Reproduce the headline number with `make && ./neogpu_demo` — the
+Verification, raw samples, and variability are recorded in
+[the P0 ledger](../docs/audit/P0_REMEDIATION.md). Old admission-only, math, and IPC
+headlines were withdrawn after finding message loss, eliminated work, and broken
+framing. Current producer benchmarks assert that every admitted message is applied.
+
+Measure with `make benchmark` — the
 `Comms Producer Benchmark` section prints throughput per producer count.
 
 ## What's here
@@ -60,10 +62,9 @@ Reproduce the headline number with `make && ./neogpu_demo` — the
 | Tooling / IPC (Unix socket + TCP) | Working |
 | Capture & replay (`HSCAP1`) | Working |
 | NEON math library | Working |
-| BitNet inference | **Experimental** — opt-in via `make ml`, off by default |
 
-The runtime and the renderer are the product; the inference engine is a
-contained experiment, deliberately kept out of the core build.
+The runtime and the renderer are the product. The former BitNet/ML experiment
+has moved to a separate repository and is no longer included here.
 
 ## Highlights
 
@@ -72,8 +73,6 @@ contained experiment, deliberately kept out of the core build.
   at **107 FPS**.
 - **Capture and replay come free** — because work is messages, a frame *is* a
   log. Captures are portable, inspectable, and replayable.
-- **Clean core/ML separation** — the core build compiles no inference sources
-  at all, enforced by `#ifdef HS_ENABLE_ML` and separate object trees.
 
 ## Documentation
 

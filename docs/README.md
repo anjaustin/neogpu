@@ -25,17 +25,6 @@ Wire-level contracts. These describe what actually travels between components.
 | [interface/MESSAGE_ABI.md](interface/MESSAGE_ABI.md) | Per-opcode schema and payload ranges |
 | [interface/CAPTURE_FORMAT.md](interface/CAPTURE_FORMAT.md) | `HSCAP1` capture file format |
 | [interface/INPUT_STREAM.md](interface/INPUT_STREAM.md) | Input streaming system: lock-free SPSC queue, evdev, hotplug |
-| [interface/ML_API.md](interface/ML_API.md) | Experimental ML inference API |
-| [interface/TERNARY_WEIGHT_FORMATS.md](interface/TERNARY_WEIGHT_FORMATS.md) | Ternary weight byte layouts, code mapping, and the two-stage lm_head format |
-
-## Research
-
-Conceptual work behind the implementation.
-
-| Doc | What it covers |
-|-----|----------------|
-| [research/GEOMETRIC_INFERENCE.md](research/GEOMETRIC_INFERENCE.md) | Neural networks as coordinate transforms |
-| [research/TERNARY_KERNEL_NOTES.md](research/TERNARY_KERNEL_NOTES.md) | Nibble-LUT ternary GEMM kernel notes |
 
 ## Benchmarks
 
@@ -45,8 +34,6 @@ hardware; see each document for its methodology.
 | Doc | What it covers |
 |-----|----------------|
 | [benchmarks/ATOMICS_PROFILE_2026-03-13.md](benchmarks/ATOMICS_PROFILE_2026-03-13.md) | Message-layer throughput profiling and red-teamed optimization log |
-| [benchmarks/GPU_BENCHMARK_RESULTS.md](benchmarks/GPU_BENCHMARK_RESULTS.md) | GPU-side GEMM benchmarks on the Pi 4 V3D |
-| [benchmarks/BITNET_FFN_ATOMICS.md](benchmarks/BITNET_FFN_ATOMICS.md) | BitNet feed-forward atomics analysis |
 
 ## Lineage
 
@@ -67,6 +54,8 @@ See [../CREDITS.md](../CREDITS.md) for the full acknowledgment.
 | Doc | What it covers |
 |-----|----------------|
 | [audit/DIAMOND.md](audit/DIAMOND.md) | Full self-audit: what is novel, useful, understated, and what was overstated |
+| [audit/TECHNICAL_DEBT_2026-11-11.md](audit/TECHNICAL_DEBT_2026-11-11.md) | Pre-remediation technical debt findings |
+| [audit/P0_REMEDIATION.md](audit/P0_REMEDIATION.md) | P0 fixes, acceptance evidence, measurements, and limitations |
 
 ## Archive
 
@@ -77,16 +66,7 @@ Nothing here reflects the current state of the code — see the
 | Directory | Contents |
 |-----------|----------|
 | [archive/lmm/](archive/lmm/) | LMM-style design explorations (raw / reflect / synthesize / nodes) |
-| [archive/lmm-theory/](archive/lmm-theory/) | LMM explorations of the geometric-inference theory |
 | [archive/journal/](archive/journal/) | Working notes and reflections kept during development |
 | [archive/REMEDIATION_PLAN.md](archive/REMEDIATION_PLAN.md) | Remediation plan (superseded) |
 | [archive/REMEDIATION_PLAN_2026-03-14.md](archive/REMEDIATION_PLAN_2026-03-14.md) | Dated remediation plan (superseded) |
-| [archive/REAL_2B4T_REMEDIATION_PLAN.md](archive/REAL_2B4T_REMEDIATION_PLAN.md) | Real-model remediation plan (superseded) |
 | [archive/INPUT_STREAM_REMEDIATION.md](archive/INPUT_STREAM_REMEDIATION.md) | Input stream remediation analysis (superseded) |
-
-## Experimental Code
-
-The vendored [../experimental/BitNet/](../experimental/BitNet/) tree is
-Microsoft's `bitnet.cpp` reference implementation (MIT, unmodified). It is
-present for comparison against NeoGPU's own BitNet kernels and is not part of
-any NeoGPU build target.
