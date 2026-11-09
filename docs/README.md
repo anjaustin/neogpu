@@ -62,6 +62,7 @@ See [../CREDITS.md](../CREDITS.md) for the full acknowledgment.
 | [audit/PARTICIPANT_SLICE_RESULTS.md](audit/PARTICIPANT_SLICE_RESULTS.md) | Concurrent delivery/lifecycle, sanitizer and real-pixel evidence for the participant slice |
 | [audit/COMPARISON_PLAN.md](audit/COMPARISON_PLAN.md) | Pinned optimized-queue and equivalent GLES comparison controls |
 | [audit/COMPARISON_RESULTS.md](audit/COMPARISON_RESULTS.md) | Same-Pi throughput/latency and byte-identical direct-GLES measurements |
+| [audit/COMPARISON_GAP.md](audit/COMPARISON_GAP.md) | Profiled synchronization costs, call counts, and failed single-slot ablation |
 
 ## Archive
 
