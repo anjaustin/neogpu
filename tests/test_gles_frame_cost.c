@@ -47,6 +47,37 @@ static u64 percentile(u64* values, u32 count, u32 p) {
     return values[(u32)(((u64)count * p + 99) / 100) - 1];
 }
 
+/* Report CRTC and framebuffer state so a candidate can prove what it left
+ * programmed, rather than inferring it from timing. */
+static void print_crtcs(const char* phase, int fd) {
+    if (fd <= 0) { printf("{\"record\":\"crtcs\",\"phase\":\"%s\",\"crtcs\":[]}\n", phase); return; }
+    drmModeRes* res = drmModeGetResources(fd);
+    if (!res) { printf("{\"record\":\"crtcs\",\"phase\":\"%s\",\"crtcs\":[]}\n", phase); return; }
+    printf("{\"record\":\"crtcs\",\"phase\":\"%s\",\"crtcs\":[", phase);
+    bool first = true;
+    for (int i = 0; i < res->count_crtcs; i++) {
+        drmModeCrtc* crtc = drmModeGetCrtc(fd, res->crtcs[i]);
+        if (!crtc) continue;
+        uint32_t handle = 0, width = 0, height = 0, pitch = 0, bpp = 0;
+        if (crtc->buffer_id) {
+            drmModeFB* fb = drmModeGetFB(fd, crtc->buffer_id);
+            if (fb) {
+                handle = fb->handle; width = fb->width; height = fb->height;
+                pitch = fb->pitch; bpp = fb->bpp;
+                drmModeFreeFB(fb);
+            }
+        }
+        printf("%s{\"crtc_id\":%u,\"fb_id\":%u,\"handle\":%u,\"width\":%u,\"height\":%u,"
+               "\"pitch\":%u,\"bpp\":%u,\"active\":%s}",
+               first ? "" : ",", crtc->crtc_id, crtc->buffer_id, handle, width, height,
+               pitch, bpp, crtc->buffer_id ? "true" : "false");
+        first = false;
+        drmModeFreeCrtc(crtc);
+    }
+    drmModeFreeResources(res);
+    printf("]}\n");
+}
+
 static void print_threads(const char* phase) {
     DIR* directory = opendir("/proc/self/task"); REQUIRE(directory);
     struct dirent* entry;
@@ -137,6 +168,12 @@ int main(int argc, char** argv) {
     u64 init_start = now_ns(), init_cpu = cpu_ns();
     if (!nogl) {
         REQUIRE(hs_graphics_init(&gfx) == 0);
+        /* Diagnostic arm: "off" skips taking the CRTC from the console, so the
+         * probe can measure display ownership without changing the library. */
+        {
+            const char* display = getenv("HS_GRAPHICS_DISPLAY");
+            if (display && !strcmp(display, "off")) gfx.take_display = false;
+        }
         width = gfx.screen_width; height = gfx.screen_height;
         if (offscreen) { width = height = size; }
         setup();
@@ -152,9 +189,11 @@ int main(int argc, char** argv) {
     }
     u64 init_ns = now_ns() - init_start, init_cpu_ns = cpu_ns() - init_cpu;
     u64 first_present_ns = 0;
+    print_crtcs("after_init", nogl ? 0 : gfx.drm_fd);
     if (!nogl && window) {
         u64 start = now_ns(); hs_graphics_present(&gfx); first_present_ns = now_ns() - start;
     }
+    print_crtcs("after_first_present", nogl ? 0 : gfx.drm_fd);
     /* Warm up without recording; same draws as the measured loop. */
     for (u32 warm = 0; warm < 8; warm++) {
         if (!nogl) {
@@ -188,6 +227,7 @@ int main(int argc, char** argv) {
         finish_ns[i] = frames_times[i].finish; total[i] = frames_times[i].total;
     }
     print_threads("after_timed");
+    print_crtcs("after_loop", nogl ? 0 : gfx.drm_fd);
 
     /* One verification frame outside timing: no swap, finish, nonblank pixel. */
     u64 verify_ns = 0;
@@ -215,7 +255,7 @@ int main(int argc, char** argv) {
     print_threads("after_shutdown");
 
     printf("{\"record\":\"summary\",\"surface\":\"%s\",\"size\":%u,\"width\":%u,\"height\":%u,"
-           "\"frames\":%u,\"draws\":%u,\"finish_every\":%u,\"swap\":\"%s\","
+           "\"frames\":%u,\"draws\":%u,\"finish_every\":%u,\"swap\":\"%s\",\"take_display\":%s,"
            "\"elapsed_ns\":%" PRIu64 ",\"process_cpu_ns\":%" PRIu64 ",\"timed_cpu_ns\":%" PRIu64 ","
            "\"init_ns\":%" PRIu64 ",\"init_cpu_ns\":%" PRIu64 ",\"first_present_ns\":%" PRIu64 ","
            "\"verify_ns\":%" PRIu64 ",\"shutdown_ns\":%" PRIu64 ","
@@ -225,6 +265,7 @@ int main(int argc, char** argv) {
            "\"total_p50_ns\":%" PRIu64 ",\"total_p99_ns\":%" PRIu64 ","
            "\"per_frame_ns\":%" PRIu64 "}\n",
            surface, size, width, height, count, draws, finish_every, swap ? "on" : "off",
+           gfx.take_display ? "true" : "false",
            elapsed, timed_cpu, timed_cpu, init_ns, init_cpu_ns, first_present_ns,
            verify_ns, shutdown_ns,
            percentile(submit, count, 50), percentile(submit, count, 99),

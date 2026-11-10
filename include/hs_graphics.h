@@ -49,6 +49,7 @@ typedef struct {
     
     bool           initialized;
     bool           vsync;
+    bool           take_display;
 } HSGraphics;
 
 static int crtc_setup_done = 0;
@@ -56,7 +57,12 @@ static int crtc_setup_done = 0;
 static inline int hs_graphics_init(HSGraphics* gfx) {
     memset(gfx, 0, sizeof(HSGraphics));
     gfx->vsync = true;
-    
+    /* Taking the CRTC away from whatever currently owns it is what puts our
+     * frames on the panel, and it costs a full modeset plus a matching
+     * handback at close. Hosts that render without presenting can clear this
+     * to skip display ownership entirely; the default keeps it. */
+    gfx->take_display = true;
+
     gfx->drm_fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
     if (gfx->drm_fd < 0) {
         gfx->drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
@@ -293,7 +299,7 @@ static inline void hs_graphics_present(HSGraphics* gfx) {
         eglSwapBuffers(gfx->egl_display, gfx->egl_surface);
     }
     
-    if (!crtc_setup_done) {
+    if (gfx->take_display && !crtc_setup_done) {
         drmModeRes* resources = drmModeGetResources(gfx->drm_fd);
         if (resources) {
             drmModeConnector* conn = NULL;

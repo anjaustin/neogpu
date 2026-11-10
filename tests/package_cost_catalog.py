@@ -17,10 +17,14 @@ DIRS = [
     'tests/evidence-cost-frames-3',   # failed partial run, preserved deliberately
     'tests/evidence-cost-frames-4',
     'tests/evidence-cost-profile-3',
+    'tests/evidence-cost-modeset-1',
+    'tests/evidence-cost-modeset-2',
+    'tests/evidence-cost-modeset-3',
 ]
 DIRS += [str(p) for p in sorted(Path('tests').glob('evidence-cost-breakdown-*'))]
 FILES = [
     'docs/audit/COST_BREAKDOWN_RESULTS.md',
+    'docs/audit/GLES_COST_P0.md',
     'tests/gles_call_timer.c',
     'tests/test_gles_call_timer_run.py',
     'tests/test_gles_cost_calls_report.py',
@@ -30,9 +34,12 @@ FILES = [
     'tests/test_gles_cost_profile_report.py',
     'tests/test_gles_cost_trace_report.py',
     'tests/package_cost_catalog.py',
+    'tests/test_gles_modeset_ab.py',
+    'tests/panel_mode_probe.c',
 ]
 SKIP_SUFFIXES = ('.verify.rgba', '.data', '.so')
-SKIP_EXACT = {'tests/test_gles_frame_cost', 'tests/test_gles_frame_cost_profile'}
+SKIP_EXACT = {'tests/test_gles_frame_cost', 'tests/test_gles_frame_cost_profile',
+              'tests/panel_mode_probe'}
 
 selected = []
 for directory in DIRS:
