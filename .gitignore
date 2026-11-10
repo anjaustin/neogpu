@@ -69,3 +69,8 @@ tests/*.o
 # never matched -- see AGENTS.md "do not use a pattern that matches both
 # binaries and source"). Add new built binaries here by name.
 /neogpu_procgame
+
+# Graphics cost diagnostics (explicit names; never globs)
+/tests/panel_mode_probe
+/tests/test_gles_frame_cost
+/tests/test_gles_frame_cost_profile
