@@ -74,3 +74,6 @@ tests/*.o
 /tests/panel_mode_probe
 /tests/test_gles_frame_cost
 /tests/test_gles_frame_cost_profile
+
+/tests/test_gles_connector_scan
+/tests/test_gles_connector_scan_asan

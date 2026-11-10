@@ -166,17 +166,35 @@ int main(int argc, char** argv) {
     REQUIRE(strncmp(prefix, "tests/evidence-", 15) == 0);
 
     u64 init_start = now_ns(), init_cpu = cpu_ns();
+    bool stale_cache = false;
+    bool forced_size = false;
     if (!nogl) {
-        REQUIRE(hs_graphics_init(&gfx) == 0);
-        /* Diagnostic arm: "off" skips taking the CRTC from the console, so the
-         * probe can measure display ownership without changing the library. */
+        /* Diagnostic arm: a forced size asks for an offscreen target that is
+         * not the panel's own mode, so the display is not taken. */
+        {
+            const char* size = getenv("HS_GRAPHICS_SIZE");
+            if (size) {
+                unsigned w = 0, h = 0;
+                REQUIRE(sscanf(size, "%ux%u", &w, &h) == 2 && w > 0 && h > 0);
+                REQUIRE(hs_graphics_init_sized(&gfx, (u32)w, (u32)h) == 0);
+                forced_size = true;
+            } else {
+                REQUIRE(hs_graphics_init(&gfx) == 0);
+            }
+        }
         {
             const char* display = getenv("HS_GRAPHICS_DISPLAY");
             if (display && !strcmp(display, "off")) gfx.take_display = false;
             /* Diagnostic arm: "rescan" forces the display setup to query the
-             * connector again instead of reusing the scan done at init. */
+             * connector again instead of reusing the scan done at init, and
+             * "stale" invalidates the cached connector so the fallback that
+             * handles a vanished display is exercised. */
             const char* sweep = getenv("HS_GRAPHICS_SWEEP");
             if (sweep && !strcmp(sweep, "rescan")) gfx.reuse_connector_scan = false;
+            if (sweep && !strcmp(sweep, "stale")) {
+                gfx.display_connector_id = 0xFFFFFFFFu;
+                stale_cache = true;
+            }
         }
         width = gfx.screen_width; height = gfx.screen_height;
         if (offscreen) { width = height = size; }
@@ -260,7 +278,7 @@ int main(int argc, char** argv) {
 
     printf("{\"record\":\"summary\",\"surface\":\"%s\",\"size\":%u,\"width\":%u,\"height\":%u,"
            "\"frames\":%u,\"draws\":%u,\"finish_every\":%u,\"swap\":\"%s\",\"take_display\":%s,"
-           "\"reuse_connector_scan\":%s,"
+           "\"reuse_connector_scan\":%s,\"stale_cache\":%s,\"forced_size\":%s,"
            "\"elapsed_ns\":%" PRIu64 ",\"process_cpu_ns\":%" PRIu64 ",\"timed_cpu_ns\":%" PRIu64 ","
            "\"init_ns\":%" PRIu64 ",\"init_cpu_ns\":%" PRIu64 ",\"first_present_ns\":%" PRIu64 ","
            "\"verify_ns\":%" PRIu64 ",\"shutdown_ns\":%" PRIu64 ","
@@ -272,6 +290,8 @@ int main(int argc, char** argv) {
            surface, size, width, height, count, draws, finish_every, swap ? "on" : "off",
            gfx.take_display ? "true" : "false",
            gfx.reuse_connector_scan ? "true" : "false",
+           stale_cache ? "true" : "false",
+           forced_size ? "true" : "false",
            elapsed, timed_cpu, timed_cpu, init_ns, init_cpu_ns, first_present_ns,
            verify_ns, shutdown_ns,
            percentile(submit, count, 50), percentile(submit, count, 99),

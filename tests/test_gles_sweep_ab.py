@@ -49,7 +49,11 @@ subprocess.run(['gcc', '-O3', '-march=armv8-a+simd', '-mtune=cortex-a72', '-ffas
 ARMS = {
     'reuse': {},
     'rescan': {'HS_GRAPHICS_SWEEP': 'rescan'},
+    'stale': {'HS_GRAPHICS_SWEEP': 'stale'},
+    'sized': {'HS_GRAPHICS_SIZE': '640x480'},
 }
+# Arms that own the display and must therefore agree on the programmed CRTC.
+DISPLAY_ARMS = ('reuse', 'rescan', 'stale')
 
 manifest = {'completed': False, 'revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
             'binary_sha256': hashlib.sha256(BINARY.read_bytes()).hexdigest(),
@@ -83,7 +87,12 @@ def probe_argv(arm, label):
 
 
 def active_crtcs(state):
-    return sorted((c['crtc_id'], c['fb_id'], c['width'], c['height'], c['bpp'])
+    """The properties that must agree across arms.
+
+    The framebuffer id and handle are kernel-assigned and are not stable
+    across runs, so they are recorded but not compared.
+    """
+    return sorted((c['crtc_id'], c['width'], c['height'], c['bpp'])
                   for c in state if c['active'])
 
 
@@ -104,8 +113,13 @@ def run(arm, rep):
     summary = summary[0]
     assert summary['surface'] == 'window' and summary['draws'] == args.draws
     assert summary['frames'] == args.frames
-    assert summary['take_display'] is True, 'both arms must own the display'
-    assert summary['reuse_connector_scan'] is (arm == 'reuse'), (arm, summary['reuse_connector_scan'])
+    assert summary['take_display'] is (arm != 'sized'), (arm, summary['take_display'])
+    assert summary['reuse_connector_scan'] is (arm != 'rescan'), (arm, summary['reuse_connector_scan'])
+    if arm == 'stale':
+        assert summary['stale_cache'] is True, 'the stale arm must invalidate the cache'
+    if arm == 'sized':
+        assert summary['forced_size'] is True, 'the sized arm must force a size'
+        assert (summary['width'], summary['height']) == (640, 480), summary
     pixels = (out/(label+'.verify.rgba')).read_bytes()
     assert len(pixels) == summary['width']*summary['height']*4
     assert max(pixels) > 0, 'verification frame is blank'
@@ -162,8 +176,13 @@ try:
               'first present ms', round(manifest['runs'][-1]['first_present_ns']['median']/1e6, 2),
               'shutdown ms', round(manifest['runs'][-1]['shutdown_ns']['median']/1e6, 2), flush=True)
     arms = {run['arm']: run for run in manifest['runs']}
-    assert arms['reuse']['active_crtcs'] == arms['rescan']['active_crtcs'], \
-        'arms disagree on the programmed CRTC'
+    reference = arms['reuse']['active_crtcs']
+    for arm in DISPLAY_ARMS:
+        assert arms[arm]['active_crtcs'] == reference, \
+            f'{arm} disagrees on the programmed CRTC: {arms[arm]["active_crtcs"]} vs {reference}'
+    # A forced size is not the panel's mode, so the display must not be taken.
+    assert arms['sized']['active_crtcs'] != reference, \
+        f"the sized arm took the display: {arms['sized']['active_crtcs']}"
     manifest['traces'] = {arm: trace_arm(arm) for arm in ARMS}
     for arm, trace in manifest['traces'].items():
         print(arm, 'GETCONNECTOR', trace['counts'].get('DRM_IOCTL_MODE_GETCONNECTOR'),

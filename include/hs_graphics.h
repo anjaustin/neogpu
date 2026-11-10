@@ -52,14 +52,83 @@ typedef struct {
     bool           take_display;
     bool           reuse_connector_scan;
     bool           display_found;
+    bool           size_defaulted;
+    bool           crtc_setup_done;
     uint32_t       display_connector_id;
+    uint32_t       display_encoder_id;
     uint32_t       display_crtc_id;
     drmModeModeInfo display_mode;
 } HSGraphics;
 
-static int crtc_setup_done = 0;
+/* Choose the connector to drive.
+ *
+ * A candidate is a connected connector that reports at least one mode. Among
+ * the candidates, prefer one whose encoder is attached to a CRTC, then one
+ * that is a DSI panel, then any. The type filter is not a requirement: any
+ * connected connector with a mode can be driven. A require_type of 0 accepts
+ * every type; a non-zero value restricts the candidates to that type.
+ *
+ * Fills the display fields of gfx and returns 1 when a candidate was found.
+ * Every connector is released exactly once, including when nothing matches.
+ */
+static inline int hs_graphics_select_display(int fd, uint32_t require_type, HSGraphics* gfx) {
+    drmModeRes* resources = drmModeGetResources(fd);
+    if (!resources) return 0;
 
-static inline int hs_graphics_init(HSGraphics* gfx) {
+    int found = 0;
+    int best_score = -1;
+    uint32_t best_connector = 0, best_encoder = 0, best_crtc = 0;
+    drmModeModeInfo best_mode;
+    memset(&best_mode, 0, sizeof(best_mode));
+
+    for (int i = 0; i < resources->count_connectors; i++) {
+        drmModeConnector* conn = drmModeGetConnector(fd, resources->connectors[i]);
+        if (!conn) continue;
+        bool usable = conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0 &&
+                      (require_type == 0 || conn->connector_type == require_type);
+        if (!usable) { drmModeFreeConnector(conn); continue; }
+
+        uint32_t encoder_id = conn->encoder_id;
+        uint32_t crtc_id = 0;
+        int score = 0;
+        if (encoder_id) {
+            drmModeEncoder* enc = drmModeGetEncoder(fd, encoder_id);
+            if (enc) {
+                if (enc->crtc_id) { crtc_id = enc->crtc_id; score += 2; }
+                drmModeFreeEncoder(enc);
+            }
+        }
+        if (conn->connector_type == DRM_MODE_CONNECTOR_DSI) score += 1;
+
+        if (score > best_score) {
+            best_score = score;
+            best_connector = conn->connector_id;
+            best_encoder = encoder_id;
+            best_crtc = crtc_id;
+            best_mode = conn->modes[0];
+            found = 1;
+        }
+        drmModeFreeConnector(conn);
+    }
+    drmModeFreeResources(resources);
+
+    if (found) {
+        gfx->display_found = true;
+        gfx->display_connector_id = best_connector;
+        gfx->display_encoder_id = best_encoder;
+        gfx->display_crtc_id = best_crtc;
+        gfx->display_mode = best_mode;
+    }
+    return found;
+}
+
+/* Initialize the graphics path.
+ *
+ * A width and height of 0 means "use the attached display's mode". A caller
+ * that knows its target size passes it, which also means the display is not
+ * taken unless that size is the panel's own mode.
+ */
+static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height) {
     memset(gfx, 0, sizeof(HSGraphics));
     gfx->vsync = true;
     /* Taking the CRTC away from whatever currently owns it is what puts our
@@ -82,41 +151,44 @@ static inline int hs_graphics_init(HSGraphics* gfx) {
     if (drmSetMaster(gfx->drm_fd) != 0) {
         return -1;
     }
-    
-    drmModeConnector* conn = NULL;
-    drmModeRes* resources = drmModeGetResources(gfx->drm_fd);
-    if (resources) {
-        for (int i = 0; i < resources->count_connectors; i++) {
-            conn = drmModeGetConnector(gfx->drm_fd, resources->connectors[i]);
-            if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0 && conn->connector_type == DRM_MODE_CONNECTOR_DSI) {
-                gfx->screen_width = conn->modes[0].hdisplay;
-                gfx->screen_height = conn->modes[0].vdisplay;
-                /* Keep what the display setup will need, so it does not have to
-                 * ask the panel again. */
-                gfx->display_connector_id = conn->connector_id;
-                gfx->display_mode = conn->modes[0];
-                gfx->display_found = true;
-                if (conn->encoder_id) {
-                    drmModeEncoder* enc = drmModeGetEncoder(gfx->drm_fd, conn->encoder_id);
-                    if (enc) {
-                        if (enc->crtc_id) gfx->display_crtc_id = enc->crtc_id;
-                        drmModeFreeEncoder(enc);
-                    }
-                }
-                drmModeFreeConnector(conn);
-                conn = NULL;
-                break;
-            }
-            drmModeFreeConnector(conn);
+
+    /* Pick the connector to drive: any connected connector that reports a
+     * mode, not only a DSI panel, so the path works on whatever display is
+     * attached. The DSI panel is preferred among equals, not required. */
+    hs_graphics_select_display(gfx->drm_fd, 0, gfx);
+    u32 detected_width = 0, detected_height = 0;
+    if (gfx->display_found) {
+        detected_width = gfx->display_mode.hdisplay;
+        detected_height = gfx->display_mode.vdisplay;
+    }
+
+    if (width && height) {
+        /* The caller knows the target size. Present on the attached panel
+         * only when the requested size is that panel's own mode; otherwise
+         * this is an offscreen target and the display is not ours to take. */
+        gfx->screen_width = width;
+        gfx->screen_height = height;
+        if (!gfx->display_found || width != detected_width || height != detected_height) {
+            gfx->take_display = false;
         }
-        drmModeFreeResources(resources);
+    } else if (!gfx->display_found) {
+        /* No display attached. Keep the legacy default so a host still gets a
+         * surface, and record that the size was defaulted rather than
+         * detected so the fallback is visible instead of silent. */
+        gfx->screen_width = 800;
+        gfx->screen_height = 480;
+        gfx->size_defaulted = true;
+    } else {
+        gfx->screen_width = detected_width;
+        gfx->screen_height = detected_height;
     }
     
     if (gfx->screen_width == 0) {
         gfx->screen_width = 800;
         gfx->screen_height = 480;
+        gfx->size_defaulted = true;
     }
-    
+
     gfx->gbm_device = gbm_create_device(gfx->drm_fd);
     if (!gfx->gbm_device) {
         return -1;
@@ -203,9 +275,14 @@ static inline int hs_graphics_init(HSGraphics* gfx) {
     return 0;
 }
 
+/* Initialize using the attached display's mode. */
+static inline int hs_graphics_init(HSGraphics* gfx) {
+    return hs_graphics_init_sized(gfx, 0, 0);
+}
+
 static inline void hs_graphics_finish(HSGraphics* gfx) {
     if (!gfx->initialized) return;
-    
+
     for (int i = 0; i < HS_MAX_TEXTURES; i++) {
         if (gfx->textures[i].gl_texture != 0 && !gfx->textures[i].disposed) {
             glDeleteTextures(1, &gfx->textures[i].gl_texture);
@@ -319,10 +396,11 @@ static inline void hs_graphics_present(HSGraphics* gfx) {
         eglSwapBuffers(gfx->egl_display, gfx->egl_surface);
     }
     
-    if (gfx->take_display && !crtc_setup_done) {
+    if (gfx->take_display && !gfx->crtc_setup_done) {
         uint32_t connector_id = 0;
         uint32_t crtc_id = 0;
         drmModeModeInfo mode;
+        memset(&mode, 0, sizeof(mode));
         bool resolved = false;
 
         /* Reuse the scan already done at init when the connector is still
@@ -345,29 +423,12 @@ static inline void hs_graphics_present(HSGraphics* gfx) {
         }
 
         if (!resolved) {
-            drmModeRes* resources = drmModeGetResources(gfx->drm_fd);
-            if (resources) {
-                drmModeConnector* conn = NULL;
-                drmModeEncoder* enc = NULL;
-                for (int i = 0; i < resources->count_connectors; i++) {
-                    conn = drmModeGetConnector(gfx->drm_fd, resources->connectors[i]);
-                    if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0 && conn->connector_type == DRM_MODE_CONNECTOR_DSI) {
-                        if (conn->encoder_id) {
-                            enc = drmModeGetEncoder(gfx->drm_fd, conn->encoder_id);
-                            if (enc && enc->crtc_id) {
-                                connector_id = conn->connector_id;
-                                crtc_id = enc->crtc_id;
-                                mode = conn->modes[0];
-                                resolved = true;
-                            }
-                        }
-                        break;
-                    }
-                    drmModeFreeConnector(conn);
-                }
-                if (conn) drmModeFreeConnector(conn);
-                if (enc) drmModeFreeEncoder(enc);
-                drmModeFreeResources(resources);
+            /* The connector may have appeared, or changed, since init. */
+            if (hs_graphics_select_display(gfx->drm_fd, 0, gfx) && gfx->display_crtc_id) {
+                connector_id = gfx->display_connector_id;
+                crtc_id = gfx->display_crtc_id;
+                mode = gfx->display_mode;
+                resolved = true;
             }
         }
 
@@ -385,7 +446,7 @@ static inline void hs_graphics_present(HSGraphics* gfx) {
                 gbm_surface_release_buffer(gfx->gbm_surface, bo);
             }
         }
-        crtc_setup_done = 1;
+        gfx->crtc_setup_done = 1;
     }
 }
 
