@@ -5,6 +5,14 @@ default path; it does not change production code. Every number here is either
 (a) a raw sample from a committed-path run, (b) an independent reduction of
 those samples, or (c) explicitly marked as perturbed by tracing/preloading.
 
+> **Baseline note.** The figures in this document are the pre-optimisation
+> baseline, kept as the reference point. Two changes have since landed in
+> [GLES_COST_P0.md](GLES_COST_P0.md): the duplicate connector sweep was
+> removed (P0-3, first present −8.8 ms) and display ownership was made
+> optional but off by default (P0-1 was rejected as a removal; P0-11 remains
+> open). The per-process lifecycle moved from 202.54 ms to 185.73 ms. Nothing
+> else in this document has been re-measured since.
+
 ## 1. The question and the answer in one paragraph
 
 For a long-running graphics process the dominant cost is **waiting on the

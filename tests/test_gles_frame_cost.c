@@ -173,6 +173,10 @@ int main(int argc, char** argv) {
         {
             const char* display = getenv("HS_GRAPHICS_DISPLAY");
             if (display && !strcmp(display, "off")) gfx.take_display = false;
+            /* Diagnostic arm: "rescan" forces the display setup to query the
+             * connector again instead of reusing the scan done at init. */
+            const char* sweep = getenv("HS_GRAPHICS_SWEEP");
+            if (sweep && !strcmp(sweep, "rescan")) gfx.reuse_connector_scan = false;
         }
         width = gfx.screen_width; height = gfx.screen_height;
         if (offscreen) { width = height = size; }
@@ -256,6 +260,7 @@ int main(int argc, char** argv) {
 
     printf("{\"record\":\"summary\",\"surface\":\"%s\",\"size\":%u,\"width\":%u,\"height\":%u,"
            "\"frames\":%u,\"draws\":%u,\"finish_every\":%u,\"swap\":\"%s\",\"take_display\":%s,"
+           "\"reuse_connector_scan\":%s,"
            "\"elapsed_ns\":%" PRIu64 ",\"process_cpu_ns\":%" PRIu64 ",\"timed_cpu_ns\":%" PRIu64 ","
            "\"init_ns\":%" PRIu64 ",\"init_cpu_ns\":%" PRIu64 ",\"first_present_ns\":%" PRIu64 ","
            "\"verify_ns\":%" PRIu64 ",\"shutdown_ns\":%" PRIu64 ","
@@ -266,6 +271,7 @@ int main(int argc, char** argv) {
            "\"per_frame_ns\":%" PRIu64 "}\n",
            surface, size, width, height, count, draws, finish_every, swap ? "on" : "off",
            gfx.take_display ? "true" : "false",
+           gfx.reuse_connector_scan ? "true" : "false",
            elapsed, timed_cpu, timed_cpu, init_ns, init_cpu_ns, first_present_ns,
            verify_ns, shutdown_ns,
            percentile(submit, count, 50), percentile(submit, count, 99),

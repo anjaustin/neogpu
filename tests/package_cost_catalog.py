@@ -20,6 +20,10 @@ DIRS = [
     'tests/evidence-cost-modeset-1',
     'tests/evidence-cost-modeset-2',
     'tests/evidence-cost-modeset-3',
+    'tests/evidence-cost-modeset-4',
+    'tests/evidence-cost-sweep',
+    'tests/evidence-e2e-regress-c54d140',
+    'tests/evidence-e2e-regress-sweep',
 ]
 DIRS += [str(p) for p in sorted(Path('tests').glob('evidence-cost-breakdown-*'))]
 FILES = [
@@ -35,9 +39,10 @@ FILES = [
     'tests/test_gles_cost_trace_report.py',
     'tests/package_cost_catalog.py',
     'tests/test_gles_modeset_ab.py',
+    'tests/test_gles_sweep_ab.py',
     'tests/panel_mode_probe.c',
 ]
-SKIP_SUFFIXES = ('.verify.rgba', '.data', '.so')
+SKIP_SUFFIXES = ('.verify.rgba', '.rgba', '.data', '.so')
 SKIP_EXACT = {'tests/test_gles_frame_cost', 'tests/test_gles_frame_cost_profile',
               'tests/panel_mode_probe'}
 

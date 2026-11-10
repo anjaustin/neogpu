@@ -82,8 +82,8 @@ total throughput alone.
 | Item | Title | Status |
 |---|---|---|
 | P0-1 | Remove the redundant manual modeset | **Rejected (measured)** — it is what puts our frames on the panel |
-| P0-11 | Make display ownership optional | Open — isolates 48.6 ms/process of display cost |
-| P0-3 | Single connector sweep | Open — duplicate sweep worth ~9–11 ms, validated by ioctl counts |
+| P0-11 | Make display ownership optional | Open — isolates ~38 ms/process of display cost |
+| P0-3 | Single connector sweep | **Accepted (measured)** — first present −8.8 ms, connector queries halved |
 | P0-2 | Display-agnostic connector and mode selection | Open — the DSI-only check is itself a portability bug |
 | P0-10 | Match the surface format to the display's native format | Open — RGB565 vs XRGB8888 halves scanout bandwidth |
 | P0-12 | Cost of taking the display from the console | Open — 25.3 ms takeover, ~13.6 ms handback |
@@ -139,16 +139,19 @@ removing it would leave the display showing the console while NeoGPU renders
 into an unsignalled buffer. The cost is real and belongs to display
 ownership, not to waste.
 
-**What the rejection yields.** The measurement isolates **48.6 ms of
-per-process lifecycle cost as display ownership** (32.3 ms first present +
-13.6 ms shutdown), which is now P0-11 rather than a saving.
+**What the rejection yields.** The measurement isolates **display ownership
+cost** as a per-process price, not as waste. Restated against the post-P0-3
+baseline (`tests/evidence-cost-modeset-4`): owning the display costs **15.9 ms
+of first present** (16.87 vs 0.95) and **21.8 ms of shutdown** (45.60 vs
+23.85), so **~38 ms of the 185.7 ms per-process lifecycle**. Before P0-3 that
+price was 48.6 ms; P0-3 removed the part of it that was duplicated work.
 
 ### P0-11 — Make display ownership optional (throughput without slowing the display)
 
 **Hypothesis.** Taking the CRTC from the console and handing it back is
-~48.6 ms per process. A renderer that never takes the CRTC keeps all of
-that time for work instead, and becomes genuinely display-agnostic: it does
-not care which panel is attached, or whether one is.
+~38 ms per process. A renderer that never takes the CRTC keeps all of that
+time for work instead, and becomes genuinely display-agnostic: it does not
+care which panel is attached, or whether one is.
 
 **Method.** Make the CRTC takeover an explicit, supported option rather than
 an unconditional side effect of the first present. The `egl` arm already
@@ -157,7 +160,7 @@ example a no-scanout init flag) so a host can ask for offscreen production
 without pretending to display.
 
 **Acceptance.** In no-scanout mode: first present ≤2 ms and shutdown ≤30 ms
-(measured: 0.92 ms and 28.68 ms), identical rendered pixels, and complete
+(measured: 0.95 ms and 23.85 ms), identical rendered pixels, and complete
 resource release. Displayed mode must be unchanged.
 
 **Note.** This is the "agnostic to the connected display" option made
@@ -181,26 +184,39 @@ a hard-coded size — fail cleanly instead.
 identical pixels for the existing E2E equality gates. **Reject.** Any change
 in rendered pixels on the committed path.
 
-### P0-3 — Single connector sweep
+### P0-3 — Single connector sweep — **ACCEPTED (measured)**
 
 **Hypothesis.** The connector scan runs twice — once in `hs_graphics_init`
 (`:73-87`) and again inside the one-time CRTC setup in `hs_graphics_present`
 (`:296-341`) — costing 18.6–22.8 ms total, 3.6–6.7 ms per `GETCONNECTOR`
 ioctl.
 
-**Change.** Cache the connected connector id, encoder id and mode during init
-and reuse them. Fall back to a re-scan only when a fresh
-`drmModeGetResources` (0.056 ms) no longer lists the cached connector, so
+**Change.** Capture what the display setup needs during the init scan
+(connector id, the encoder's CRTC id, and the mode) and reuse it. The display
+setup validates the cached connector against a fresh `drmModeGetResources`
+(0.056 ms) and falls back to a full re-scan if the connector has gone, so
 hotplug is still handled.
 
-**Partial validation.** The P0-1 arms bracket the cost directly: the `egl`
-arm performs only the init sweep and issues **6 `MODE_GETCONNECTOR` ioctls
-(10.46 ms traced)**; the `manual` arm performs both sweeps and issues **12
-(24.13 ms traced)**. The duplicate sweep is worth ~13.7 ms traced (~9–11 ms
-untraced) and is removable without touching the CRTC takeover, which is the
-part P0-1 proved necessary.
+**Result — `tests/evidence-cost-sweep`, 5 reps × 64 frames, same binary:**
 
-**Acceptance.** Startup improves by ≥8 ms with identical CRTC/mode/FB.
+| Measure | `rescan` (before) | `reuse` (after) | Delta |
+|---|---:|---:|---:|
+| first present | 28.89 ms | **20.08 ms** | **−8.8 ms (−30%)** |
+| init | 120.88 ms | 121.56 ms | unchanged |
+| shutdown | 44.28 ms | 46.71 ms | unchanged |
+| `MODE_GETCONNECTOR` ioctls | 12 (22.95 ms traced) | **6** (12.98 ms traced) | −6 ioctls |
+
+**Correctness.** The runner asserts that both arms end with the same CRTC
+bound to the same framebuffer: CRTC 93, fb 726, 800×480, bpp 32 in every
+repetition of both arms. The real-GLES end-to-end harness passes all 12
+configurations (1/2/8 producers × 1/64 draws × capture on/off) with pixel
+equality, FIFO ordering and complete resource release intact.
+
+**Effect on the P0-1 baseline.** With the duplicate sweep gone, the display
+setup's own cost drops from 35.20 ms to **16.87 ms** of first present, and the
+whole per-process lifecycle (init + first present + shutdown) falls from
+202.54 ms to **185.73 ms**, an 8.3% reduction. P0-11's figures below are
+restated against this new baseline.
 
 ### P0-10 — Match the surface format to the display's native format
 

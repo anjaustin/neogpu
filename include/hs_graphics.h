@@ -50,6 +50,11 @@ typedef struct {
     bool           initialized;
     bool           vsync;
     bool           take_display;
+    bool           reuse_connector_scan;
+    bool           display_found;
+    uint32_t       display_connector_id;
+    uint32_t       display_crtc_id;
+    drmModeModeInfo display_mode;
 } HSGraphics;
 
 static int crtc_setup_done = 0;
@@ -62,6 +67,9 @@ static inline int hs_graphics_init(HSGraphics* gfx) {
      * handback at close. Hosts that render without presenting can clear this
      * to skip display ownership entirely; the default keeps it. */
     gfx->take_display = true;
+    /* The connector scan is slow on this class of panel, and the display setup
+     * needs the same information, so keep it from being done twice. */
+    gfx->reuse_connector_scan = true;
 
     gfx->drm_fd = open("/dev/dri/card1", O_RDWR | O_CLOEXEC);
     if (gfx->drm_fd < 0) {
@@ -83,6 +91,18 @@ static inline int hs_graphics_init(HSGraphics* gfx) {
             if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0 && conn->connector_type == DRM_MODE_CONNECTOR_DSI) {
                 gfx->screen_width = conn->modes[0].hdisplay;
                 gfx->screen_height = conn->modes[0].vdisplay;
+                /* Keep what the display setup will need, so it does not have to
+                 * ask the panel again. */
+                gfx->display_connector_id = conn->connector_id;
+                gfx->display_mode = conn->modes[0];
+                gfx->display_found = true;
+                if (conn->encoder_id) {
+                    drmModeEncoder* enc = drmModeGetEncoder(gfx->drm_fd, conn->encoder_id);
+                    if (enc) {
+                        if (enc->crtc_id) gfx->display_crtc_id = enc->crtc_id;
+                        drmModeFreeEncoder(enc);
+                    }
+                }
                 drmModeFreeConnector(conn);
                 conn = NULL;
                 break;
@@ -300,50 +320,70 @@ static inline void hs_graphics_present(HSGraphics* gfx) {
     }
     
     if (gfx->take_display && !crtc_setup_done) {
-        drmModeRes* resources = drmModeGetResources(gfx->drm_fd);
-        if (resources) {
-            drmModeConnector* conn = NULL;
-            drmModeEncoder* enc = NULL;
-            int crtc_idx = -1;
-            
-            for (int i = 0; i < resources->count_connectors; i++) {
-                conn = drmModeGetConnector(gfx->drm_fd, resources->connectors[i]);
-                if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0 && conn->connector_type == DRM_MODE_CONNECTOR_DSI) {
-                    if (conn->encoder_id) {
-                        enc = drmModeGetEncoder(gfx->drm_fd, conn->encoder_id);
-                        if (enc && enc->crtc_id) {
-                            crtc_idx = -1;
-                            for (int j = 0; j < resources->count_crtcs; j++) {
-                                if (resources->crtcs[j] == enc->crtc_id) {
-                                    crtc_idx = j;
-                                    break;
-                                }
+        uint32_t connector_id = 0;
+        uint32_t crtc_id = 0;
+        drmModeModeInfo mode;
+        bool resolved = false;
+
+        /* Reuse the scan already done at init when the connector is still
+         * there. Listing resources is cheap; querying the connector is what
+         * costs on a panel that has to be probed over I2C. */
+        if (gfx->reuse_connector_scan && gfx->display_found && gfx->display_crtc_id) {
+            drmModeRes* check = drmModeGetResources(gfx->drm_fd);
+            if (check) {
+                for (int i = 0; i < check->count_connectors; i++) {
+                    if (check->connectors[i] == gfx->display_connector_id) {
+                        connector_id = gfx->display_connector_id;
+                        crtc_id = gfx->display_crtc_id;
+                        mode = gfx->display_mode;
+                        resolved = true;
+                        break;
+                    }
+                }
+                drmModeFreeResources(check);
+            }
+        }
+
+        if (!resolved) {
+            drmModeRes* resources = drmModeGetResources(gfx->drm_fd);
+            if (resources) {
+                drmModeConnector* conn = NULL;
+                drmModeEncoder* enc = NULL;
+                for (int i = 0; i < resources->count_connectors; i++) {
+                    conn = drmModeGetConnector(gfx->drm_fd, resources->connectors[i]);
+                    if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0 && conn->connector_type == DRM_MODE_CONNECTOR_DSI) {
+                        if (conn->encoder_id) {
+                            enc = drmModeGetEncoder(gfx->drm_fd, conn->encoder_id);
+                            if (enc && enc->crtc_id) {
+                                connector_id = conn->connector_id;
+                                crtc_id = enc->crtc_id;
+                                mode = conn->modes[0];
+                                resolved = true;
                             }
                         }
+                        break;
                     }
-                    break;
+                    drmModeFreeConnector(conn);
                 }
-                drmModeFreeConnector(conn);
+                if (conn) drmModeFreeConnector(conn);
+                if (enc) drmModeFreeEncoder(enc);
+                drmModeFreeResources(resources);
             }
-            
-            if (conn && crtc_idx >= 0) {
-                struct gbm_bo* bo = gbm_surface_lock_front_buffer(gfx->gbm_surface);
-                if (bo) {
-                    uint32_t handle = gbm_bo_get_handle(bo).u32;
-                    uint32_t stride = gbm_bo_get_stride(bo);
-                    uint32_t fb = 0;
-                    if (drmModeAddFB(gfx->drm_fd, gfx->screen_width, gfx->screen_height, 
-                                   24, 32, stride, handle, &fb) == 0) {
-                        drmModeSetCrtc(gfx->drm_fd, resources->crtcs[crtc_idx], fb, 0, 0, 
-                                      &conn->connector_id, 1, &conn->modes[0]);
-                    }
-                    gbm_surface_release_buffer(gfx->gbm_surface, bo);
+        }
+
+        if (resolved) {
+            struct gbm_bo* bo = gbm_surface_lock_front_buffer(gfx->gbm_surface);
+            if (bo) {
+                uint32_t handle = gbm_bo_get_handle(bo).u32;
+                uint32_t stride = gbm_bo_get_stride(bo);
+                uint32_t fb = 0;
+                if (drmModeAddFB(gfx->drm_fd, gfx->screen_width, gfx->screen_height, 
+                               24, 32, stride, handle, &fb) == 0) {
+                    drmModeSetCrtc(gfx->drm_fd, crtc_id, fb, 0, 0, 
+                                   &connector_id, 1, &mode);
                 }
+                gbm_surface_release_buffer(gfx->gbm_surface, bo);
             }
-            
-            if (conn) drmModeFreeConnector(conn);
-            if (enc) drmModeFreeEncoder(enc);
-            drmModeFreeResources(resources);
         }
         crtc_setup_done = 1;
     }
