@@ -126,7 +126,11 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
 
 - `OP_ACK` (Immediate)
   - Header: `cid = request cid`, `from = node that applied the request`
-  - Header: `payload_idx = original opcode`, `flags = status (0=ok, 1=unhandled)`
+  - Header: `payload_idx = original opcode`, `flags = status`:
+    `HS_ACK_OK` (0), `HS_ACK_UNHANDLED` (1, the node does not handle the
+    opcode), `HS_ACK_INVALID` (2, the message failed schema validation or
+    decoding; nothing was applied). Nodes validate every message against its
+    opcode schema whether or not `validate_on_send` is enabled.
 - `OP_RESULT` (Payload, 0..64B)
   - Header: `cid = request cid`, `from = node producing the result`
   - Payload: opcode-specific small result blob
@@ -225,7 +229,20 @@ The message log used for capture can be channel-filtered:
 The GLES backend can optionally source vertex data from `HSGpu.memory` buffer banks. The current minimal convention is:
 
 - buffer bank `N` contains interleaved floats: `x, y, r, g, b` per vertex
-- vertex count is derived from `HSBuffer.length / (5 * 4)`
+- vertex count is `HSBuffer.length / (5 * 4)` (whole vertices; a bank with
+  fewer than 3 vertices falls back to a built-in triangle)
+- `OP_DRAW_INSTANCE` draws `count` instances (0 draws nothing). If the
+  instance bank holds at least `count * 8` bytes, it supplies one `x, y`
+  offset (two floats) per instance; otherwise every instance is at (0, 0).
+- `OP_DRAW_TEXT` draws its NUL-terminated string in white, one line per
+  command, stacked from the top-left corner of the frame. It is a no-op when
+  the font (see `hs_font_load_default`) is not found.
+
+Render state (blend, cull, depth, color mask, clip) persists across frames
+until changed, as in GL. `OP_CLEAR` / `OP_CLEAR_DS` follow GL semantics: they
+honour the current clip rectangle and write masks. Reset `OP_CLIP` (0 size),
+`OP_COLOR_MASK` (0xF) and depth writes first to clear the whole target. A clip
+rectangle is in top-left-origin pixels and is trimmed to the target.
 
 ## Validation
 

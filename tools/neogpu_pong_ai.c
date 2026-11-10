@@ -39,76 +39,22 @@ static const char* AI_COMMENTS[] = {
 };
 #define N_COMMENTS (sizeof(AI_COMMENTS)/sizeof(AI_COMMENTS[0]))
 
-static void save_screenshot(HSGraphics* gfx, const char* path) {
-    int w = gfx->screen_width;
-    int h = gfx->screen_height;
-    u8* pixels = malloc(w * h * 3);
-    if (!pixels) return;
-    
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, pixels);
-    
-    FILE* f = fopen(path, "wb");
-    if (f) {
-        fprintf(f, "P6\n%d %d\n255\n", w, h);
-        for (int y = h - 1; y >= 0; y--) {
-            fwrite(pixels + y * w * 3, 1, w * 3, f);
-        }
-        fclose(f);
-        fprintf(stderr, "screenshot: %s\n", path);
+/* Geometry for one frame: five coloured quads (two paddles, ball, two score
+ * bars) as 30 vertices of x,y,r,g,b in memory bank 0, drawn by one OP_DRAW. */
+#define QUADS 5
+#define BANK_BYTES (QUADS * 6 * 5 * 4)
+
+static void put_quad(HSBuffer* buf, int quad, float x0, float y0, float x1, float y1,
+                     float r, float g, float b) {
+    const float corners[6][2] = {{x0, y0}, {x1, y0}, {x0, y1}, {x1, y0}, {x1, y1}, {x0, y1}};
+    for (int v = 0; v < 6; v++) {
+        u32 base = (u32)(quad * 6 + v) * 5;
+        hs_buffer_set_f32(buf, base + 0, corners[v][0]);
+        hs_buffer_set_f32(buf, base + 1, corners[v][1]);
+        hs_buffer_set_f32(buf, base + 2, r);
+        hs_buffer_set_f32(buf, base + 3, g);
+        hs_buffer_set_f32(buf, base + 4, b);
     }
-    free(pixels);
-}
-
-static const char *VS_QUAD = 
-    "attribute vec2 a_pos;\n"
-    "attribute vec2 a_uv;\n"
-    "varying vec2 v_uv;\n"
-    "void main(){\n"
-    "  v_uv = a_uv;\n"
-    "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
-    "}\n";
-
-static const char *FS_SOLID = 
-    "precision mediump float;\n"
-    "varying vec2 v_uv;\n"
-    "uniform vec3 u_color;\n"
-    "void main(){\n"
-    "  gl_FragColor = vec4(u_color, 1.0);\n"
-    "}\n";
-
-static GLuint make_prog(const char *vs, const char *fs) {
-    GLuint v = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(v, 1, &vs, NULL); glCompileShader(v);
-    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(f, 1, &fs, NULL); glCompileShader(f);
-    GLuint p = glCreateProgram();
-    glAttachShader(p, v); glAttachShader(p, f); glLinkProgram(p);
-    glDeleteShader(v); glDeleteShader(f);
-    return p;
-}
-
-static GLuint g_vbo;
-static GLint g_a_pos, g_a_uv;
-static GLuint g_prog;
-static GLint g_u_color;
-
-static void draw_quad(float x0, float y0, float x1, float y1) {
-    float q[] = {
-        x0, y0, 0, 0,
-        x1, y0, 1, 0,
-        x0, y1, 0, 1,
-        x1, y0, 1, 0,
-        x1, y1, 1, 1,
-        x0, y1, 0, 1
-    };
-    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(q), q);
-    glEnableVertexAttribArray(g_a_pos);
-    glEnableVertexAttribArray(g_a_uv);
-    glVertexAttribPointer(g_a_pos, 2, GL_FLOAT, GL_FALSE, 16, (void*)0);
-    glVertexAttribPointer(g_a_uv, 2, GL_FLOAT, GL_FALSE, 16, (void*)8);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
 typedef struct {
@@ -142,27 +88,19 @@ int main(int argc, char** argv) {
     hs_gpu_init(&gpu);
 
     HSBuffer* buf = hs_gpu_get_buffer(&gpu, 0);
-    if (!hs_buffer_init(buf, 0, 1024)) {
+    if (!hs_buffer_init(buf, 0, BANK_BYTES)) {
         fprintf(stderr, "Failed to init buffer\n");
         return 1;
     }
 
+    /* Everything on screen goes through messages: the backend clears, draws
+     * bank 0, draws the commentary text, and presents once per frame. */
     HSBackend backend = hs_backend_gles_create();
     hs_gpu_attach_backend(&gpu, &backend);
-    HSGraphics* gfx = (HSGraphics*)backend.ctx;
-
-    g_prog = make_prog(VS_QUAD, FS_SOLID);
-    glUseProgram(g_prog);
-    g_a_pos = glGetAttribLocation(g_prog, "a_pos");
-    g_a_uv = glGetAttribLocation(g_prog, "a_uv");
-    g_u_color = glGetUniformLocation(g_prog, "u_color");
-
-    glGenBuffers(1, &g_vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-    glBufferData(GL_ARRAY_BUFFER, 6 * 16, NULL, GL_DYNAMIC_DRAW);
-
-    glViewport(0, 0, (GLsizei)gfx->screen_width, (GLsizei)gfx->screen_height);
-    glDisable(GL_DEPTH_TEST);
+    if (!gpu.backend) {
+        fprintf(stderr, "Display backend unavailable (run as root with a display attached)\n");
+        return 1;
+    }
 
     Paddle player = { -0.85f, 0.0f, 0 };
     Paddle ai = { 0.85f, 0.0f, 0 };
@@ -171,6 +109,7 @@ int main(int argc, char** argv) {
 
     int ai_msg_idx = 0;
     int ai_msg_timer = 0;
+    const char* screenshot_path = "pong_ai_demo.ppm";
 
     printf("Recording 120 frames with AI commentary...\n");
     hs_gpu_start_recording(&gpu);
@@ -217,30 +156,24 @@ int main(int argc, char** argv) {
             ai_msg_timer = 0;
         }
 
+        put_quad(buf, 0, player.x - 0.03f, player.y - 0.15f, player.x + 0.03f, player.y + 0.15f, 0.2f, 0.6f, 1.0f);
+        put_quad(buf, 1, ai.x - 0.03f, ai.y - 0.15f, ai.x + 0.03f, ai.y + 0.15f, 1.0f, 0.2f, 0.2f);
+        put_quad(buf, 2, ball.x - 0.02f, ball.y - 0.02f, ball.x + 0.02f, ball.y + 0.02f, 1.0f, 1.0f, 1.0f);
+        put_quad(buf, 3, -0.95f, -0.85f, -0.95f + 0.05f * (float)(player.score + 1), -0.80f, 0.2f, 0.6f, 1.0f);
+        put_quad(buf, 4, 0.95f - 0.05f * (float)(ai.score + 1), -0.85f, 0.95f, -0.80f, 1.0f, 0.2f, 0.2f);
+        buf->dirty = true;
+
+        char score[48];
+        snprintf(score, sizeof(score), "P:%d AI:%d", player.score, ai.score);
+
         hs_gpu_begin_frame(&gpu);
-        
         hs_gpu_clear(&gpu, v4_make(0.05f, 0.05f, 0.1f, 1.0f));
-        
-        glUniform3f(g_u_color, 0.2f, 0.6f, 1.0f);
-        draw_quad(player.x - 0.03f, player.y - 0.15f, player.x + 0.03f, player.y + 0.15f);
-        
-        glUniform3f(g_u_color, 1.0f, 0.2f, 0.2f);
-        draw_quad(ai.x - 0.03f, ai.y - 0.15f, ai.x + 0.03f, ai.y + 0.15f);
-        
-        glUniform3f(g_u_color, 1.0f, 1.0f, 1.0f);
-        draw_quad(ball.x - 0.02f, ball.y - 0.02f, ball.x + 0.02f, ball.y + 0.02f);
-
-        glUniform3f(g_u_color, 0.0f, 1.0f, 0.5f);
-        draw_quad(-0.95f, 0.7f, -0.5f, 0.85f);
-        
-        glUniform3f(g_u_color, 0.5f, 0.8f, 1.0f);
-        draw_quad(0.5f, 0.7f, 0.95f, 0.85f);
-
+        hs_gpu_draw(&gpu, 0);
+        hs_gpu_draw_text(&gpu, AI_COMMENTS[ai_msg_idx]);
+        hs_gpu_draw_text(&gpu, score);
+        if (frame == 90) (void)hs_backend_gles_capture_next(&backend, screenshot_path);
         hs_gpu_process(&gpu);
-        hs_gpu_end_frame(&gpu);
-
-        hs_graphics_present(gfx);
-        usleep(16667);
+        hs_gpu_end_frame(&gpu);  /* backend executes and presents this frame */
     }
 
     u32 log_count = hs_gpu_stop_recording(&gpu);
@@ -255,7 +188,8 @@ int main(int argc, char** argv) {
     bool cap_ok = hs_capture_from_log(&gpu.system, msgs, log_count, &cap);
     printf("Capture from log: %s\n", cap_ok ? "OK" : "FAILED");
     
-    const char* cap_path = "/tmp/pong_ai_capture.bin";
+    const char* cap_path = "pong_ai_capture.bin";
+    unlink(cap_path); /* a stale file must not stand in for a failed write */
     bool write_ok = hs_capture_write_file(&cap, cap_path);
     printf("Write capture: %s (%s)\n", write_ok ? "OK" : "FAILED", cap_path);
 
@@ -265,26 +199,30 @@ int main(int argc, char** argv) {
     bool read_ok = hs_capture_read_file(&cap2, cap_path, replay_msgs, replay_payloads, MAX_MSG_LOG);
     printf("Read capture: %s\n", read_ok ? "OK" : "FAILED");
 
-    printf("\n--- Replaying captured game ---\n");
-    bool replay_ok = hs_capture_replay(&gpu.system, &cap);
+    bool same = read_ok && cap2.count == cap.count;
+    for (u32 i = 0; same && i < cap.count; i++) same = memcmp(&cap.msgs[i], &cap2.msgs[i], sizeof(Message)) == 0;
+    printf("Round trip identical: %s\n", same ? "YES" : "NO");
+
+    printf("\n--- Replaying captured game (from the file) ---\n");
+    bool replay_ok = read_ok && hs_capture_replay(&gpu.system, &cap2);
     printf("Replay capture: %s\n", replay_ok ? "OK" : "FAILED");
 
     for (int f = 0; f < 30 && g_run; f++) {
         hs_gpu_begin_frame(&gpu);
         hs_gpu_clear(&gpu, v4_make(0.05f, 0.05f, 0.1f, 1.0f));
+        hs_gpu_draw(&gpu, 0);
         hs_gpu_process(&gpu);
         hs_gpu_end_frame(&gpu);
-        hs_graphics_present(gfx);
-        usleep(16667);
     }
 
-    save_screenshot(gfx, "/tmp/pong_ai_demo.ppm");
+    bool shot_ok = hs_backend_gles_capture_ok(&backend);
+    hs_gpu_shutdown(&gpu);
 
     printf("\n=== Demo Complete ===\n");
-    printf("Files:\n");
-    printf("  /tmp/pong_ai_capture.bin - Message capture (HSCAP1)\n");
-    printf("  /tmp/pong_ai_demo.ppm   - Visual screenshot\n");
+    printf("Files (current directory):\n");
+    printf("  %s - Message capture (HSCAP1)\n", cap_path);
+    printf("  %s - Screenshot of frame 90 (%s)\n", screenshot_path, shot_ok ? "written" : "FAILED");
     printf("\nGame rendering + scripted commentary via unified message-passing!\n");
-    
-    return 0;
+
+    return cap_ok && write_ok && read_ok && same && replay_ok && shot_ok ? 0 : 1;
 }

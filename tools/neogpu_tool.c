@@ -1,3 +1,4 @@
+#define _GNU_SOURCE /* SO_PEERCRED, struct ucred */
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,7 +55,7 @@ static void usage(const char* argv0) {
     printf("  set-block <ch> <0|1>\n");
     printf("  fence <ch> <cid>\n");
     printf("\nChannel ids: 1=RT 2=RENDER 3=TELEM\n");
-    printf("Default socket: /tmp/neogpu.sock\n");
+    printf("Default socket: $XDG_RUNTIME_DIR/neogpu.sock, else /tmp/neogpu-<uid>.sock\n");
 }
 
 static int write_full(int fd, const void* buf, size_t len) {
@@ -100,7 +101,27 @@ static int connect_sock(const char* path) {
         close(fd);
         return -1;
     }
+    /* Only trust a server run by this user or root. A socket in a shared
+     * directory such as /tmp can be pre-bound by another local user, who would
+     * otherwise receive our requests and forge the replies. */
+    struct ucred peer;
+    socklen_t peer_len = sizeof(peer);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_len) != 0 ||
+        (peer.uid != geteuid() && peer.uid != 0)) {
+        close(fd);
+        errno = EPERM;
+        return -1;
+    }
     return fd;
+}
+
+/* $XDG_RUNTIME_DIR is per-user and mode 0700; fall back to a per-uid name. */
+static const char* default_socket_path(char* buffer, size_t size) {
+    const char* runtime = getenv("XDG_RUNTIME_DIR");
+    if (runtime && runtime[0] == '/' &&
+        (size_t)snprintf(buffer, size, "%s/neogpu.sock", runtime) < size) return buffer;
+    snprintf(buffer, size, "/tmp/neogpu-%u.sock", (unsigned)geteuid());
+    return buffer;
 }
 
 static int connect_tcp(const char* host, const char* port) {
@@ -248,7 +269,8 @@ static bool print_fabric(const u8* payload, u32 len) {
 }
 
 int main(int argc, char** argv) {
-    const char* sock = "/tmp/neogpu.sock";
+    char default_sock[108];
+    const char* sock = default_socket_path(default_sock, sizeof(default_sock));
     const char* host = NULL;
     char port_number[6] = "8765";
     const char* port = port_number;
@@ -257,6 +279,11 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         usage(argv[0]);
         return 2;
+    }
+
+    if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
+        usage(argv[0]);
+        return 0;
     }
 
     while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
@@ -336,7 +363,7 @@ int main(int argc, char** argv) {
         if (ngip_request(fd, OP_SET_CHAN_BUDGET, 0, cid, p, sizeof(p), out, &out_len, sizeof(out)) != 0) return 1;
         u32 oldv = 0, newv = 0;
         if (hs_unpack_u32x2(out, out_len, &oldv, &newv)) {
-            if (oldv == 0xFFFFFFFFu || newv == 0xFFFFFFFFu) printf("set-budget: invalid channel %u\n", (unsigned)ch);
+            if (oldv == 0xFFFFFFFFu || newv == 0xFFFFFFFFu) printf("set-budget: rejected (channel %u must be 1..3, budget >= %u)\n", (unsigned)ch, (unsigned)HS_CHAN_BUDGET_MIN);
             else printf("set-budget: ch=%u %u -> %u\n", (unsigned)ch, (unsigned)oldv, (unsigned)newv);
         } else return 1;
 

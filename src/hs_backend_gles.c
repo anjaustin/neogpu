@@ -2,6 +2,9 @@
 #include "hs_gpu.h"
 #include "hs_graphics.h"
 #include "hs_nodes.h"
+#include "hs_text.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 typedef struct {
     HSGraphics gfx;
@@ -12,6 +15,13 @@ typedef struct {
     u32    vbo_sizes[16];
     GLint pos_loc;
     GLint color_loc;
+    GLint offset_loc;  /* per-instance vec2 offset; constant (0,0) for plain draws */
+
+    HSFont font;       /* loaded at init; OP_DRAW_TEXT is a no-op without it */
+    bool   font_ok;
+    u32    text_line;  /* OP_DRAW_TEXT lines drawn so far in this frame */
+    char   capture_path[256]; /* non-empty: read back the next frame before presenting */
+    bool   capture_ok;
 
     GLuint tex_program;
     GLuint quad_vbo;
@@ -60,7 +70,11 @@ static GLuint hs_compile_shader(GLenum type, const char* src) {
 static GLuint hs_create_program(const char* vs_src, const char* fs_src) {
     GLuint vs = hs_compile_shader(GL_VERTEX_SHADER, vs_src);
     GLuint fs = hs_compile_shader(GL_FRAGMENT_SHADER, fs_src);
-    if (!vs || !fs) return 0;
+    if (!vs || !fs) {
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+        return 0;
+    }
     GLuint p = glCreateProgram();
     glAttachShader(p, vs);
     glAttachShader(p, fs);
@@ -79,6 +93,7 @@ static GLuint hs_create_program(const char* vs_src, const char* fs_src) {
 static bool gles_init(void* ctx, HSGpu* gpu) {
     (void)gpu;
     HSGLESBackend* b = (HSGLESBackend*)ctx;
+    if (!b) return false;
     memset(b, 0, sizeof(*b));
 
     b->gfx_ok = (hs_graphics_init(&b->gfx) == 0);
@@ -87,9 +102,10 @@ static bool gles_init(void* ctx, HSGpu* gpu) {
     static const char* vs =
         "attribute vec2 a_position;\n"
         "attribute vec3 a_color;\n"
+        "attribute vec2 a_offset;\n"
         "varying vec3 v_color;\n"
         "void main(){\n"
-        "  gl_Position = vec4(a_position,0.0,1.0);\n"
+        "  gl_Position = vec4(a_position + a_offset,0.0,1.0);\n"
         "  v_color = a_color;\n"
         "}\n";
 
@@ -105,6 +121,7 @@ static bool gles_init(void* ctx, HSGpu* gpu) {
 
     b->pos_loc = glGetAttribLocation(b->program, "a_position");
     b->color_loc = glGetAttribLocation(b->program, "a_color");
+    b->offset_loc = glGetAttribLocation(b->program, "a_offset");
 
     float verts[] = {
         /* x, y, r, g, b */
@@ -166,12 +183,18 @@ static bool gles_init(void* ctx, HSGpu* gpu) {
         hs_graphics_create_texture(&b->gfx, 0, 16, 16, pixels);
     }
 
+    /* Font for OP_DRAW_TEXT (see hs_font_load_default for the search order). */
+    b->font_ok = hs_font_load_default(&b->font);
+    if (b->font_ok) hs_font_upload_texture(&b->font);
+    b->font_ok = b->font_ok && b->font.atlas_tex != 0;
+
     return true;
 }
 
 static void gles_shutdown(void* ctx, HSGpu* gpu) {
     (void)gpu;
     HSGLESBackend* b = (HSGLESBackend*)ctx;
+    if (!b) return;
     if (b->fallback_vbo) glDeleteBuffers(1, &b->fallback_vbo);
     if (b->quad_vbo) glDeleteBuffers(1, &b->quad_vbo);
     for (int i = 0; i < 16; i++) {
@@ -179,18 +202,19 @@ static void gles_shutdown(void* ctx, HSGpu* gpu) {
     }
     if (b->program) glDeleteProgram(b->program);
     if (b->tex_program) glDeleteProgram(b->tex_program);
+    if (b->font_ok) hs_font_unload(&b->font);
     if (b->gfx_ok) hs_graphics_finish(&b->gfx);
     memset(b, 0, sizeof(*b));
+    free(b); /* the context belongs to this backend instance; see hs_backend_gles_create */
 }
 
-static GLuint gles_get_vbo_for_buffer(HSGLESBackend* b, HSBuffer* buf, u8 idx) {
-    if (!b) return 0;
-    if (!buf || !buf->data || buf->length == 0) return b->fallback_vbo;
+#define HS_GLES_VERTEX_BYTES   (5u * 4u)  /* x,y,r,g,b */
+#define HS_GLES_INSTANCE_BYTES (2u * 4u)  /* per-instance x,y offset */
 
-    /* Expect 5 floats per vertex: x,y,r,g,b */
-    u32 stride = 5 * 4;
+/* Upload (when dirty) a memory bank's bytes to its VBO. 0 if the bank is empty. */
+static GLuint gles_upload_bank(HSGLESBackend* b, HSBuffer* buf, u8 idx) {
+    if (!b || !buf || !buf->data || buf->length == 0) return 0;
     u32 byte_len = buf->length;
-    if (byte_len < 3 * stride) return b->fallback_vbo;
 
     if (!b->vbos[idx]) {
         glGenBuffers(1, &b->vbos[idx]);
@@ -207,9 +231,49 @@ static GLuint gles_get_vbo_for_buffer(HSGLESBackend* b, HSBuffer* buf, u8 idx) {
     return b->vbos[idx];
 }
 
+/* Vertex source for a draw: the bank when it holds at least one triangle,
+ * otherwise the built-in triangle. *vertices is the number of whole vertices. */
+static GLuint gles_get_vbo_for_buffer(HSGLESBackend* b, HSBuffer* buf, u8 idx, GLsizei* vertices) {
+    *vertices = 3;
+    if (!b) return 0;
+    if (!buf || !buf->data || buf->length < 3 * HS_GLES_VERTEX_BYTES) return b->fallback_vbo;
+    GLuint vbo = gles_upload_bank(b, buf, idx);
+    if (!vbo) return b->fallback_vbo;
+    *vertices = (GLsizei)(buf->length / HS_GLES_VERTEX_BYTES);
+    return vbo;
+}
+
+/* Binary PPM of the current back buffer, top row first. Must run before the
+ * frame is presented: after a page flip the back buffer content is undefined. */
+static bool gles_capture_ppm(HSGLESBackend* b, const char* path) {
+    u32 w = b->gfx.screen_width, h = b->gfx.screen_height;
+    if (!w || !h) return false;
+    /* GL_RGBA/GL_UNSIGNED_BYTE is the only read format GLES guarantees;
+     * GL_RGB fails with GL_INVALID_OPERATION and leaves the buffer untouched. */
+    u8* pixels = malloc((size_t)w * h * 4);
+    u8* row_rgb = malloc((size_t)w * 3);
+    if (!pixels || !row_rgb) { free(pixels); free(row_rgb); return false; }
+    while (glGetError() != GL_NO_ERROR) {}
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    bool ok = glGetError() == GL_NO_ERROR;
+    FILE* f = ok ? fopen(path, "wb") : NULL;
+    ok = ok && f && fprintf(f, "P6\n%u %u\n255\n", w, h) > 0;
+    for (u32 row = 0; ok && row < h; row++) {
+        const u8* src = pixels + (size_t)(h - 1 - row) * w * 4;
+        for (u32 x = 0; x < w; x++) memcpy(row_rgb + (size_t)x * 3, src + (size_t)x * 4, 3);
+        ok = fwrite(row_rgb, 1, (size_t)w * 3, f) == (size_t)w * 3;
+    }
+    if (f && fclose(f) != 0) ok = false;
+    free(pixels);
+    free(row_rgb);
+    return ok;
+}
+
 static void gles_execute(void* ctx, const HSFrameContext* frame) {
     HSGLESBackend* b = (HSGLESBackend*)ctx;
     if (!b->gfx_ok || !frame || !frame->render) return;
+    b->text_line = 0;
 
     for (u32 i = 0; i < frame->render->count; i++) {
         const HSRenderCmd* c = &frame->render->cmds[i];
@@ -269,9 +333,13 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
                 } else {
                     glEnable(GL_SCISSOR_TEST);
                     /* Messages are treated as top-left origin pixels. */
-                    int sy = (int)b->gfx.screen_height - (int)(y + h);
-                    if (sy < 0) sy = 0;
-                    glScissor((int)x, sy, (int)w, (int)h);
+                    /* GL's origin is bottom-left: trim the part of the rect
+                     * below the bottom edge instead of shifting it up. */
+                    long sy = (long)b->gfx.screen_height - (long)(y + h);
+                    long sh = (long)h;
+                    if (sy < 0) { sh += sy; sy = 0; }
+                    if (sh < 0) sh = 0;
+                    glScissor((int)x, (int)sy, (int)w, (int)sh);
                 }
                 break;
             }
@@ -310,19 +378,50 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
             case HS_RC_DRAW:
             case HS_RC_DRAW_INSTANCE:
             {
+                bool instanced = (HSRenderOp)c->op == HS_RC_DRAW_INSTANCE;
+                u32 instances = instanced ? c->x : 1;
+                if (instances == 0) break;
                 u8 buf_idx = c->a & 0xF;
                 HSBuffer* cpu_buf = NULL;
                 if (frame->gpu) {
                     cpu_buf = hs_gpu_get_buffer((HSGpu*)frame->gpu, buf_idx);
                 }
-                GLuint vbo = gles_get_vbo_for_buffer(b, cpu_buf, buf_idx);
+                GLsizei vertices = 3;
+                GLuint vbo = gles_get_vbo_for_buffer(b, cpu_buf, buf_idx, &vertices);
                 glUseProgram(b->program);
                 glBindBuffer(GL_ARRAY_BUFFER, vbo);
                 glEnableVertexAttribArray(b->pos_loc);
                 glVertexAttribPointer(b->pos_loc, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
                 glEnableVertexAttribArray(b->color_loc);
                 glVertexAttribPointer(b->color_loc, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(2 * sizeof(float)));
-                glDrawArrays(GL_TRIANGLES, 0, 3);
+
+                /* Per-instance offsets come from the instance bank (2 floats
+                 * per instance) when it holds one for every instance;
+                 * otherwise every instance is drawn at offset (0,0). */
+                GLuint instance_vbo = 0;
+                if (instanced && frame->gpu && b->offset_loc >= 0) {
+                    u8 inst_idx = c->b & 0xF;
+                    HSBuffer* inst = hs_gpu_get_buffer((HSGpu*)frame->gpu, inst_idx);
+                    if (inst && inst->data && (u64)inst->length >= (u64)instances * HS_GLES_INSTANCE_BYTES)
+                        instance_vbo = gles_upload_bank(b, inst, inst_idx);
+                }
+                if (b->offset_loc >= 0) {
+                    if (instance_vbo) {
+                        glBindBuffer(GL_ARRAY_BUFFER, instance_vbo);
+                        glEnableVertexAttribArray((GLuint)b->offset_loc);
+                        glVertexAttribPointer((GLuint)b->offset_loc, 2, GL_FLOAT, GL_FALSE, HS_GLES_INSTANCE_BYTES, (void*)0);
+                        glVertexAttribDivisor((GLuint)b->offset_loc, 1);
+                    } else {
+                        glDisableVertexAttribArray((GLuint)b->offset_loc);
+                        glVertexAttrib2f((GLuint)b->offset_loc, 0.0f, 0.0f);
+                    }
+                }
+                if (instanced) glDrawArraysInstanced(GL_TRIANGLES, 0, vertices, (GLsizei)instances);
+                else glDrawArrays(GL_TRIANGLES, 0, vertices);
+                if (instance_vbo) {
+                    glVertexAttribDivisor((GLuint)b->offset_loc, 0);
+                    glDisableVertexAttribArray((GLuint)b->offset_loc);
+                }
                 break;
             }
 
@@ -331,7 +430,33 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
                 glClearStencil((GLint)c->a);
                 glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
                 break;
-            case HS_RC_DRAW_TEXT:
+            case HS_RC_DRAW_TEXT: {
+                /* One line per command, stacked from the top-left corner. The
+                 * string is the (NUL-terminated) payload of the message. */
+                const HSSystem* sys = frame->sys;
+                if (!b->font_ok || !sys || !sys->payloads || c->payload_idx >= sys->payload_capacity) break;
+                char text[HS_PAYLOAD_SIZE + 1];
+                u32 len = c->payload_len > HS_PAYLOAD_SIZE ? HS_PAYLOAD_SIZE : c->payload_len;
+                memcpy(text, sys->payloads[c->payload_idx].data, len);
+                text[len] = 0;
+                /* NDC per screen pixel on each axis; glyphs drawn at 2x. */
+                float px = 2.0f / (float)(b->gfx.screen_width ? b->gfx.screen_width : 1);
+                float py = 2.0f / (float)(b->gfx.screen_height ? b->gfx.screen_height : 1);
+                float sx = 2.0f * px, sy = 2.0f * py;
+                float line = (float)(b->font.line_height ? b->font.line_height : 16) * sy;
+                float x = -1.0f + 8.0f * px;
+                float y = 1.0f - 8.0f * py - (float)b->text_line * line;
+                b->text_line++;
+                /* The text renderer enables alpha blending; keep the frame's own blend state. */
+                GLboolean blend_on = glIsEnabled(GL_BLEND);
+                GLint src = GL_ONE, dst = GL_ZERO;
+                glGetIntegerv(GL_BLEND_SRC_RGB, &src);
+                glGetIntegerv(GL_BLEND_DST_RGB, &dst);
+                hs_font_render_text_xy(&b->font, text, x, y, sx, sy, 1.0f, 1.0f, 1.0f, 1.0f);
+                glBlendFunc((GLenum)src, (GLenum)dst);
+                if (!blend_on) glDisable(GL_BLEND);
+                break;
+            }
             case HS_RC_SHOW_TEXTURE: {
                 u8 slot = c->a & 0x0F;
                 GLuint tex = hs_graphics_get_gl_texture(&b->gfx, slot);
@@ -354,6 +479,10 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
         }
     }
 
+    if (b->capture_path[0]) {
+        b->capture_ok = gles_capture_ppm(b, b->capture_path);
+        b->capture_path[0] = 0;
+    }
     hs_graphics_present(&b->gfx);
 }
 
@@ -366,9 +495,27 @@ static const HSBackendOps g_ops = {
 };
 
 HSBackend hs_backend_gles_create(void) {
-    static HSGLESBackend backend_state;
+    /* Each backend owns its own context (previously one static instance was
+     * shared, so a second init wiped the first backend's live state). The
+     * context is released by the backend's shutdown, which hs_gpu_shutdown
+     * and a failed hs_gpu_attach_backend both call. ctx is NULL if out of memory. */
     HSBackend b;
-    b.ctx = &backend_state;
+    b.ctx = calloc(1, sizeof(HSGLESBackend));
     b.ops = &g_ops;
     return b;
+}
+
+bool hs_backend_gles_capture_next(HSBackend* backend, const char* path) {
+    if (!backend || backend->ops != &g_ops || !backend->ctx || !path) return false;
+    HSGLESBackend* b = (HSGLESBackend*)backend->ctx;
+    if (!b->gfx_ok || strlen(path) >= sizeof(b->capture_path)) return false;
+    memcpy(b->capture_path, path, strlen(path) + 1);
+    b->capture_ok = false;
+    return true;
+}
+
+bool hs_backend_gles_capture_ok(const HSBackend* backend) {
+    if (!backend || backend->ops != &g_ops || !backend->ctx) return false;
+    const HSGLESBackend* b = (const HSGLESBackend*)backend->ctx;
+    return b->capture_ok && !b->capture_path[0];
 }

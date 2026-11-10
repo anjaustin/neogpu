@@ -14,6 +14,11 @@
 #define NODE_SYSTEM  6
 #define NODE_INPUT   7
 
+/* OP_ACK status (Message.flags of the ACK). */
+#define HS_ACK_OK           0u
+#define HS_ACK_UNHANDLED    1u  /* opcode not handled by the destination node */
+#define HS_ACK_INVALID      2u  /* failed schema validation (destination, payload length/index, string termination) or decoding; nothing applied */
+
 typedef struct {
     u8   current_shader;
     f32  params[16][4];

@@ -131,5 +131,5 @@ make run
 
 ### Tests & Benchmarks
 - `src/main.c` - Test suite (28 core tests)
-- `src/benchmark.c` - Benchmarks
+- `src/benchmark.c` - Historical port comparison benchmark (`make bench-legacy`; not a gate)
 - `tests/test_01-06_*.c` - Graphics tests (run on Pi)

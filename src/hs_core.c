@@ -288,7 +288,7 @@ static bool hs_submit_enqueue(HSSystem* sys, HSChannel ch, const Message* msg, c
     for (;;) {
         HSSubmitSlot* slot = &q->slots[hs_ring_index(pos, HS_SUBMIT_SIZE)];
         u32 seq = atomic_load_explicit(&slot->seq, memory_order_acquire);
-        intptr_t dif = (intptr_t)seq - (intptr_t)pos;
+        int32_t dif = (int32_t)(seq - pos);
         if (dif == 0) {
             if (atomic_compare_exchange_weak_explicit(
                     &q->enqueue_pos, &pos, pos + 1,
@@ -319,7 +319,7 @@ static bool hs_submit_dequeue(HSSystem* sys, HSChannel ch, Message* out_msg, u8 
     for (;;) {
         HSSubmitSlot* slot = &q->slots[hs_ring_index(pos, HS_SUBMIT_SIZE)];
         u32 seq = atomic_load_explicit(&slot->seq, memory_order_acquire);
-        intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
+        int32_t dif = (int32_t)(seq - (pos + 1));
         if (dif == 0) {
             if (atomic_compare_exchange_weak_explicit(
                     &q->dequeue_pos, &pos, pos + 1,
@@ -569,7 +569,7 @@ static void hs_backpressure_wait(HSSystem* sys) {
     pthread_mutex_lock(&sys->bp_lock);
     /* Timed wait to avoid missed wakeups causing long stalls. */
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     long nsec = ts.tv_nsec + 1000000L; /* +1ms */
     ts.tv_sec += nsec / 1000000000L;
     ts.tv_nsec = nsec % 1000000000L;
@@ -640,7 +640,7 @@ bool hs_toolbus_wait(HSSystem* sys, u32 after_seq, u32 cid, u8 result_op, u8* ou
 
     const u64 deadline_ns = (u64)timeout_ms * 1000000ull;
     struct timespec start_ts;
-    clock_gettime(CLOCK_REALTIME, &start_ts);
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
 
     for (;;) {
         for (u32 i = 0; i < HS_TOOLBUS_SIZE; i++) {
@@ -657,7 +657,7 @@ bool hs_toolbus_wait(HSSystem* sys, u32 after_seq, u32 cid, u8 result_op, u8* ou
         }
 
         struct timespec now;
-        clock_gettime(CLOCK_REALTIME, &now);
+        clock_gettime(CLOCK_MONOTONIC, &now);
         u64 elapsed_ns = (u64)(now.tv_sec - start_ts.tv_sec) * 1000000000ull;
         long dn = now.tv_nsec - start_ts.tv_nsec;
         if (dn < 0) { elapsed_ns -= 1000000000ull; dn += 1000000000L; }
@@ -670,7 +670,7 @@ bool hs_toolbus_wait(HSSystem* sys, u32 after_seq, u32 cid, u8 result_op, u8* ou
         u64 remain_ns = deadline_ns - elapsed_ns;
         u64 wait_ns = remain_ns > 10000000ull ? 10000000ull : remain_ns;
         struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
+        clock_gettime(CLOCK_MONOTONIC, &ts);
         u64 add = (u64)ts.tv_nsec + wait_ns;
         ts.tv_sec += (time_t)(add / 1000000000ull);
         ts.tv_nsec = (long)(add % 1000000000ull);
@@ -831,6 +831,15 @@ static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
     [OP_PRESENT]       = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
     [OP_FENCE]         = {NODE_SYSTEM, HS_PAYLOAD_NONE,   0, 0},
 
+    /* Input ops previously had no entry, so validation compared them against
+     * a zeroed spec (destination NODE_CPU) and rejected every one. Minimum
+     * lengths match what input_node_process decodes. */
+    [OP_INPUT_KEY]          = {NODE_INPUT, HS_PAYLOAD_RANGE, 3, HS_PAYLOAD_SIZE},
+    [OP_INPUT_MOUSE]        = {NODE_INPUT, HS_PAYLOAD_RANGE, 8, HS_PAYLOAD_SIZE},
+    [OP_INPUT_GAMEPAD]      = {NODE_INPUT, HS_PAYLOAD_RANGE, 8, HS_PAYLOAD_SIZE},
+    [OP_INPUT_DEVICE_ADD]   = {NODE_INPUT, HS_PAYLOAD_RANGE, 0, HS_PAYLOAD_SIZE},
+    [OP_INPUT_DEVICE_REMOVE]= {NODE_INPUT, HS_PAYLOAD_RANGE, 0, HS_PAYLOAD_SIZE},
+
     [OP_QUERY_STATS]     = {NODE_SYSTEM, HS_PAYLOAD_NONE,  0, 0},
     [OP_QUERY_FABRIC]    = {NODE_SYSTEM, HS_PAYLOAD_NONE,  0, 0},
     [OP_SET_RECORD_MASK] = {NODE_SYSTEM, HS_PAYLOAD_FIXED, 4, 4},
@@ -952,12 +961,14 @@ void hs_set_record_mask(HSSystem* sys, u32 mask) {
     hs_unlock(sys);
 }
 
-void hs_set_channel_budget(HSSystem* sys, HSChannel ch, u32 budget) {
-    if (!sys) return;
-    if (ch <= CHAN_DEFAULT || ch >= CHAN_COUNT) return;
+bool hs_set_channel_budget(HSSystem* sys, HSChannel ch, u32 budget) {
+    if (!sys) return false;
+    if (ch <= CHAN_DEFAULT || ch >= CHAN_COUNT) return false;
+    if (budget < HS_CHAN_BUDGET_MIN) return false;
     hs_lock(sys);
     sys->chan_budget[(u32)ch] = budget;
     hs_unlock(sys);
+    return true;
 }
 
 bool mq_push(MessageQueue* q, Message* msg) {
@@ -1063,12 +1074,18 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
         sys->lock_inited = true;
     }
 
+    /* Timed waits use CLOCK_MONOTONIC: the Pi has no RTC, so wall-clock
+     * steps from NTP after boot are routine and must not stretch or cut waits. */
+    pthread_condattr_t cattr;
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
     pthread_mutex_init(&sys->bp_lock, NULL);
-    pthread_cond_init(&sys->bp_cv, NULL);
+    pthread_cond_init(&sys->bp_cv, &cattr);
     atomic_init(&sys->bp_waiters, 0);
 
     pthread_mutex_init(&sys->toolbus_lock, NULL);
-    pthread_cond_init(&sys->toolbus_cv, NULL);
+    pthread_cond_init(&sys->toolbus_cv, &cattr);
+    pthread_condattr_destroy(&cattr);
     sys->toolbus_inited = true;
     sys->toolbus_seq = 0;
     sys->toolbus_head = 0;

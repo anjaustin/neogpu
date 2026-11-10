@@ -258,9 +258,12 @@ static inline mat4 m4_transpose(mat4 m) {
     mat4 result;
     float32x4x2_t t1 = vtrnq_f32(m.val[0], m.val[1]);
     float32x4x2_t t2 = vtrnq_f32(m.val[2], m.val[3]);
+    /* t1 = {a0,b0,a2,b2},{a1,b1,a3,b3}; t2 = {c0,d0,c2,d2},{c1,d1,c3,d3}.
+     * Row k takes lane k of every column: rows 0/2 come from val[0]'s low/high
+     * halves, rows 1/3 from val[1]'s. (Rows 1 and 2 were previously swapped.) */
     result.val[0] = vcombine_f32(vget_low_f32(t1.val[0]), vget_low_f32(t2.val[0]));
-    result.val[1] = vcombine_f32(vget_high_f32(t1.val[0]), vget_high_f32(t2.val[0]));
-    result.val[2] = vcombine_f32(vget_low_f32(t1.val[1]), vget_low_f32(t2.val[1]));
+    result.val[1] = vcombine_f32(vget_low_f32(t1.val[1]), vget_low_f32(t2.val[1]));
+    result.val[2] = vcombine_f32(vget_high_f32(t1.val[0]), vget_high_f32(t2.val[0]));
     result.val[3] = vcombine_f32(vget_high_f32(t1.val[1]), vget_high_f32(t2.val[1]));
     return result;
 }

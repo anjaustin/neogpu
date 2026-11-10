@@ -36,10 +36,18 @@ typedef struct {
 
 bool hs_font_load_fnt(HSFont* font, const char* fnt_path, const u8* atlas_data, int atlas_w, int atlas_h);
 bool hs_font_load(HSFont* font, const char* base_path);
+/* Load the bundled font: $NEOGPU_FONT if set, else src/medodica_font relative
+ * to the working directory, else relative to the running executable's
+ * directory (binaries are built at the repository root). */
+bool hs_font_load_default(HSFont* font);
 void hs_font_unload(HSFont* font);
 void hs_font_upload_texture(HSFont* font);
 
 void hs_font_render_text(const HSFont* font, const char* text, float x, float y, float scale, float r, float g, float b, float a);
+/* As above with separate horizontal/vertical NDC-per-font-pixel scales, so
+ * glyphs keep their shape on a non-square target. */
+void hs_font_render_text_xy(const HSFont* font, const char* text, float x, float y, float scale_x, float scale_y,
+                            float r, float g, float b, float a);
 
 float hs_font_text_width(const HSFont* font, const char* text, float scale);
 float hs_font_text_height(const HSFont* font, float scale);

@@ -42,6 +42,9 @@ typedef struct {
     _Atomic(uint64_t)* dropped_events;
     void* owner;
     bool thread_started;
+    atomic_bool failed;    /* reader stopped on a device error; slot is reclaimed on next add/stop */
+    bool dropping;         /* reader-owned: discarding until SYN_REPORT after SYN_DROPPED */
+    bool resync_pending;   /* reader-owned: key state must be re-read (EVIOCGKEY) */
 } HSEvdevDevice;
 
 typedef struct {
@@ -62,6 +65,7 @@ typedef struct {
 
     _Atomic(uint64_t) event_count;
     _Atomic(uint64_t) dropped_events;
+    atomic_bool release_pending; /* a device failed: release held keys after the next drain */
 
     pthread_mutex_t queue_mutex;
     pthread_mutex_t device_mutex;
@@ -81,6 +85,11 @@ u32 hs_input_spsc_available(const HSInputSpscQueue* q);
 
 bool hs_input_stream_init(HSInputStream* stream);
 bool hs_input_stream_add_device(HSInputStream* stream, const char* device_path);
+/* Feed one batch of raw events from device_idx exactly as its reader thread
+ * does (SYN_DROPPED handling, EVIOCGKEY resync, filtering). Used by the reader
+ * and by tests; call it directly only while the stream is not running. */
+void hs_input_stream_device_events(HSInputStream* stream, int device_idx,
+                                   const struct input_event* events, size_t count);
 bool hs_input_stream_start(HSInputStream* stream);
 void hs_input_stream_stop(HSInputStream* stream);
 void hs_input_stream_shutdown(HSInputStream* stream);

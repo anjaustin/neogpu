@@ -61,11 +61,18 @@ def serve(arguments, family, address):
                 assert status == 0 and returned_op == op and len(result) == (96 if op == 39 else 8)
             assert request(connection, 41, 212, struct.pack("<B3xI", 2, 8192))[0] == 0
             assert request(connection, 42, 213, bytes((2, 0)))[0] == 0
+            # A zero budget would stop RT draining (and all IPC with it): rejected.
+            assert request(connection, 41, 214, struct.pack("<B3xI", 1, 0)) == (0, 41, struct.pack("<II", 0xFFFFFFFF, 0xFFFFFFFF))
+            assert request(connection, 38, 215)[0] == 0
         # Execute the documented standalone client, not only this test's client.
         options = ["--sock", address] if family == socket.AF_UNIX else ["--host", "localhost", "--port", str(address[1])]
         for command, marker in (("query-stats", "stats:"), ("query-fabric", "fabric:")):
             result = subprocess.run([TOOL, *options, command], capture_output=True, text=True, timeout=3)
             assert result.returncode == 0 and marker in result.stdout and "decode failed" not in result.stdout, result
+        result = subprocess.run([TOOL, *options, "set-budget", "1", "0"], capture_output=True, text=True, timeout=3)
+        assert result.returncode == 0 and "rejected" in result.stdout, result
+        result = subprocess.run([TOOL, *options, "query-stats"], capture_output=True, text=True, timeout=3)
+        assert result.returncode == 0 and "stats:" in result.stdout, result
         for arguments in (("set-record-mask", "bad"), ("set-budget", "258", "10"),
                           ("set-block", "2", "2"), ("fence", "-1", "4")):
             result = subprocess.run([TOOL, *options, *arguments], capture_output=True, timeout=3)
@@ -124,9 +131,17 @@ with socket.socket() as reserve:
 serve(["--ipc-tcp", str(port)], socket.AF_INET, ("127.0.0.1", port))
 for arguments in (["--nonsense"], ["--ipc-tcp", "bad"], ["--ipc-tcp", "65536"],
                   ["--ipc-server", "tests/invalid.sock", "--ipc-ms", "-1"],
-                  ["--benchmark-producers", "0"], ["--benchmark-producers", "33"]):
+                  ["--benchmark-producers", "0"], ["--benchmark-producers", "33"],
+                  # In-process tool mode: values are parsed strictly, never truncated.
+                  ["--tool", "--set-budget", "rt", "10"], ["--tool", "--set-budget", "257", "10"],
+                  ["--tool", "--set-block", "1", "2"], ["--tool", "--set-record-mask", "0xZZ"],
+                  ["--tool", "--query-stats", "--loop", "99999999"], ["--tool", "--query-stats", "--loop", "-5"]):
     result = subprocess.run(["./neogpu_demo", *arguments], capture_output=True, timeout=3)
     assert result.returncode == 2, arguments
+    if arguments[0].startswith("--ipc"):
+        assert b"server options" in result.stderr, (arguments, result.stderr)
+result = subprocess.run(["./neogpu_demo", "--tool", "--set-budget", "1", "0"], capture_output=True, text=True, timeout=5)
+assert result.returncode == 0 and "rejected" in result.stdout, result
 with tempfile.TemporaryDirectory(prefix="cli-existing-", dir="tests") as directory:
     path = Path(directory) / "do-not-replace"
     path.write_text("user data")

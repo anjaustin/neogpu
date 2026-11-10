@@ -1,3 +1,4 @@
+#define _GNU_SOURCE /* accept4 */
 #include "hs_ipc.h"
 #include "hs_nodes.h"
 
@@ -189,13 +190,18 @@ static int hs_ipc_handle_req(HSIpcServer* srv, int cfd, const HSIpcHdr* hdr) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     u32 after_seq = hs_toolbus_seq(sys);
+    /* Correlate on a server-unique id, not the client's cid: a request that
+     * timed out still executes later, and its late result must never be
+     * mistaken for the answer to a subsequent request. 0 means "none". */
+    u32 internal_cid = ++srv->next_cid;
+    if (internal_cid == 0) internal_cid = ++srv->next_cid;
 
     Message m = {
         .to = NODE_SYSTEM,
         .from = NODE_CPU,
         .op = req->op,
         .flags = 0,
-        .cid = hdr->cid,
+        .cid = internal_cid,
         .tick = 0,
         .payload_idx = 0,
         .payload_len = 0,
@@ -220,7 +226,7 @@ static int hs_ipc_handle_req(HSIpcServer* srv, int cfd, const HSIpcHdr* hdr) {
     u8 out[HS_TOOLBUS_PAYLOAD_MAX];
     u32 out_len = 0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    if (!hs_toolbus_wait(sys, after_seq, hdr->cid, req->op, out, &out_len, 250)) {
+    if (!hs_toolbus_wait(sys, after_seq, internal_cid, req->op, out, &out_len, 250)) {
         hs_ipc_send_error(cfd, hdr->cid, HS_IPC_ERR_TIMEOUT);
         return 0;
     }
@@ -261,10 +267,16 @@ static void* hs_ipc_thread_main(void* arg) {
         if (ready < 0 && errno == EINTR) continue;
         if (ready < 0) break;
         if (ready == 0) continue;
-        int client = accept(fd, NULL, NULL);
+        int client = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
         if (client < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
-            break;
+            int err = errno;
+            if (atomic_load_explicit(&srv->stop, memory_order_acquire)) break;
+            /* Only a dead listening socket ends the loop. Resource exhaustion
+             * (EMFILE/ENFILE/ENOBUFS/ENOMEM) and aborted handshakes are
+             * transient: back off briefly instead of abandoning the backlog. */
+            if (err == EBADF || err == EINVAL || err == ENOTSOCK) break;
+            if (err != EINTR && err != EAGAIN && err != EWOULDBLOCK) poll(NULL, 0, 10);
+            continue;
         }
         if (srv->mode == HS_IPC_MODE_TCP) {
             int enabled = 1;
@@ -298,7 +310,7 @@ static void* hs_ipc_thread_main(void* arg) {
 static bool hs_ipc_start_common(HSIpcServer* srv) {
     int fd;
     if (srv->mode == HS_IPC_MODE_TCP) {
-        fd = socket(AF_INET, SOCK_STREAM, 0);
+        fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (fd < 0) return false;
         srv->listen_fd = fd;
 
@@ -309,8 +321,11 @@ static bool hs_ipc_start_common(HSIpcServer* srv) {
         memset(&tcp_addr, 0, sizeof(tcp_addr));
         tcp_addr.sin_family = AF_INET;
         tcp_addr.sin_port = htons(srv->port);
-        if (!srv->addr[0] || strcmp(srv->addr, "0.0.0.0") == 0) {
-            tcp_addr.sin_addr.s_addr = INADDR_ANY;
+        /* No address means loopback. Listening on every interface exposes
+         * unauthenticated control ops, so it must be requested explicitly
+         * ("0.0.0.0"), and only on a trusted network. */
+        if (!srv->addr[0]) {
+            tcp_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         } else {
             if (inet_pton(AF_INET, srv->addr, &tcp_addr.sin_addr) != 1) {
                 close(fd);
@@ -331,7 +346,7 @@ static bool hs_ipc_start_common(HSIpcServer* srv) {
             return false;
         }
     } else {
-        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (fd < 0) return false;
         srv->listen_fd = fd;
 
@@ -343,6 +358,14 @@ static bool hs_ipc_start_common(HSIpcServer* srv) {
         memcpy(addr.sun_path, srv->path, pathlen);
         addr.sun_path[pathlen] = '\0';
 
+        /* Linux creates the socket inode with the fd's mode (masked by umask),
+         * so setting 0600 before bind leaves no window in which another user
+         * could connect. The chmod below remains as a portable backstop. */
+        if (fchmod(fd, 0600) != 0) {
+            close(fd);
+            srv->listen_fd = -1;
+            return false;
+        }
         /* Never remove a caller's existing file/socket to claim its name. */
         if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
             close(fd);

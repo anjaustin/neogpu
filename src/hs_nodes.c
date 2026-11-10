@@ -41,6 +41,22 @@ static SystemState* hs_system_state(Node* node) {
     return node ? (SystemState*)node->state : NULL;
 }
 
+/* Schema gate shared by every ack-emitting node: a message whose payload does
+ * not match its opcode's spec (length, index, string termination) is rejected
+ * before any state changes, and acknowledged as HS_ACK_INVALID. This holds
+ * whether or not the sender enabled validate_on_send. */
+static inline bool hs_f32_bits_finite(f32 value) {
+    u32 bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return (bits & 0x7F800000u) != 0x7F800000u;
+}
+
+static bool node_message_valid(Node* node, const Message* msg) {
+    HSSystem* sys = hs_node_system(node);
+    if (!sys) return msg->payload_len == 0;
+    return hs_validate_message(sys, msg, NULL);
+}
+
 static void emit_ack(Node* node, const Message* req, u8 status) {
     HSSystem* sys = hs_node_system(node);
     if (!sys || !node || !req) return;
@@ -129,6 +145,9 @@ int shader_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
+        const u8 original_op = msg.op;
+        bool bad_payload = !node_message_valid(node, &msg);
+        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
         switch (msg.op) {
             case OP_SET_SHADER:
                 state->current_shader = msg.payload_idx;
@@ -140,7 +159,7 @@ int shader_node_process(Node* node) {
                 if (data && msg.payload_len >= 20) {
                     u32 param_idx = 0;
                     f32 v[4];
-                    if (!hs_unpack_set_param(data, msg.payload_len, &param_idx, v)) break;
+                    if (!hs_unpack_set_param(data, msg.payload_len, &param_idx, v)) { bad_payload = true; break; }
                     if (param_idx < 16) {
                         for (int i = 0; i < 4; i++) state->params[param_idx][i] = v[i];
                         state->params_set |= (1u << param_idx);
@@ -184,7 +203,7 @@ int shader_node_process(Node* node) {
                 void* data = get_payload(node, msg.payload_idx);
                 if (data) {
                     u8 src = 0, dst = 0;
-                    if (!hs_unpack_u8x2(data, msg.payload_len, &src, &dst)) break;
+                    if (!hs_unpack_u8x2(data, msg.payload_len, &src, &dst)) { bad_payload = true; break; }
                     state->blend_src = src;
                     state->blend_dst = dst;
                     DBG_PRINT("[%s] Blend: src=%d, dst=%d\n", node_name(node->id), (int)state->blend_src, (int)state->blend_dst);
@@ -217,7 +236,7 @@ int shader_node_process(Node* node) {
                 void* data = get_payload(node, msg.payload_idx);
                 if (data) {
                     u16 vals[4];
-                    if (!hs_unpack_u16x4(data, msg.payload_len, vals)) break;
+                    if (!hs_unpack_u16x4(data, msg.payload_len, vals)) { bad_payload = true; break; }
                     state->clip_x = vals[0];
                     state->clip_y = vals[1];
                     state->clip_w = vals[2];
@@ -231,7 +250,7 @@ int shader_node_process(Node* node) {
                 void* data = get_payload(node, msg.payload_idx);
                 if (data) {
                     u8 vals[4];
-                    if (!hs_unpack_u8x4(data, msg.payload_len, vals)) break;
+                    if (!hs_unpack_u8x4(data, msg.payload_len, vals)) { bad_payload = true; break; }
                     state->stencil_op = vals[0];
                     state->stencil_fail = vals[1];
                     state->stencil_pass = vals[2];
@@ -245,7 +264,7 @@ int shader_node_process(Node* node) {
                 void* data = get_payload(node, msg.payload_idx);
                 if (data) {
                     u8 vals[4];
-                    if (!hs_unpack_u8x4(data, msg.payload_len, vals)) break;
+                    if (!hs_unpack_u8x4(data, msg.payload_len, vals)) { bad_payload = true; break; }
                     state->stencil_compare = vals[0];
                     state->stencil_ref = vals[1];
                     state->stencil_read_mask = vals[2];
@@ -259,7 +278,7 @@ int shader_node_process(Node* node) {
                 void* data = get_payload(node, msg.payload_idx);
                 if (data) {
                     u8 cmp = 0, wr = 0;
-                    if (!hs_unpack_u8x2(data, msg.payload_len, &cmp, &wr)) break;
+                    if (!hs_unpack_u8x2(data, msg.payload_len, &cmp, &wr)) { bad_payload = true; break; }
                     state->depth_compare = cmp;
                     state->depth_write = wr;
                     DBG_PRINT("[%s] Depth compare: comp=%d, write=%d\n", node_name(node->id), (int)cmp, (int)wr);
@@ -271,7 +290,12 @@ int shader_node_process(Node* node) {
                 handled = 0;
                 break;
         }
-        emit_ack(node, &msg, handled ? 0 : 1);
+        if (bad_payload) {
+            msg.op = original_op;
+            emit_ack(node, &msg, HS_ACK_INVALID);
+        } else {
+            emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);
+        }
         processed++;
     }
 
@@ -299,6 +323,9 @@ int buffer_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
+        const u8 original_op = msg.op;
+        bool bad_payload = !node_message_valid(node, &msg);
+        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
         switch (msg.op) {
             case OP_LOAD_BUFFER:
                 state->buffer_handles[msg.payload_idx & 0xF] = msg.payload_idx;
@@ -316,7 +343,7 @@ int buffer_node_process(Node* node) {
                     u8 buffer_idx = 0;
                     u8 inst_buf = 0;
                     u32 count = 0;
-                    if (!hs_unpack_draw_instance(data, msg.payload_len, &buffer_idx, &inst_buf, &count)) break;
+                    if (!hs_unpack_draw_instance(data, msg.payload_len, &buffer_idx, &inst_buf, &count)) { bad_payload = true; break; }
                     DBG_PRINT("[%s] Draw instance: buffer=%d, inst_buffer=%d, count=%d\n", node_name(node->id), buffer_idx, inst_buf, count);
                 }
                 break;
@@ -334,7 +361,12 @@ int buffer_node_process(Node* node) {
                 handled = 0;
                 break;
         }
-        emit_ack(node, &msg, handled ? 0 : 1);
+        if (bad_payload) {
+            msg.op = original_op;
+            emit_ack(node, &msg, HS_ACK_INVALID);
+        } else {
+            emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);
+        }
         processed++;
     }
 
@@ -362,6 +394,9 @@ int texture_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
+        const u8 original_op = msg.op;
+        bool bad_payload = !node_message_valid(node, &msg);
+        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
         switch (msg.op) {
             case OP_LOAD_TEXTURE:
                 state->texture_handles[msg.payload_idx & 0xF] = msg.payload_idx;
@@ -374,7 +409,7 @@ int texture_node_process(Node* node) {
                 if (data) {
                     u8 tex = 0;
                     u8 depth = 0;
-                    if (!hs_unpack_u8x2(data, msg.payload_len, &tex, &depth)) break;
+                    if (!hs_unpack_u8x2(data, msg.payload_len, &tex, &depth)) { bad_payload = true; break; }
                     state->current_target = tex;
                     state->current_depth_target = depth;
                 } else {
@@ -410,7 +445,12 @@ int texture_node_process(Node* node) {
                 handled = 0;
                 break;
         }
-        emit_ack(node, &msg, handled ? 0 : 1);
+        if (bad_payload) {
+            msg.op = original_op;
+            emit_ack(node, &msg, HS_ACK_INVALID);
+        } else {
+            emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);
+        }
         processed++;
     }
 
@@ -445,12 +485,15 @@ int output_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
+        const u8 original_op = msg.op;
+        bool bad_payload = !node_message_valid(node, &msg);
+        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
         switch (msg.op) {
             case OP_CLEAR: {
                 void* data = get_payload(node, msg.payload_idx);
                 if (data && msg.payload_len >= 4 * sizeof(f32)) {
                     f32 color[4];
-                    if (!hs_unpack_clear_color(data, msg.payload_len, color)) break;
+                    if (!hs_unpack_clear_color(data, msg.payload_len, color)) { bad_payload = true; break; }
                     state->clear_color[0] = color[0];
                     state->clear_color[1] = color[1];
                     state->clear_color[2] = color[2];
@@ -465,7 +508,7 @@ int output_node_process(Node* node) {
                 if (data) {
                     f32 depth = 0.0f;
                     u8 stencil = 0;
-                    if (!hs_unpack_clear_ds(data, msg.payload_len, &depth, &stencil)) break;
+                    if (!hs_unpack_clear_ds(data, msg.payload_len, &depth, &stencil)) { bad_payload = true; break; }
                     state->clear_depth = depth;
                     state->clear_stencil = stencil;
                     DBG_PRINT("[%s] Clear DS: depth=%.2f, stencil=%d\n", node_name(node->id), state->clear_depth, state->clear_stencil);
@@ -477,7 +520,12 @@ int output_node_process(Node* node) {
                 handled = 0;
                 break;
         }
-        emit_ack(node, &msg, handled ? 0 : 1);
+        if (bad_payload) {
+            msg.op = original_op;
+            emit_ack(node, &msg, HS_ACK_INVALID);
+        } else {
+            emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);
+        }
         processed++;
     }
 
@@ -505,13 +553,16 @@ int sound_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
+        const u8 original_op = msg.op;
+        bool bad_payload = !node_message_valid(node, &msg);
+        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
         switch (msg.op) {
             case OP_SET_CHANNEL: {
                 void* data = get_payload(node, msg.payload_idx);
                 if (data) {
                     u8 ch = 0;
                     u8 shader = 0;
-                    if (!hs_unpack_u8x2(data, msg.payload_len, &ch, &shader)) break;
+                    if (!hs_unpack_u8x2(data, msg.payload_len, &ch, &shader)) { bad_payload = true; break; }
                     if (ch < 4) {
                         state->channel_shaders[ch] = shader;
                         DBG_PRINT("[%s] Channel %d -> shader #%d\n", node_name(node->id), ch, shader);
@@ -524,7 +575,12 @@ int sound_node_process(Node* node) {
                 handled = 0;
                 break;
         }
-        emit_ack(node, &msg, handled ? 0 : 1);
+        if (bad_payload) {
+            msg.op = original_op;
+            emit_ack(node, &msg, HS_ACK_INVALID);
+        } else {
+            emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);
+        }
         processed++;
     }
 
@@ -710,7 +766,8 @@ int system_node_process(Node* node) {
                 u32 budget = 0;
                 u32 old = 0;
                 if (sys) {
-                    if (data && hs_unpack_set_chan_budget(data, msg.payload_len, &ch, &budget) && ch < CHAN_COUNT && ch != CHAN_DEFAULT) {
+                    if (data && hs_unpack_set_chan_budget(data, msg.payload_len, &ch, &budget) && ch < CHAN_COUNT && ch != CHAN_DEFAULT &&
+                        budget >= HS_CHAN_BUDGET_MIN) {
                         old = sys->chan_budget[ch];
                         sys->chan_budget[ch] = budget;
                     } else {
@@ -775,6 +832,9 @@ int input_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
+        const u8 original_op = msg.op;
+        bool bad_payload = !node_message_valid(node, &msg);
+        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
         switch (msg.op) {
             case OP_INPUT_KEY: {
                 void* data = get_payload(node, msg.payload_idx);
@@ -800,8 +860,9 @@ int input_node_process(Node* node) {
             case OP_INPUT_MOUSE: {
                 void* data = get_payload(node, msg.payload_idx);
                 if (data && msg.payload_len >= 8) {
-                    s32 x = *(s32*)data;
-                    s32 y = *(s32*)(data + 4);
+                    s32 x, y;
+                    memcpy(&x, data, sizeof(x));
+                    memcpy(&y, (const u8*)data + 4, sizeof(y));
                     state->base.mouse_x = x < 0 ? 0 : (x > HS_WIDTH ? HS_WIDTH : x);
                     state->base.mouse_y = y < 0 ? 0 : (y > HS_HEIGHT ? HS_HEIGHT : y);
                 }
@@ -811,8 +872,13 @@ int input_node_process(Node* node) {
             case OP_INPUT_GAMEPAD: {
                 void* data = get_payload(node, msg.payload_idx);
                 if (data && msg.payload_len >= 8) {
-                    f32 x = *(f32*)data;
-                    f32 y = *(f32*)(data + 4);
+                    f32 x, y;
+                    memcpy(&x, data, sizeof(x));
+                    memcpy(&y, (const u8*)data + 4, sizeof(y));
+                    /* -ffast-math assumes no NaN/Inf, so comparisons cannot be
+                     * trusted to clamp them; test the exponent bits instead. */
+                    if (!hs_f32_bits_finite(x)) x = 0.0f;
+                    if (!hs_f32_bits_finite(y)) y = 0.0f;
                     state->base.pad_x = x < -1.0f ? -1.0f : (x > 1.0f ? 1.0f : x);
                     state->base.pad_y = y < -1.0f ? -1.0f : (y > 1.0f ? 1.0f : y);
                 }
@@ -823,7 +889,12 @@ int input_node_process(Node* node) {
                 handled = 0;
                 break;
         }
-        emit_ack(node, &msg, handled ? 0 : 1);
+        if (bad_payload) {
+            msg.op = original_op;
+            emit_ack(node, &msg, HS_ACK_INVALID);
+        } else {
+            emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);
+        }
         processed++;
     }
 

@@ -1,5 +1,10 @@
 # P0 remediation ledger
 
+> **Later status (2026-11-13):** the "every C source" gate below regressed after
+> this ledger (`tests/panel_mode_probe.c`, added later, did not compile) and the
+> published display-path FPS did not measure displayed frames. Both are fixed
+> and re-verified in [AUDIT_2026-11-13.md](AUDIT_2026-11-13.md).
+
 ## Acceptance contract
 
 - Preserve existing user work and the wire/input opcode ABI.

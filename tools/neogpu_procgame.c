@@ -6,6 +6,8 @@
  * - Meshes (compressed vertices)
  * - Audio (synthesized sounds)
  * 
+ * The ship plays itself; there is no keyboard input. Ctrl-C quits.
+ *
  * Target: < 64KB total including all assets
  */
 
@@ -210,7 +212,7 @@ int main(int argc, char** argv) {
 
     printf("=== NeoGPU Procedural Space Shooter ===\n");
     printf("Procedural textures: %zu bytes\n", sizeof(g_player_tex) + sizeof(g_enemy_tex) + sizeof(g_bullet_tex));
-    printf("Controls: Arrow keys to move, SPACE to fire, Q to quit\n");
+    printf("Self-playing demo (no keyboard input); Ctrl-C to quit\n");
 
     HSGraphics gfx;
     if (hs_graphics_init(&gfx) != 0) {
@@ -282,7 +284,11 @@ int main(int argc, char** argv) {
         }
         
         // Spawn enemies
-        if (frame_count % (60 - wave * 5) == 0) {
+        /* Spawn faster each wave, but never more often than every 10 frames
+         * (an unclamped 60 - wave*5 reaches 0 at wave 12: SIGFPE). */
+        int spawn_interval = 60 - wave * 5;
+        if (spawn_interval < 10) spawn_interval = 10;
+        if (frame_count % spawn_interval == 0) {
             spawn_enemy();
         }
         
@@ -360,11 +366,7 @@ int main(int argc, char** argv) {
         glUniform3f(g_u_color, 0.5f, 0.8f, 1.0f);
         draw_sprite(player.x, player.y, 0.12f, 0.15f);
         
-        hs_graphics_present(&gfx);
-        
-        // 60 FPS
-        struct timespec ts = {0, 16666667};
-        nanosleep(&ts, NULL);
+        hs_graphics_present(&gfx); /* vsync paces the loop at the display's refresh */
         
         // Render audio buffer
         proc_audio_render(&audio, 256);

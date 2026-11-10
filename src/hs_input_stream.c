@@ -84,6 +84,18 @@ static void drain_locked(HSInputStream* stream) {
         atomic_fetch_add_explicit(&stream->event_count, 1, memory_order_relaxed);
         changed = true;
     }
+    /* A device went away. Its own key-up events may have been lost (full
+     * queue, SYN_DROPPED with no device left to resync from), so release
+     * every held key and button once everything queued has been applied.
+     * Pointer position is kept. */
+    if (atomic_exchange(&stream->release_pending, false)) {
+        HSInput* state = &stream->state_a;
+        state->key_left = state->key_right = state->key_up = state->key_down = false;
+        state->button1 = state->button2 = false;
+        state->mouse_left = state->mouse_right = false;
+        state->pad_a = state->pad_b = false;
+        changed = true;
+    }
     if (changed) {
         HSInput* state = &stream->state_a;
         state->dir_x = hs_clamp((float)state->key_right - (float)state->key_left + state->pad_x, -1, 1);
@@ -109,7 +121,8 @@ static void* process_thread(void* arg) {
     pthread_mutex_lock(&stream->queue_mutex);
     while (atomic_load_explicit(&stream->running, memory_order_acquire)) {
         while (atomic_load_explicit(&stream->running, memory_order_acquire) &&
-               (hs_input_spsc_empty(&stream->queue) || atomic_load(&stream->paused))) {
+               ((hs_input_spsc_empty(&stream->queue) && !atomic_load(&stream->release_pending)) ||
+                atomic_load(&stream->paused))) {
             pthread_cond_wait(&stream->queue_not_empty, &stream->queue_mutex);
         }
         if (!atomic_load(&stream->running)) break;
@@ -119,25 +132,93 @@ static void* process_thread(void* arg) {
     return NULL;
 }
 
+/* Key codes apply_event tracks, grouped by the state field they drive. A
+ * resync reports one event per field so aliases (SPACE/ENTER) combine. */
+static const u16 key_groups[][2] = {
+    {KEY_LEFT, 0}, {KEY_RIGHT, 0}, {KEY_UP, 0}, {KEY_DOWN, 0},
+    {KEY_SPACE, KEY_ENTER}, {KEY_DELETE, KEY_BACKSPACE},
+    {BTN_LEFT, 0}, {BTN_RIGHT, 0}, {BTN_A, BTN_START}, {BTN_B, BTN_SELECT},
+};
+
+static bool submit_key(HSInputStream* stream, u16 code, bool pressed) {
+    HSInputEvent event = {.type = EV_KEY, .code = code, .value = pressed ? 1 : 0};
+    return hs_input_stream_submit(stream, &event);
+}
+
+/* Re-read the device's current key state from the kernel and report it. */
+static bool resync_keys(HSEvdevDevice* device) {
+    unsigned char bits[KEY_MAX / 8 + 1];
+    memset(bits, 0, sizeof(bits));
+    if (ioctl(device->fd, EVIOCGKEY(sizeof(bits)), bits) < 0) return false;
+#define KEY_BIT(code) ((bits[(code) / 8] >> ((code) % 8)) & 1)
+    for (size_t g = 0; g < sizeof(key_groups) / sizeof(key_groups[0]); g++) {
+        bool pressed = KEY_BIT(key_groups[g][0]) || (key_groups[g][1] && KEY_BIT(key_groups[g][1]));
+        if (!submit_key(device->owner, key_groups[g][0], pressed)) return false;
+    }
+#undef KEY_BIT
+    return true;
+}
+
+static void device_events(HSEvdevDevice* device, const struct input_event* events, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        const struct input_event* raw = &events[i];
+        if (raw->type == EV_SYN && raw->code == SYN_DROPPED) {
+            /* The kernel buffer overflowed: events up to the next SYN_REPORT
+             * are an incomplete packet, and state must be re-read. */
+            device->dropping = true;
+            continue;
+        }
+        if (raw->type == EV_SYN && raw->code == SYN_REPORT) {
+            if (device->dropping) { device->dropping = false; device->resync_pending = true; }
+            if (device->resync_pending) device->resync_pending = !resync_keys(device);
+            continue;
+        }
+        if (device->dropping) continue;
+        /* Only state-carrying events use queue slots (SYN/MSC are framing). */
+        if (raw->type != EV_KEY && raw->type != EV_REL && raw->type != EV_ABS) continue;
+        HSInputEvent event = {.tv_sec = (u32)raw->time.tv_sec, .tv_usec = (u32)raw->time.tv_usec,
+            .type = raw->type, .code = raw->code, .value = raw->value};
+        /* A lost key transition would leave a key stuck: resync at the next report. */
+        if (!hs_input_stream_submit(device->owner, &event) && raw->type == EV_KEY)
+            device->resync_pending = true;
+    }
+}
+
+void hs_input_stream_device_events(HSInputStream* stream, int device_idx,
+                                   const struct input_event* events, size_t count) {
+    if (!stream || !stream->initialized || device_idx < 0 || device_idx >= HS_INPUT_MAX_DEVICES || !events) return;
+    HSEvdevDevice* device = &stream->devices[device_idx];
+    if (device->fd < 0) return;
+    device_events(device, events, count);
+}
+
 static void* reader_thread(void* arg) {
     HSEvdevDevice* device = arg;
+    bool device_error = false;
     while (atomic_load_explicit(&device->active, memory_order_acquire)) {
         fd_set readers;
         FD_ZERO(&readers);
         FD_SET(device->fd, &readers);
         struct timeval timeout = {0, 10000};
         int rc = select(device->fd + 1, &readers, NULL, NULL, &timeout);
-        if (rc < 0) { if (errno == EINTR) continue; break; }
+        if (rc < 0) { if (errno == EINTR) continue; device_error = true; break; }
         if (!rc) continue;
         struct input_event events[64];
         ssize_t bytes = read(device->fd, events, sizeof(events));
         if (bytes < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-        if (bytes <= 0) break;
-        for (size_t i = 0; i < (size_t)bytes / sizeof(events[0]); i++) {
-            HSInputEvent event = {.tv_sec = events[i].time.tv_sec, .tv_usec = events[i].time.tv_usec,
-                .type = events[i].type, .code = events[i].code, .value = events[i].value};
-            hs_input_stream_submit(device->owner, &event);
-        }
+        if (bytes <= 0) { device_error = true; break; } /* e.g. ENODEV: unplugged */
+        device_events(device, events, (size_t)bytes / sizeof(events[0]));
+    }
+    if (device_error && atomic_load_explicit(&device->active, memory_order_acquire)) {
+        /* Not a requested stop: the device went away (with or without hotplug
+         * watching). Ask the consumer to release held keys; the slot and fd
+         * are reclaimed by the next add_device or stop (under device_mutex). */
+        HSInputStream* stream = device->owner;
+        pthread_mutex_lock(&stream->queue_mutex);
+        atomic_store(&stream->release_pending, true);
+        pthread_cond_signal(&stream->queue_not_empty);
+        pthread_mutex_unlock(&stream->queue_mutex);
+        atomic_store(&device->failed, true);
     }
     atomic_store(&device->active, false);
     return NULL;
@@ -152,6 +233,9 @@ static void stop_device(HSEvdevDevice* device) {
         close(device->fd);
         device->fd = -1;
     }
+    atomic_store(&device->failed, false);
+    device->dropping = false;
+    device->resync_pending = false;
 }
 
 bool hs_input_stream_add_device(HSInputStream* stream, const char* path) {
@@ -159,6 +243,8 @@ bool hs_input_stream_add_device(HSInputStream* stream, const char* path) {
     pthread_mutex_lock(&stream->device_mutex);
     int slot = -1;
     for (int i = 0; i < HS_INPUT_MAX_DEVICES; i++) {
+        /* Reclaim slots whose reader stopped on a device error. */
+        if (stream->devices[i].fd >= 0 && atomic_load(&stream->devices[i].failed)) stop_device(&stream->devices[i]);
         if (stream->devices[i].fd >= 0 && strcmp(stream->devices[i].path, path) == 0) {
             pthread_mutex_unlock(&stream->device_mutex);
             return false;
@@ -238,9 +324,11 @@ bool hs_input_stream_init(HSInputStream* stream) {
     atomic_init(&stream->active_state_ptr, &stream->state_a);
     atomic_init(&stream->running, false); atomic_init(&stream->paused, false);
     atomic_init(&stream->event_count, 0); atomic_init(&stream->dropped_events, 0);
+    atomic_init(&stream->release_pending, false);
     for (int i = 0; i < HS_INPUT_MAX_DEVICES; i++) {
         stream->devices[i].fd = -1;
         atomic_init(&stream->devices[i].active, false);
+        atomic_init(&stream->devices[i].failed, false);
     }
     if (pthread_mutex_init(&stream->queue_mutex, NULL)) return false;
     if (pthread_mutex_init(&stream->device_mutex, NULL)) goto fail_queue;

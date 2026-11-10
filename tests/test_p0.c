@@ -5,12 +5,18 @@
 #include "hs_ipc.h"
 #include "hs_async.h"
 #include "hs_input_stream.h"
+#include "hs_text.h"
+#include <pthread.h>
 #include <sched.h>
 #include <errno.h>
 #include <dirent.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -224,6 +230,16 @@ static void test_ipc_shutdown(void) {
     unlink(path);
     CHECK(!hs_ipc_start_tcp(&failed, &gpu.system, "not-an-address", 12345));
     hs_ipc_stop(&failed);
+    /* No address means loopback, never the wildcard. */
+    for (int variant = 0; variant < 2; variant++) {
+        HSIpcServer tcp = {0};
+        CHECK(hs_ipc_start_tcp(&tcp, &gpu.system, variant ? "" : NULL, 0));
+        struct sockaddr_in bound;
+        socklen_t length = sizeof(bound);
+        CHECK(getsockname(tcp.listen_fd, (struct sockaddr*)&bound, &length) == 0 &&
+              bound.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+        hs_ipc_stop(&tcp);
+    }
 }
 
 typedef struct { HSAsync* async; const char* directory; unsigned first, accepted; } AsyncSubmit;
@@ -381,6 +397,334 @@ static unsigned open_descriptors(void) {
     return count;
 }
 
+/* ---- 2026-11-13 audit regressions ---- */
+
+/* Place an empty Vyukov ring at an arbitrary position: slot for pos p holds p. */
+static void seed_submit_ring(HSSubmitQueue* q, u32 pos) {
+    for (u32 k = 0; k < HS_SUBMIT_SIZE; k++) {
+        u32 p = pos + k;
+        atomic_store(&q->slots[p & (HS_SUBMIT_SIZE - 1)].seq, p);
+    }
+    atomic_store(&q->enqueue_pos, pos);
+    atomic_store(&q->dequeue_pos, pos);
+}
+
+static void fresh_gpu(void) {
+    hs_gpu_shutdown(&gpu);
+    hs_gpu_init(&gpu);
+    gpu.system.recording = false;
+}
+
+static void test_submit_ring_wrap(void) {
+    fresh_gpu();
+    /* Exhaust producer ids so this thread's sends take the MPMC submit ring. */
+    atomic_store(&gpu.system.producer_count, HS_MAX_PRODUCERS);
+    atomic_fetch_add(&gpu.system.producer_epoch, 1);
+    HSSubmitQueue* q = &gpu.system.submit[CHAN_RENDER];
+    ShaderState* shader = &gpu.shader_state;
+    Message m = {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_SET_SHADER,
+                 .payload_idx = 7, .channel = CHAN_RENDER};
+
+    /* Empty ring parked on the last u32 position: dequeue must see "empty"
+     * (the intptr_t difference used to be +2^32 here and spun forever). */
+    seed_submit_ring(q, 0xFFFFFFFFu);
+    hs_step(&gpu.system);
+    CHECK(atomic_load(&q->dequeue_pos) == 0xFFFFFFFFu);
+    CHECK(hs_try_send(&gpu.system, &m, NULL, 0));
+    hs_step(&gpu.system);
+    CHECK(atomic_load(&q->dequeue_pos) == 0u && shader->current_shader == 7);
+    hs_step(&gpu.system);
+    CHECK(atomic_load(&q->dequeue_pos) == 0u);
+
+    /* Full ring straddling the wrap: admission must refuse, never wait. */
+    seed_submit_ring(q, 0xFFFFFFFFu - 10);
+    u32 accepted = 0;
+    for (u32 i = 0; i < HS_SUBMIT_SIZE; i++) {
+        m.payload_idx = (u16)(i & 0xFF);
+        accepted += hs_try_send(&gpu.system, &m, NULL, 0) ? 1u : 0u;
+    }
+    CHECK(accepted == HS_SUBMIT_SIZE);
+    unsigned full_before = atomic_load(&gpu.system.submit_full[CHAN_RENDER]);
+    CHECK(!hs_try_send(&gpu.system, &m, NULL, 0));
+    CHECK(atomic_load(&gpu.system.submit_full[CHAN_RENDER]) == full_before + 1);
+    for (int i = 0; i < 4; i++) hs_step(&gpu.system);
+    CHECK(atomic_load(&q->dequeue_pos) == atomic_load(&q->enqueue_pos));
+    CHECK(atomic_load(&q->dequeue_pos) == (u32)(0xFFFFFFFFu - 10 + HS_SUBMIT_SIZE));
+    fresh_gpu();
+}
+
+static bool control_result(u32 cid, u32* old_value, u32* new_value) {
+    SystemState* st = &gpu.system_state_data;
+    if (st->last_result_cid != cid) return false;
+    return hs_unpack_u32x2(gpu.system.payloads[st->last_result_payload_idx].data,
+                           st->last_result_len, old_value, new_value);
+}
+
+static void test_budget_floor(void) {
+    fresh_gpu();
+    CHECK(!hs_set_channel_budget(&gpu.system, CHAN_RT, 0));
+    CHECK(!hs_set_channel_budget(&gpu.system, CHAN_RENDER, 0));
+    CHECK(gpu.system.chan_budget[CHAN_RT] == 4096 && gpu.system.chan_budget[CHAN_RENDER] == 16384);
+    CHECK(hs_set_channel_budget(&gpu.system, CHAN_TELEM, HS_CHAN_BUDGET_MIN));
+    CHECK(gpu.system.chan_budget[CHAN_TELEM] == HS_CHAN_BUDGET_MIN);
+
+    /* The control op (what neogpu_tool set-budget 1 0 sends) is rejected too. */
+    u8 p[8];
+    hs_pack_set_chan_budget(p, (u8)CHAN_RT, 0);
+    Message m = {.to = NODE_SYSTEM, .from = NODE_CPU, .op = OP_SET_CHAN_BUDGET, .cid = 77, .channel = CHAN_RT};
+    CHECK(hs_send_with_payload(&gpu.system, &m, p, sizeof(p)));
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    u32 old_value = 0, new_value = 0;
+    CHECK(control_result(77, &old_value, &new_value) && old_value == 0xFFFFFFFFu && new_value == 0xFFFFFFFFu);
+    CHECK(gpu.system.chan_budget[CHAN_RT] == 4096);
+
+    /* RT still drains afterwards, and a valid change is applied and reported. */
+    hs_pack_set_chan_budget(p, (u8)CHAN_RT, 64);
+    m.cid = 78;
+    CHECK(hs_send_with_payload(&gpu.system, &m, p, sizeof(p)));
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    CHECK(control_result(78, &old_value, &new_value) && old_value == 4096 && new_value == 64);
+    CHECK(gpu.system.chan_budget[CHAN_RT] == 64);
+}
+
+static void test_invalid_messages_nacked(void) {
+    fresh_gpu();
+    SystemState* st = &gpu.system_state_data;
+    ShaderState* shader = &gpu.shader_state;
+    u8 blend[2] = {3, 4};
+    Message m = {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_BLEND, .flags = HS_MSGF_ACK,
+                 .cid = 5, .channel = CHAN_RENDER};
+    u8 src_before = shader->blend_src, dst_before = shader->blend_dst;
+    u32 acks = st->ack_count;
+    CHECK(hs_send_with_payload(&gpu.system, &m, blend, 1)); /* short payload */
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    CHECK(st->ack_count == acks + 1 && st->last_ack_cid == 5);
+    CHECK(st->last_ack_status == HS_ACK_INVALID && st->last_ack_op == OP_BLEND);
+    CHECK(shader->blend_src == src_before && shader->blend_dst == dst_before);
+
+    m.cid = 6;
+    CHECK(hs_send_with_payload(&gpu.system, &m, blend, sizeof(blend)));
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    CHECK(st->last_ack_cid == 6 && st->last_ack_status == HS_ACK_OK);
+    CHECK(shader->blend_src == 3 && shader->blend_dst == 4);
+
+    /* Payload-free message that requires a payload is also rejected. */
+    Message clip = {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_CLIP, .flags = HS_MSGF_ACK,
+                    .cid = 7, .channel = CHAN_RENDER};
+    CHECK(hs_send(&gpu.system, &clip));
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    CHECK(st->last_ack_cid == 7 && st->last_ack_status == HS_ACK_INVALID);
+
+    /* Ops without a decoder (fixed 64-byte matrix) used to skip silently and
+     * ACK success on a short payload; the schema gate rejects them. */
+    float camera[16] = {2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1};
+    float view_before = shader->camera_view_proj[0];
+    Message cam = {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_SET_CAMERA, .flags = HS_MSGF_ACK,
+                   .cid = 10, .channel = CHAN_RENDER};
+    CHECK(hs_send_with_payload(&gpu.system, &cam, camera, 10));
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    CHECK(st->last_ack_cid == 10 && st->last_ack_status == HS_ACK_INVALID);
+    CHECK(shader->camera_view_proj[0] == view_before);
+    cam.cid = 11;
+    CHECK(hs_send_with_payload(&gpu.system, &cam, camera, sizeof(camera)));
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    CHECK(st->last_ack_cid == 11 && st->last_ack_status == HS_ACK_OK && shader->camera_view_proj[0] == 2.0f);
+
+    /* Input opcodes have a schema now: with validation on, they are accepted
+     * (previously rejected as "bad destination"), and NaN axes are zeroed. */
+    static Node input;
+    static InputState input_state;
+    memset(&input, 0, sizeof(input));
+    input.id = NODE_INPUT;
+    input.sys = &gpu.system;
+    input.state = &input_state;
+    input_node_init(&input);
+    hs_register(&gpu.system, &input);
+    gpu.system.validate_on_send = true;
+    u8 key[3] = {105, 0, 1};
+    Message k = {.to = NODE_INPUT, .from = NODE_CPU, .op = OP_INPUT_KEY, .flags = HS_MSGF_ACK,
+                 .cid = 8, .channel = CHAN_RT};
+    CHECK(hs_send_with_payload(&gpu.system, &k, key, sizeof(key)));
+    u32 nan_bits = 0x7FC00000u, inf_bits = 0x7F800000u;
+    u8 axes[8];
+    memcpy(axes, &nan_bits, 4);
+    memcpy(axes + 4, &inf_bits, 4);
+    Message g = {.to = NODE_INPUT, .from = NODE_CPU, .op = OP_INPUT_GAMEPAD, .flags = HS_MSGF_ACK,
+                 .cid = 9, .channel = CHAN_RT};
+    CHECK(hs_send_with_payload(&gpu.system, &g, axes, sizeof(axes)));
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    CHECK(input_state.base.key_left == 1);
+    CHECK(input_state.base.pad_x == 0.0f && input_state.base.pad_y == 0.0f);
+    CHECK(st->last_ack_cid == 9 && st->last_ack_status == HS_ACK_OK);
+    fresh_gpu();
+}
+
+static void test_storage_names_and_files(void) {
+    static HSStorage store, copy;
+    hs_storage_init(&store);
+    char long_name[64];
+    memset(long_name, 'n', sizeof(long_name) - 1);
+    long_name[sizeof(long_name) - 1] = 0;
+    CHECK(hs_storage_load(&store, long_name) == NULL);       /* no silent truncation */
+    long_name[HS_STORAGE_NAME_MAX - 1] = 0;                  /* 31 chars: fits */
+    hs_storage_set_u8(&store, long_name, 3, 42);
+    CHECK(hs_storage_get_u8(&store, long_name, 3) == 42);
+    unsigned used = 0;
+    for (int i = 0; i < HS_STORAGE_SLOTS; i++) used += store.slots[i].loaded;
+    CHECK(used == 1);                                        /* one slot, reused */
+    char path[96];
+    snprintf(path, sizeof(path), "tests/p0-storage-%d.bin", (int)getpid());
+    CHECK(hs_storage_save(&store, path));
+    hs_storage_init(&copy);
+    CHECK(hs_storage_load_file(&copy, path) && hs_storage_get_u8(&copy, long_name, 3) == 42);
+    FILE* f = fopen(path, "r+b");                           /* truncate: must be rejected */
+    CHECK(f && ftruncate(fileno(f), 100) == 0);
+    if (f) fclose(f);
+    hs_storage_init(&copy);
+    CHECK(!hs_storage_load_file(&copy, path));
+    CHECK(!copy.slots[0].loaded);
+    CHECK(!hs_storage_save(&store, "/dev/full"));
+    unlink(path);
+}
+
+static void test_font_glyph_codes(void) {
+    static HSFont font;
+    CHECK(hs_font_load(&font, "src/medodica_font"));
+    /* code="0".."9" are the digit characters, not code points 0..9. */
+    for (int c = '0'; c <= '9'; c++) CHECK(font.glyphs[c].advance > 0 && font.glyphs[c].width > 0);
+    for (int c = 0; c <= 9; c++) CHECK(font.glyphs[c].advance == 0);
+    /* Entities decode to their characters. */
+    CHECK(font.glyphs['"'].advance > 0 && font.glyphs['&'].advance > 0 && font.glyphs['<'].advance > 0);
+    CHECK(font.glyphs['A'].width > 0 && font.glyphs[' '].advance > 0);
+    /* An atlas larger than the fixed buffer is refused, not copied. */
+    static u8 big[(HS_FONT_ATLAS_W * 2) * HS_FONT_ATLAS_H * 4];
+    CHECK(!hs_font_load_fnt(&font, NULL, big, HS_FONT_ATLAS_W * 2, HS_FONT_ATLAS_H));
+}
+
+/* Wire format mirrors src/hs_ipc.c (packed). */
+typedef struct { u32 magic; u16 version; u16 type; u32 len; u32 cid; } __attribute__((packed)) WireHdr;
+typedef struct { u8 op; u8 flags; u16 reserved; u32 payload_len; } __attribute__((packed)) WireReq;
+typedef struct { u32 status; u32 result_op; u32 result_len; } __attribute__((packed)) WireResp;
+
+static bool ipc_set_budget(int fd, u32 cid, u8 channel, u32 budget, u32* status, u32* old_value, u32* new_value) {
+    u8 frame[sizeof(WireHdr) + sizeof(WireReq) + 8];
+    WireHdr h = {.magic = 0x4E474950u, .version = 1, .type = 1, .len = sizeof(WireReq) + 8, .cid = cid};
+    WireReq r = {.op = OP_SET_CHAN_BUDGET, .payload_len = 8};
+    memcpy(frame, &h, sizeof(h));
+    memcpy(frame + sizeof(h), &r, sizeof(r));
+    hs_pack_set_chan_budget(frame + sizeof(h) + sizeof(r), channel, budget);
+    if (send(fd, frame, sizeof(frame), MSG_NOSIGNAL) != (ssize_t)sizeof(frame)) return false;
+    u8 reply[sizeof(WireHdr) + sizeof(WireResp) + 96];
+    size_t got = 0, want = sizeof(WireHdr) + sizeof(WireResp);
+    while (got < want) {
+        ssize_t n = recv(fd, reply + got, sizeof(reply) - got, 0);
+        if (n <= 0) return false;
+        got += (size_t)n;
+        if (got >= sizeof(WireHdr)) {
+            WireHdr rh;
+            memcpy(&rh, reply, sizeof(rh));
+            want = sizeof(WireHdr) + rh.len;
+            if (want > sizeof(reply)) return false;
+        }
+    }
+    WireResp resp;
+    memcpy(&resp, reply + sizeof(WireHdr), sizeof(resp));
+    *status = resp.status;
+    *old_value = *new_value = 0;
+    if (resp.status == 0 && resp.result_len == 8)
+        hs_unpack_u32x2(reply + sizeof(WireHdr) + sizeof(WireResp), 8, old_value, new_value);
+    return true;
+}
+
+static atomic_bool stepping;
+static void* step_loop(void* unused) {
+    (void)unused;
+    while (atomic_load(&stepping)) { hs_step(&gpu.system); usleep(200); }
+    return NULL;
+}
+
+static void test_ipc_late_result_not_misattributed(void) {
+    fresh_gpu();
+    char path[108];
+    snprintf(path, sizeof(path), "tests/p0-late-%d.sock", (int)getpid());
+    HSIpcServer server = {0};
+    CHECK(hs_ipc_start(&server, &gpu.system, path));
+    struct stat sb;
+    CHECK(stat(path, &sb) == 0 && (sb.st_mode & 0777) == 0600);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    strcpy(address.sun_path, path);
+    CHECK(fd >= 0 && connect(fd, (struct sockaddr*)&address, sizeof(address)) == 0);
+    u32 status = 0, old_value = 0, new_value = 0;
+    /* Nobody steps: request 1 times out but stays queued and runs later. */
+    CHECK(ipc_set_budget(fd, 1, (u8)CHAN_RENDER, 111, &status, &old_value, &new_value));
+    CHECK(status != 0);
+    /* Request 2 (same client cid and op). With an RT budget of 1, request 1
+     * runs a full step before request 2, so its late result is published
+     * while request 2 is waiting. The reply must describe request 2. */
+    CHECK(hs_set_channel_budget(&gpu.system, CHAN_RT, 1));
+    atomic_store(&stepping, true);
+    pthread_t stepper;
+    CHECK(pthread_create(&stepper, NULL, step_loop, NULL) == 0);
+    CHECK(ipc_set_budget(fd, 1, (u8)CHAN_RENDER, 222, &status, &old_value, &new_value));
+    CHECK(status == 0 && old_value == 111 && new_value == 222);
+    atomic_store(&stepping, false);
+    pthread_join(stepper, NULL);
+    close(fd);
+    hs_ipc_stop(&server);
+    fresh_gpu();
+}
+
+/* accept() failing with EMFILE (descriptor exhaustion) is transient: the IPC
+ * thread must keep serving once descriptors are available again. */
+static void test_ipc_accept_survives_emfile(void) {
+    fresh_gpu();
+    char path[108];
+    snprintf(path, sizeof(path), "tests/p0-emfile-%d.sock", (int)getpid());
+    HSIpcServer server = {0};
+    CHECK(hs_ipc_start(&server, &gpu.system, path));
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    strcpy(address.sun_path, path);
+    struct rlimit saved, tight;
+    CHECK(getrlimit(RLIMIT_NOFILE, &saved) == 0);
+    tight = saved;
+    /* The limit bounds descriptor numbers: capping it at the lowest free
+     * number makes every new descriptor (the server's accept) fail EMFILE. */
+    int lowest_free = dup(0);
+    CHECK(lowest_free >= 0);
+    close(lowest_free);
+    tight.rlim_cur = (rlim_t)lowest_free;
+    CHECK(setrlimit(RLIMIT_NOFILE, &tight) == 0);
+    int probe = dup(0);
+    CHECK(probe < 0 && errno == EMFILE);  /* the condition really holds */
+    if (probe >= 0) close(probe);
+    CHECK(fd >= 0 && connect(fd, (struct sockaddr*)&address, sizeof(address)) == 0); /* queued in backlog */
+    usleep(150000);                        /* server's accept fails with EMFILE meanwhile */
+    CHECK(setrlimit(RLIMIT_NOFILE, &saved) == 0);
+    atomic_store(&stepping, true);
+    pthread_t stepper;
+    CHECK(pthread_create(&stepper, NULL, step_loop, NULL) == 0);
+    struct timeval timeout = {.tv_sec = 2};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    u32 status = 99, old_value = 0, new_value = 0;
+    CHECK(ipc_set_budget(fd, 3, (u8)CHAN_RENDER, 333, &status, &old_value, &new_value));
+    CHECK(status == 0 && new_value == 333);
+    atomic_store(&stepping, false);
+    pthread_join(stepper, NULL);
+    close(fd);
+    hs_ipc_stop(&server);
+    fresh_gpu();
+}
+
 static void test_lifecycle(void) {
     static HSGpu instance;
     for (unsigned i = 0; i < 100; i++) {
@@ -407,6 +751,13 @@ int main(void) {
     test_ipc_shutdown();
     test_async_ownership();
     test_input_ownership();
+    test_submit_ring_wrap();
+    test_budget_floor();
+    test_invalid_messages_nacked();
+    test_storage_names_and_files();
+    test_font_glyph_codes();
+    test_ipc_late_result_not_misattributed();
+    test_ipc_accept_survives_emfile();
     test_lifecycle();
     hs_gpu_shutdown(&gpu);
     CHECK(open_descriptors() == descriptor_baseline);

@@ -28,10 +28,13 @@ static inline void hs_storage_init(HSStorage* store) {
 
 static inline HSStorageSlot* hs_storage_load(HSStorage* store, const char* name) {
     if (!store || !name || !store->initialized) return NULL;
-    
+    /* Names must fit with their terminator. Truncating would make a long name
+     * never match its stored (shortened) copy, or alias another name. */
+    if (!name[0] || strnlen(name, HS_STORAGE_NAME_MAX) >= HS_STORAGE_NAME_MAX) return NULL;
+
     for (int i = 0; i < HS_STORAGE_SLOTS; i++) {
-        if (store->slots[i].loaded && 
-            strncmp(store->slots[i].name, name, HS_STORAGE_NAME_MAX) == 0) {
+        if (store->slots[i].loaded &&
+            strcmp(store->slots[i].name, name) == 0) {
             return &store->slots[i];
         }
     }
@@ -78,19 +81,33 @@ static inline void hs_storage_set_f32(HSStorage* store, const char* name, u32 of
     slot->dirty = 1;
 }
 
-static inline void hs_storage_save(HSStorage* store, const char* filename) {
+/* Native-layout snapshot of all slots. Returns false on any write/close error. */
+static inline bool hs_storage_save(HSStorage* store, const char* filename) {
+    if (!store || !filename) return false;
     FILE* f = fopen(filename, "wb");
-    if (!f) return;
-    fwrite(store->slots, sizeof(HSStorageSlot), HS_STORAGE_SLOTS, f);
-    fclose(f);
+    if (!f) return false;
+    bool ok = fwrite(store->slots, sizeof(HSStorageSlot), HS_STORAGE_SLOTS, f) == HS_STORAGE_SLOTS;
+    if (fclose(f) != 0) ok = false;
+    return ok;
 }
 
-static inline void hs_storage_load_file(HSStorage* store, const char* filename) {
+/* Loads a snapshot written by hs_storage_save. A short/oversized file or a
+ * slot without a terminated name is rejected and leaves the store unchanged. */
+static inline bool hs_storage_load_file(HSStorage* store, const char* filename) {
+    if (!store || !filename) return false;
     FILE* f = fopen(filename, "rb");
-    if (!f) return;
-    fread(store->slots, sizeof(HSStorageSlot), HS_STORAGE_SLOTS, f);
+    if (!f) return false;
+    HSStorageSlot loaded[HS_STORAGE_SLOTS];
+    bool ok = fread(loaded, sizeof(HSStorageSlot), HS_STORAGE_SLOTS, f) == HS_STORAGE_SLOTS &&
+              fgetc(f) == EOF && !ferror(f);
     fclose(f);
+    for (int i = 0; ok && i < HS_STORAGE_SLOTS; i++) {
+        if (memchr(loaded[i].name, 0, HS_STORAGE_NAME_MAX) == NULL) ok = false;
+    }
+    if (!ok) return false;
+    memcpy(store->slots, loaded, sizeof(loaded));
     store->initialized = 1;
+    return true;
 }
 
 static inline void hs_storage_sync(HSStorage* store) {

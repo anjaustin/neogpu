@@ -11,7 +11,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-#include <arm_neon.h>
+#include "hs_neonCompat.h" /* <arm_neon.h> on aarch64 */
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -224,7 +224,6 @@ struct HSSystem {
     u32 dropped_queue_full;
     u32 dropped_system_nonrt;
     u32 dropped_result;
-    u32 dropped_toolbus;
 
     /* Capture policy */
     u32 record_mask; /* bitmask of (1u << HSChannel) */
@@ -276,7 +275,10 @@ void hs_lock(HSSystem* sys);
 void hs_unlock(HSSystem* sys);
 
 void hs_set_record_mask(HSSystem* sys, u32 mask);
-void hs_set_channel_budget(HSSystem* sys, HSChannel ch, u32 budget);
+/* Per-step drain budget. A budget of 0 would never drain the channel (and on
+ * CHAN_RT would wedge all IPC control traffic), so it is rejected. */
+#define HS_CHAN_BUDGET_MIN 1u
+bool hs_set_channel_budget(HSSystem* sys, HSChannel ch, u32 budget);
 
 /* Message flags (Message.flags) */
 #define HS_MSGF_ACK   (1u << 7)  /* request OP_ACK after apply (must not collide with opcode-specific flags) */
@@ -299,7 +301,10 @@ u32  hs_step(HSSystem* sys);
 /* Wake threads blocked in hs_send when block_on_full is enabled. */
 void hs_wake_senders(HSSystem* sys);
 
-/* Allocate a payload block and copy up to HS_PAYLOAD_SIZE bytes into it. */
+/* Allocate a payload block and copy up to HS_PAYLOAD_SIZE bytes into it.
+ * STEP THREAD ONLY: the payload ring is owned by the thread running hs_step.
+ * Producer threads must use hs_send_with_payload()/hs_try_send(), which carry
+ * the bytes inline and allocate on the step thread. */
 bool hs_payload_alloc_and_copy(HSSystem* sys, const void* data, u32 len, u16* out_idx, u32* out_len);
 
 /* Convenience wrapper: alloc+copy payload then send message. */

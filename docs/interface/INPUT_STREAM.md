@@ -37,8 +37,19 @@ producers, queue wrap, pause/resume, and held-state snapshots without devices.
 - Device descriptors are nonblocking; readers wait with `select()`.
 - Added devices use `EVIOCGRAB`: do not point tests at a person's active keyboard.
 - Hotplug handles create/delete events and reuses free descriptor slots.
-- Removal resets aggregate held state, preventing stuck keys. The aggregate is
-  last-event-wins, not a per-device key-reference-count model.
+- Removal releases held keys and buttons, preventing stuck keys, whether or
+  not hotplug is enabled: a reader that fails (e.g. `ENODEV` on unplug) asks
+  the consumer to release them after draining, which cannot be lost to a full
+  queue. Its slot and descriptor are reclaimed by the next `add_device` or
+  `stop`, so the same path can be added again. The aggregate is last-event-wins,
+  not a per-device key-reference-count model, so removal releases keys held on
+  other devices too.
+- `SYN_DROPPED` (kernel buffer overflow): events up to the next `SYN_REPORT`
+  are discarded and key state is re-read with `EVIOCGKEY`. A key event the
+  stream's own queue rejects triggers the same resync at the next report.
+- Only `EV_KEY`, `EV_REL` and `EV_ABS` events use queue slots.
+- `hs_input_stream_stop()` closes every device; a later `start()` begins with
+  none, so add devices (or rely on hotplug) again after restarting.
 - Capability queries report failed ioctls rather than pretending success.
 - Generic absolute-axis mapping assumes X/Y in 0..65535 and RX/RY in
   -32767..32767. Device-specific calibration is not implemented.

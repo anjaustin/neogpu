@@ -64,9 +64,9 @@ static bool wait_keys(HSInputStream* stream, bool left, bool right) {
 int main(void) {
     alarm(15);
     int result = 0, checks = 0;
-    int first = -1, second = -1;
-    char first_path[256], second_path[256];
-    HSInputStream stream = {0};
+    int first = -1, second = -1, third = -1, fourth = -1;
+    char first_path[256], second_path[256], third_path[256], fourth_path[256];
+    static HSInputStream stream, manual, unplug;
     REQUIRE(hs_input_stream_init(&stream));
     first = virtual_device(first_path);
     REQUIRE(first >= 0);
@@ -95,9 +95,87 @@ int main(void) {
     REQUIRE(wait_keys(&stream, true, false));
     ioctl(second, UI_DEV_DESTROY); close(second); second = -1;
     REQUIRE(wait_keys(&stream, false, false));
-    printf("Real evdev/uinput: %d checks passed, including two readers and hot-add/remove\n", checks);
+    hs_input_stream_shutdown(&stream);
+
+    /* SYN_DROPPED: the partial packet is discarded and key state is re-read
+     * from the kernel (EVIOCGKEY), so a press whose event was lost is seen. */
+    REQUIRE(hs_input_stream_init(&manual));
+    third = virtual_device(third_path);
+    REQUIRE(third >= 0);
+    REQUIRE(hs_input_stream_add_device(&manual, third_path));
+    REQUIRE(emit(third, KEY_LEFT, 1));          /* kernel state: LEFT down; event never read */
+    usleep(20000);
+    struct input_event dropped[] = {
+        {.type = EV_SYN, .code = SYN_DROPPED},
+        {.type = EV_KEY, .code = KEY_RIGHT, .value = 1},  /* incomplete packet: must be discarded */
+        {.type = EV_REL, .code = REL_X, .value = 50},     /* not covered by the key resync */
+        {.type = EV_SYN, .code = SYN_REPORT},
+    };
+    hs_input_stream_device_events(&manual, 0, dropped, 4);
+    hs_input_stream_process_events(&manual);
+    const HSInput* snapshot = hs_input_stream_get_state(&manual);
+    REQUIRE(snapshot->key_left == 1 && snapshot->key_right == 0 && snapshot->mouse_x == 0);
+    REQUIRE(emit(third, KEY_LEFT, 0));          /* release also lost */
+    usleep(20000);
+    hs_input_stream_device_events(&manual, 0, dropped, 4);
+    hs_input_stream_process_events(&manual);
+    snapshot = hs_input_stream_get_state(&manual);
+    REQUIRE(snapshot->key_left == 0 && snapshot->key_right == 0 && snapshot->mouse_x == 0);
+    /* Framing events do not consume queue slots or advance the input frame. */
+    uint64_t before = atomic_load(&manual.event_count);
+    u32 frame = snapshot->frame;
+    struct input_event framing[] = {{.type = EV_MSC, .code = MSC_SCAN, .value = 5}, {.type = EV_SYN, .code = SYN_REPORT}};
+    hs_input_stream_device_events(&manual, 0, framing, 2);
+    hs_input_stream_process_events(&manual);
+    REQUIRE(atomic_load(&manual.event_count) == before && hs_input_stream_get_state(&manual)->frame == frame);
+    hs_input_stream_shutdown(&manual);
+
+    /* Unplug without hotplug: keys are released, and the slot is reclaimed
+     * so a device can be added again (previously the fd stayed grabbed and
+     * the path was rejected as a duplicate). */
+    REQUIRE(hs_input_stream_init(&unplug));
+    REQUIRE(hs_input_stream_add_device(&unplug, third_path));
+    REQUIRE(hs_input_stream_start(&unplug));
+    REQUIRE(emit(third, KEY_LEFT, 1));
+    REQUIRE(wait_keys(&unplug, true, false));
+    ioctl(third, UI_DEV_DESTROY); close(third); third = -1;
+    REQUIRE(wait_keys(&unplug, false, false));
+    deadline = milliseconds() + 2000;
+    while (!atomic_load(&unplug.devices[0].failed) && milliseconds() < deadline) usleep(1000);
+    REQUIRE(atomic_load(&unplug.devices[0].failed));
+    fourth = virtual_device(fourth_path);
+    REQUIRE(fourth >= 0);
+    REQUIRE(hs_input_stream_add_device(&unplug, fourth_path));
+    int open_slots = 0;
+    for (int i = 0; i < HS_INPUT_MAX_DEVICES; i++) open_slots += unplug.devices[i].fd >= 0;
+    REQUIRE(open_slots == 1 && !atomic_load(&unplug.devices[0].failed));
+    REQUIRE(emit(fourth, KEY_RIGHT, 1));
+    REQUIRE(wait_keys(&unplug, false, true));
+
+    /* Unplug while our queue is full: the kernel's own key-up events are lost,
+     * yet the key must not stay held once the consumer catches up. */
+    hs_input_stream_pause(&unplug);
+    for (int i = 0; i < 400; i++) {
+        struct input_event toggles[2] = {{.type = EV_KEY, .code = KEY_LEFT, .value = i & 1},
+                                         {.type = EV_SYN, .code = SYN_REPORT}};
+        if (write(fourth, toggles, sizeof(toggles)) != sizeof(toggles)) break;
+    }
+    usleep(50000);
+    REQUIRE(atomic_load(&unplug.dropped_events) > 0);   /* the queue really overflowed */
+    ioctl(fourth, UI_DEV_DESTROY); close(fourth); fourth = -1;
+    deadline = milliseconds() + 2000;
+    while (!atomic_load(&unplug.devices[0].failed) && !atomic_load(&unplug.devices[1].failed) &&
+           milliseconds() < deadline) usleep(1000);
+    hs_input_stream_resume(&unplug);
+    REQUIRE(wait_keys(&unplug, false, false));
+    printf("Real evdev/uinput: %d checks passed, including two readers, hot-add/remove, "
+           "SYN_DROPPED resync and unplug without hotplug\n", checks);
 cleanup:
     hs_input_stream_shutdown(&stream);
+    hs_input_stream_shutdown(&manual);
+    hs_input_stream_shutdown(&unplug);
+    if (third >= 0) { ioctl(third, UI_DEV_DESTROY); close(third); }
+    if (fourth >= 0) { ioctl(fourth, UI_DEV_DESTROY); close(fourth); }
     if (second >= 0) { ioctl(second, UI_DEV_DESTROY); close(second); }
     if (first >= 0) { ioctl(first, UI_DEV_DESTROY); close(first); }
     return result;

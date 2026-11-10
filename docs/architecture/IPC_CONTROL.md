@@ -8,16 +8,25 @@ Source: derived from the Lincoln Manifold pass in `docs/lmm/ipc_control_*.md`.
 
 ## Scope
 
-- Local machine only (Linux/Pi): Unix domain socket.
+- Unix domain socket (`--ipc-server PATH`): created mode 0600 (owner only)
+  from the moment it exists; an existing file at PATH is never replaced.
+- TCP (`--ipc-tcp PORT`): binds 127.0.0.1 unless an address is given with
+  `--ipc-bind`. `0.0.0.0` listens on every interface; the protocol has no
+  authentication, so only do that on a trusted network.
+- The standalone client (`neogpu_tool`) defaults to
+  `$XDG_RUNTIME_DIR/neogpu.sock` (else `/tmp/neogpu-<uid>.sock`) and refuses a
+  Unix-socket server not run by the same user or root (`SO_PEERCRED`).
 - Requests are limited to `NODE_SYSTEM` query/control/fence ops.
 - Responses return raw `OP_RESULT` payload bytes.
 
 ## Allowed Ops (Whitelist)
 
 - `OP_QUERY_STATS` -> `OP_RESULT(flags=OP_QUERY_STATS, payload_len=64)`
-- `OP_QUERY_FABRIC` -> `OP_RESULT(flags=OP_QUERY_FABRIC, payload_len=64)`
+- `OP_QUERY_FABRIC` -> `OP_RESULT(flags=OP_QUERY_FABRIC, payload_len=96)`
 - `OP_SET_RECORD_MASK` (payload 4B) -> `OP_RESULT(flags=OP_SET_RECORD_MASK, payload_len=8)`
-- `OP_SET_CHAN_BUDGET` (payload 8B) -> `OP_RESULT(flags=OP_SET_CHAN_BUDGET, payload_len=8)`
+- `OP_SET_CHAN_BUDGET` (payload 8B) -> `OP_RESULT(flags=OP_SET_CHAN_BUDGET, payload_len=8)`;
+  a budget below 1 (it would stop the channel draining) or an invalid channel
+  is rejected and reported as old = new = `0xFFFFFFFF`.
 - `OP_SET_BLOCK_POLICY` (payload 2B) -> `OP_RESULT(flags=OP_SET_BLOCK_POLICY, payload_len=8)`
 - `OP_FENCE` -> `OP_RESULT(flags=OP_FENCE, payload_len=8)`
 
@@ -75,11 +84,20 @@ Error status codes:
 `OP_RESULT` messages to `NODE_SYSTEM` are copied into a bounded internal ring buffer ("toolbus") so the IPC server can match results by `cid`.
 
 - Ring size: 256 entries (configurable via `HS_TOOLBUS_SIZE`)
-- Each entry stores: `cid`, `seq`, `result_op`, `payload_len`, `payload[64]`
+- Each entry stores: `cid`, `seq`, `result_op`, `payload_len`, `payload[96]`
 - Toolbus is cleared on `hs_clear()`
-- Dropped counter: `HSSystem.dropped_toolbus`
+- When full, the oldest entry is overwritten and `HSSystem.toolbus_dropped`
+  is incremented (not reported by `OP_QUERY_STATS`). A request whose result
+  was overwritten before it was matched times out.
 
-If the toolbus is full, toolbus copies are dropped (counter increment). IPC requests may time out.
+The server does not correlate on the client's `cid`. Each request is sent with
+a server-assigned id and the reply carries the client's `cid` back. A request
+that times out still executes later; its late result can never be mistaken for
+the answer to a subsequent request.
+
+Waits use `CLOCK_MONOTONIC`, so wall-clock steps (NTP on a Pi without an RTC)
+neither cut a wait short nor stretch it. A transient `accept()` failure
+(descriptor or memory exhaustion) is retried; it does not end the service.
 
 ## Red-Team Requirements
 

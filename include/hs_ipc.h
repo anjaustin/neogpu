@@ -25,11 +25,14 @@ typedef struct {
     char path[108]; /* sockaddr_un.sun_path limit */
     char addr[64];  /* TCP bind address */
     u16 port;       /* TCP port */
+    u32 next_cid;   /* server-assigned correlation ids (IPC thread only) */
 } HSIpcServer;
 
 bool hs_ipc_start(HSIpcServer* srv, HSSystem* sys, const char* path);
 /* Start initializes storage, including on failure. Never restart a live server;
  * start/stop calls are externally serialized; stop is idempotent after start. */
+/* addr NULL/"" binds 127.0.0.1. "0.0.0.0" listens on all interfaces; the
+ * protocol is unauthenticated, so only do that on a trusted network. */
 bool hs_ipc_start_tcp(HSIpcServer* srv, HSSystem* sys, const char* addr, u16 port);
 void hs_ipc_stop(HSIpcServer* srv);
 

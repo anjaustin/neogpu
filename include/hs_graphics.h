@@ -13,6 +13,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <poll.h>
+#include <time.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <gbm.h>
@@ -53,11 +55,25 @@ typedef struct {
     bool           reuse_connector_scan;
     bool           display_found;
     bool           size_defaulted;
-    bool           crtc_setup_done;
+    bool           crtc_setup_done;   /* takeover attempted (success or not) */
+    bool           crtc_active;       /* our framebuffer is being scanned out */
+    bool           flip_pending;      /* a page flip was queued and has not completed */
+    bool           closing;           /* finish(): let close() release framebuffers */
     uint32_t       display_connector_id;
     uint32_t       display_encoder_id;
     uint32_t       display_crtc_id;
     drmModeModeInfo display_mode;
+
+    /* KMS presentation. scanout_bo is on screen; pending_bo is queued to
+     * replace it at the next vblank. Each locked GBM buffer carries its own
+     * DRM framebuffer (created once per buffer, see hs_graphics_fb_for_bo). */
+    struct gbm_bo* scanout_bo;
+    struct gbm_bo* pending_bo;
+    u64            frames_presented;  /* flips (and the takeover) that completed */
+    u64            frames_dropped;    /* vsync off: frame skipped, flip still in flight */
+    u32            present_errors;
+    int            last_present_errno;
+    const char*    present_error;     /* why presentation is off, or NULL */
 } HSGraphics;
 
 /* Choose the connector to drive.
@@ -98,6 +114,21 @@ static inline int hs_graphics_select_display(int fd, uint32_t require_type, HSGr
                 drmModeFreeEncoder(enc);
             }
         }
+        /* An idle connector (no console on it, or a CRTC left disabled by a
+         * previous owner) has no active encoder->CRTC link. Any CRTC one of
+         * its encoders can drive will do. */
+        for (int e = 0; !crtc_id && e < conn->count_encoders; e++) {
+            drmModeEncoder* enc = drmModeGetEncoder(fd, conn->encoders[e]);
+            if (!enc) continue;
+            for (int c = 0; c < resources->count_crtcs && c < 32; c++) {
+                if (enc->possible_crtcs & (1u << c)) {
+                    crtc_id = resources->crtcs[c];
+                    encoder_id = enc->encoder_id;
+                    break;
+                }
+            }
+            drmModeFreeEncoder(enc);
+        }
         if (conn->connector_type == DRM_MODE_CONNECTOR_DSI) score += 1;
 
         if (score > best_score) {
@@ -130,11 +161,21 @@ static inline int hs_graphics_select_display(int fd, uint32_t require_type, HSGr
  */
 static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height) {
     memset(gfx, 0, sizeof(HSGraphics));
-    gfx->vsync = true;
+    gfx->drm_fd = -1;
+    gfx->egl_display = EGL_NO_DISPLAY;
+    gfx->egl_context = EGL_NO_CONTEXT;
+    gfx->egl_surface = EGL_NO_SURFACE;
+    /* Uncapped by default: present never waits for the display, so frame
+     * rates measure what the system can render. The panel shows the newest
+     * completed flip at each refresh; frames it cannot show are dropped, not
+     * waited for. Set vsync = true to pace to the display instead. */
+    gfx->vsync = false;
     /* Taking the CRTC away from whatever currently owns it is what puts our
-     * frames on the panel, and it costs a full modeset plus a matching
-     * handback at close. Hosts that render without presenting can clear this
-     * to skip display ownership entirely; the default keeps it. */
+     * frames on the panel; it costs a full modeset on the first present. At
+     * close() the kernel hands the CRTC back to the console (fbcon); an
+     * explicit restore was measured and rejected (docs/audit/GLES_SHUTDOWN_PLAN.md).
+     * Hosts that render without presenting can clear this to skip display
+     * ownership entirely; the default keeps it. */
     gfx->take_display = true;
     /* The connector scan is slow on this class of panel, and the display setup
      * needs the same information, so keep it from being done twice. */
@@ -147,9 +188,9 @@ static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height)
     if (gfx->drm_fd < 0) {
         return -1;
     }
-    
+
     if (drmSetMaster(gfx->drm_fd) != 0) {
-        return -1;
+        goto fail;
     }
 
     /* Pick the connector to drive: any connected connector that reports a
@@ -191,7 +232,7 @@ static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height)
 
     gfx->gbm_device = gbm_create_device(gfx->drm_fd);
     if (!gfx->gbm_device) {
-        return -1;
+        goto fail;
     }
     
     gfx->gbm_surface = gbm_surface_create(
@@ -202,7 +243,7 @@ static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height)
         GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING
     );
     if (!gfx->gbm_surface) {
-        return -1;
+        goto fail;
     }
     
     EGLint egl_major, egl_minor;
@@ -218,11 +259,12 @@ static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height)
     }
     
     if (gfx->egl_display == EGL_NO_DISPLAY) {
-        return -1;
+        goto fail;
     }
     
     if (!eglInitialize(gfx->egl_display, &egl_major, &egl_minor)) {
-        return -1;
+        gfx->egl_display = EGL_NO_DISPLAY; /* nothing to terminate */
+        goto fail;
     }
     
     EGLint config_attribs[] = {
@@ -240,7 +282,7 @@ static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height)
     
     EGLint num_configs;
     if (!eglChooseConfig(gfx->egl_display, config_attribs, &gfx->egl_config, 1, &num_configs) || num_configs == 0) {
-        return -1;
+        goto fail;
     }
     
     EGLint context_attribs[] = {
@@ -253,18 +295,18 @@ static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height)
         context_attribs[1] = 2;
         gfx->egl_context = eglCreateContext(gfx->egl_display, gfx->egl_config, EGL_NO_CONTEXT, context_attribs);
         if (gfx->egl_context == EGL_NO_CONTEXT) {
-            return -1;
+            goto fail;
         }
     }
     
     gfx->egl_surface = eglCreateWindowSurface(gfx->egl_display, gfx->egl_config, 
                                               (EGLNativeWindowType)gfx->gbm_surface, NULL);
     if (gfx->egl_surface == EGL_NO_SURFACE) {
-        return -1;
+        goto fail;
     }
     
     if (!eglMakeCurrent(gfx->egl_display, gfx->egl_surface, gfx->egl_surface, gfx->egl_context)) {
-        return -1;
+        goto fail;
     }
     
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -273,6 +315,28 @@ static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height)
     
     gfx->initialized = 1;
     return 0;
+
+fail:
+    /* Release exactly what was acquired, in reverse order, so a failed init
+     * leaks nothing and does not keep DRM master (which would make every
+     * later init in this process fail at drmSetMaster). */
+    if (gfx->egl_display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(gfx->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (gfx->egl_surface != EGL_NO_SURFACE) eglDestroySurface(gfx->egl_display, gfx->egl_surface);
+        if (gfx->egl_context != EGL_NO_CONTEXT) eglDestroyContext(gfx->egl_display, gfx->egl_context);
+        eglTerminate(gfx->egl_display);
+        eglReleaseThread();
+    }
+    if (gfx->gbm_surface) gbm_surface_destroy(gfx->gbm_surface);
+    if (gfx->gbm_device) gbm_device_destroy(gfx->gbm_device);
+    close(gfx->drm_fd); /* also releases master */
+    gfx->drm_fd = -1;
+    gfx->gbm_surface = NULL;
+    gfx->gbm_device = NULL;
+    gfx->egl_display = EGL_NO_DISPLAY;
+    gfx->egl_context = EGL_NO_CONTEXT;
+    gfx->egl_surface = EGL_NO_SURFACE;
+    return -1;
 }
 
 /* Initialize using the attached display's mode. */
@@ -280,8 +344,166 @@ static inline int hs_graphics_init(HSGraphics* gfx) {
     return hs_graphics_init_sized(gfx, 0, 0);
 }
 
+/* ---- KMS presentation ---------------------------------------------------- */
+
+typedef struct {
+    int         fd;
+    uint32_t    fb_id;
+    const bool* closing;
+} HSScanoutFb;
+
+static inline void hs_graphics_fb_destroy(struct gbm_bo* bo, void* data) {
+    (void)bo;
+    HSScanoutFb* fb = (HSScanoutFb*)data;
+    if (!fb) return;
+    /* During finish() the fd is about to be closed, which releases every
+     * framebuffer it owns; removing the scanned-out one first would force an
+     * extra CRTC disable (measured slower: GLES_SHUTDOWN_PLAN "early-RmFB"). */
+    if (fb->fb_id && !*fb->closing) drmModeRmFB(fb->fd, fb->fb_id);
+    free(fb);
+}
+
+/* The DRM framebuffer for a locked GBM buffer, created once and cached on it. */
+static inline uint32_t hs_graphics_fb_for_bo(HSGraphics* gfx, struct gbm_bo* bo) {
+    HSScanoutFb* fb = (HSScanoutFb*)gbm_bo_get_user_data(bo);
+    if (fb) return fb->fb_id;
+    fb = (HSScanoutFb*)calloc(1, sizeof(*fb));
+    if (!fb) return 0;
+    fb->fd = gfx->drm_fd;
+    fb->closing = &gfx->closing;
+    uint32_t width = gbm_bo_get_width(bo), height = gbm_bo_get_height(bo);
+    int rc = drmModeAddFB(gfx->drm_fd, width, height, 24, 32, gbm_bo_get_stride(bo),
+                          gbm_bo_get_handle(bo).u32, &fb->fb_id);
+    if (rc != 0) {
+        /* Buffers with a layout modifier need the explicit-modifier form. */
+        uint32_t handles[4] = {0}, strides[4] = {0}, offsets[4] = {0};
+        uint64_t modifiers[4] = {0};
+        int planes = gbm_bo_get_plane_count(bo);
+        uint64_t modifier = gbm_bo_get_modifier(bo);
+        for (int i = 0; i < planes && i < 4; i++) {
+            handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
+            strides[i] = gbm_bo_get_stride_for_plane(bo, i);
+            offsets[i] = gbm_bo_get_offset(bo, i);
+            modifiers[i] = modifier;
+        }
+        rc = drmModeAddFB2WithModifiers(gfx->drm_fd, width, height, gbm_bo_get_format(bo), handles,
+                                        strides, offsets, modifiers, &fb->fb_id, DRM_MODE_FB_MODIFIERS);
+    }
+    if (rc != 0) {
+        gfx->last_present_errno = errno;
+        free(fb);
+        return 0;
+    }
+    gbm_bo_set_user_data(bo, fb, hs_graphics_fb_destroy);
+    return fb->fb_id;
+}
+
+static inline void hs_graphics_flip_done(int fd, unsigned int sequence, unsigned int sec,
+                                         unsigned int usec, void* data) {
+    (void)fd; (void)sequence; (void)sec; (void)usec;
+    ((HSGraphics*)data)->flip_pending = false;
+}
+
+/* Service DRM events until the queued flip completes or timeout_ms passes
+ * (0 = only consume events already delivered). Returns true when no flip is
+ * pending afterwards. */
+static inline bool hs_graphics_wait_flip(HSGraphics* gfx, int timeout_ms) {
+    drmEventContext events;
+    memset(&events, 0, sizeof(events));
+    events.version = 2;
+    events.page_flip_handler = hs_graphics_flip_done;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (gfx->flip_pending) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed = (long)(now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
+        int remaining = timeout_ms - (int)elapsed;
+        if (remaining < 0) remaining = 0;
+        struct pollfd pfd = {.fd = gfx->drm_fd, .events = POLLIN};
+        int ready = poll(&pfd, 1, remaining);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) break;
+        if (drmHandleEvent(gfx->drm_fd, &events) != 0) break;
+    }
+    return !gfx->flip_pending;
+}
+
+/* The queued buffer is now on screen: the previous one can be rendered into. */
+static inline void hs_graphics_retire_flip(HSGraphics* gfx) {
+    if (gfx->scanout_bo) gbm_surface_release_buffer(gfx->gbm_surface, gfx->scanout_bo);
+    gfx->scanout_bo = gfx->pending_bo;
+    gfx->pending_bo = NULL;
+    gfx->frames_presented++;
+}
+
+static inline void hs_graphics_present_failed(HSGraphics* gfx, const char* why) {
+    gfx->present_errors++;
+    if (!gfx->last_present_errno) gfx->last_present_errno = errno;
+    gfx->present_error = why;
+}
+
+/* First present: resolve the display and program the CRTC with this frame. */
+static inline void hs_graphics_takeover(HSGraphics* gfx) {
+    gfx->crtc_setup_done = 1;
+    bool resolved = false;
+
+    /* Reuse the scan done at init while the connector still reports the same
+     * state. drmModeGetConnectorCurrent returns the kernel's cached state
+     * without re-probing the panel (the probe is what is slow on DSI). */
+    if (gfx->reuse_connector_scan && gfx->display_found && gfx->display_crtc_id) {
+        drmModeConnector* current = drmModeGetConnectorCurrent(gfx->drm_fd, gfx->display_connector_id);
+        if (current) {
+            resolved = current->connection == DRM_MODE_CONNECTED;
+            drmModeFreeConnector(current);
+        }
+    }
+    if (!resolved) {
+        /* The connector may have appeared, changed, or gone since init. */
+        resolved = hs_graphics_select_display(gfx->drm_fd, 0, gfx) && gfx->display_crtc_id;
+    }
+    if (!resolved) {
+        hs_graphics_present_failed(gfx, "no connected display with a usable CRTC");
+        return;
+    }
+    if (gfx->display_mode.hdisplay != gfx->screen_width || gfx->display_mode.vdisplay != gfx->screen_height) {
+        /* The surface was sized for a different (or no) display; scanning it
+         * out with this mode would fail with EINVAL. Stay render-only. */
+        errno = EINVAL;
+        hs_graphics_present_failed(gfx, "display mode does not match surface size");
+        return;
+    }
+
+    struct gbm_bo* bo = gbm_surface_lock_front_buffer(gfx->gbm_surface);
+    if (!bo) {
+        hs_graphics_present_failed(gfx, "gbm_surface_lock_front_buffer failed");
+        return;
+    }
+    uint32_t fb = hs_graphics_fb_for_bo(gfx, bo);
+    uint32_t connector = gfx->display_connector_id;
+    if (!fb || drmModeSetCrtc(gfx->drm_fd, gfx->display_crtc_id, fb, 0, 0, &connector, 1,
+                              &gfx->display_mode) != 0) {
+        hs_graphics_present_failed(gfx, fb ? "drmModeSetCrtc failed" : "drmModeAddFB failed");
+        gbm_surface_release_buffer(gfx->gbm_surface, bo);
+        return;
+    }
+    gfx->scanout_bo = bo;
+    gfx->crtc_active = true;
+    gfx->present_error = NULL;
+    gfx->frames_presented++;
+}
+
 static inline void hs_graphics_finish(HSGraphics* gfx) {
     if (!gfx->initialized) return;
+
+    /* Let a queued flip land before its buffer is destroyed. */
+    if (gfx->flip_pending && hs_graphics_wait_flip(gfx, 100)) hs_graphics_retire_flip(gfx);
+    gfx->closing = true; /* framebuffers are released by close() below */
+    if (gfx->pending_bo) gbm_surface_release_buffer(gfx->gbm_surface, gfx->pending_bo);
+    if (gfx->scanout_bo) gbm_surface_release_buffer(gfx->gbm_surface, gfx->scanout_bo);
+    gfx->pending_bo = gfx->scanout_bo = NULL;
+    gfx->flip_pending = false;
+    gfx->crtc_active = false;
 
     for (int i = 0; i < HS_MAX_TEXTURES; i++) {
         if (gfx->textures[i].gl_texture != 0 && !gfx->textures[i].disposed) {
@@ -375,79 +597,65 @@ static inline GLuint hs_graphics_get_gl_texture(HSGraphics* gfx, u8 slot) {
     return gfx->textures[slot].gl_texture;
 }
 
-static inline void hs_graphics_swap_buffers(HSGraphics* gfx) {
-    if (!gfx->initialized) return;
-    eglSwapBuffers(gfx->egl_display, gfx->egl_surface);
-}
-
 static inline void hs_graphics_clear(HSGraphics* gfx, float r, float g, float b, float a) {
     if (!gfx->initialized) return;
     glClearColor(r, g, b, a);
     glClear(GL_COLOR_BUFFER_BIT);
 }
 
+/* Present the frame just rendered.
+ *
+ * Every frame is put on screen with a page flip of its own buffer:
+ *   vsync off (default) - the flip is queued and the call returns at once, so
+ *               rendering runs at full speed. If the previous flip has not
+ *               completed yet, this frame is not shown (frames_dropped) rather
+ *               than shown torn or waited for.
+ *   vsync on  - the call returns after the flip completes (one frame per
+ *               vblank; the scanned-out buffer is never rendered into).
+ * Without take_display (offscreen use) the frame is only swapped. */
 static inline void hs_graphics_present(HSGraphics* gfx) {
     if (!gfx->initialized) return;
-    
-    if (gfx->vsync) {
-        eglSwapBuffers(gfx->egl_display, gfx->egl_surface);
-    } else {
-        eglSwapInterval(gfx->egl_display, 0);
-        eglSwapBuffers(gfx->egl_display, gfx->egl_surface);
+
+    if (!gfx->vsync) eglSwapInterval(gfx->egl_display, 0);
+    eglSwapBuffers(gfx->egl_display, gfx->egl_surface);
+
+    if (!gfx->take_display) return;
+    if (!gfx->crtc_setup_done) {
+        hs_graphics_takeover(gfx);
+        return;
     }
-    
-    if (gfx->take_display && !gfx->crtc_setup_done) {
-        uint32_t connector_id = 0;
-        uint32_t crtc_id = 0;
-        drmModeModeInfo mode;
-        memset(&mode, 0, sizeof(mode));
-        bool resolved = false;
+    if (!gfx->crtc_active) return; /* takeover failed: render-only, reason in present_error */
 
-        /* Reuse the scan already done at init when the connector is still
-         * there. Listing resources is cheap; querying the connector is what
-         * costs on a panel that has to be probed over I2C. */
-        if (gfx->reuse_connector_scan && gfx->display_found && gfx->display_crtc_id) {
-            drmModeRes* check = drmModeGetResources(gfx->drm_fd);
-            if (check) {
-                for (int i = 0; i < check->count_connectors; i++) {
-                    if (check->connectors[i] == gfx->display_connector_id) {
-                        connector_id = gfx->display_connector_id;
-                        crtc_id = gfx->display_crtc_id;
-                        mode = gfx->display_mode;
-                        resolved = true;
-                        break;
-                    }
-                }
-                drmModeFreeResources(check);
-            }
-        }
-
-        if (!resolved) {
-            /* The connector may have appeared, or changed, since init. */
-            if (hs_graphics_select_display(gfx->drm_fd, 0, gfx) && gfx->display_crtc_id) {
-                connector_id = gfx->display_connector_id;
-                crtc_id = gfx->display_crtc_id;
-                mode = gfx->display_mode;
-                resolved = true;
-            }
-        }
-
-        if (resolved) {
-            struct gbm_bo* bo = gbm_surface_lock_front_buffer(gfx->gbm_surface);
-            if (bo) {
-                uint32_t handle = gbm_bo_get_handle(bo).u32;
-                uint32_t stride = gbm_bo_get_stride(bo);
-                uint32_t fb = 0;
-                if (drmModeAddFB(gfx->drm_fd, gfx->screen_width, gfx->screen_height, 
-                               24, 32, stride, handle, &fb) == 0) {
-                    drmModeSetCrtc(gfx->drm_fd, crtc_id, fb, 0, 0, 
-                                   &connector_id, 1, &mode);
-                }
-                gbm_surface_release_buffer(gfx->gbm_surface, bo);
-            }
-        }
-        gfx->crtc_setup_done = 1;
+    if (gfx->flip_pending && hs_graphics_wait_flip(gfx, gfx->vsync ? 100 : 0)) {
+        hs_graphics_retire_flip(gfx);
     }
+
+    struct gbm_bo* bo = gbm_surface_lock_front_buffer(gfx->gbm_surface);
+    if (!bo) {
+        hs_graphics_present_failed(gfx, "gbm_surface_lock_front_buffer failed");
+        return;
+    }
+    if (gfx->flip_pending) {
+        /* vsync off and the previous flip is still in flight. */
+        gbm_surface_release_buffer(gfx->gbm_surface, bo);
+        gfx->frames_dropped++;
+        return;
+    }
+    uint32_t fb = hs_graphics_fb_for_bo(gfx, bo);
+    if (!fb || drmModePageFlip(gfx->drm_fd, gfx->display_crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT, gfx) != 0) {
+        hs_graphics_present_failed(gfx, fb ? "drmModePageFlip failed" : "drmModeAddFB failed");
+        gbm_surface_release_buffer(gfx->gbm_surface, bo);
+        return;
+    }
+    gfx->pending_bo = bo;
+    gfx->flip_pending = true;
+    if (gfx->vsync && hs_graphics_wait_flip(gfx, 100)) hs_graphics_retire_flip(gfx);
+}
+
+/* Compatibility name for hs_graphics_present(). A bare eglSwapBuffers would
+ * skip the page flip, leaving the display on a stale buffer. */
+static inline void hs_graphics_swap_buffers(HSGraphics* gfx) {
+    hs_graphics_present(gfx);
 }
 
 #else

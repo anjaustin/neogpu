@@ -22,26 +22,6 @@
 static volatile bool g_run = true;
 static void on_sig(int s) { (void)s; g_run = false; }
 
-static void save_screenshot(HSGraphics* gfx, const char* path) {
-    int w = gfx->screen_width;
-    int h = gfx->screen_height;
-    u8* pixels = malloc(w * h * 3);
-    if (!pixels) return;
-    
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, pixels);
-    
-    FILE* f = fopen(path, "wb");
-    if (f) {
-        fprintf(f, "P6\n%d %d\n255\n", w, h);
-        for (int y = h - 1; y >= 0; y--) {
-            fwrite(pixels + y * w * 3, 1, w * 3, f);
-        }
-        fclose(f);
-        fprintf(stderr, "screenshot: %s\n", path);
-    }
-    free(pixels);
-}
 
 int main(int argc, char** argv) {
     (void)argc;
@@ -80,6 +60,10 @@ int main(int argc, char** argv) {
 
     HSBackend backend = hs_backend_gles_create();
     hs_gpu_attach_backend(&gpu, &backend);
+    if (!gpu.backend) {
+        fprintf(stderr, "Display backend unavailable (run as root with a display attached)\n");
+        return 1;
+    }
 
     printf("Recording 60 frames...\n");
     hs_gpu_start_recording(&gpu);
@@ -95,9 +79,7 @@ int main(int argc, char** argv) {
         hs_gpu_clear(&gpu, v4_make(r * 0.2f, g * 0.2f, b * 0.3f, 1.0f));
         hs_gpu_draw(&gpu, 0);
         hs_gpu_process(&gpu);
-        hs_gpu_end_frame(&gpu);
-        
-        usleep(16000);
+        hs_gpu_end_frame(&gpu); /* presents; vsync paces the loop */
     }
     
     u32 log_count = hs_gpu_stop_recording(&gpu);
@@ -113,7 +95,12 @@ int main(int argc, char** argv) {
     bool cap_ok = hs_capture_from_log(&gpu.system, msgs, log_count, &cap);
     printf("Capture from log: %s\n", cap_ok ? "OK" : "FAILED");
     
-    const char* cap_path = "/tmp/neogpu_capture.bin";
+    /* Outputs go to the working directory: predictable /tmp names are unsafe
+     * for a demo that runs as root. A stale file must not stand in for a
+     * failed write, so remove it first. */
+    const char* cap_path = "neogpu_capture.bin";
+    const char* shot_path = "capture_demo.ppm";
+    unlink(cap_path);
     bool write_ok = hs_capture_write_file(&cap, cap_path);
     printf("Write capture: %s (%s)\n", write_ok ? "OK" : "FAILED", cap_path);
 
@@ -123,29 +110,36 @@ int main(int argc, char** argv) {
     bool read_ok = hs_capture_read_file(&cap2, cap_path, replay_msgs, replay_payloads, MAX_MSG_LOG);
     printf("Read capture: %s\n", read_ok ? "OK" : "FAILED");
 
-    printf("\n--- Replaying captured messages ---\n");
-    
-    bool replay_ok = hs_capture_replay(&gpu.system, &cap);
+    /* The file round trip is the point: replay what was read back. */
+    bool same = read_ok && cap2.count == cap.count;
+    for (u32 i = 0; same && i < cap.count; i++) {
+        same = memcmp(&cap.msgs[i], &cap2.msgs[i], sizeof(Message)) == 0 &&
+               (!cap.msgs[i].payload_len ||
+                memcmp(cap.payloads[cap.msgs[i].payload_idx].data, cap2.payloads[cap2.msgs[i].payload_idx].data,
+                       cap.msgs[i].payload_len) == 0);
+    }
+    printf("Round trip identical: %s\n", same ? "YES" : "NO");
+
+    printf("\n--- Replaying captured messages (from the file) ---\n");
+
+    bool replay_ok = read_ok && hs_capture_replay(&gpu.system, &cap2);
     printf("Replay capture: %s\n", replay_ok ? "OK" : "FAILED");
     
     for (int f = 0; f < 30 && g_run; f++) {
         hs_gpu_begin_frame(&gpu);
         hs_gpu_clear(&gpu, v4_make(0.1f, 0.1f, 0.1f, 1.0f));
         hs_gpu_draw(&gpu, 0);
+        if (f == 29) (void)hs_backend_gles_capture_next(&backend, shot_path);
         hs_gpu_process(&gpu);
         hs_gpu_end_frame(&gpu);
-        usleep(16000);
     }
-
-    HSGraphics* gfx = (HSGraphics*)backend.ctx;
-    if (gfx) {
-        save_screenshot(gfx, "/tmp/capture_demo.ppm");
-    }
+    bool shot_ok = hs_backend_gles_capture_ok(&backend);
+    hs_gpu_shutdown(&gpu);
 
     printf("\n=== Demo Complete ===\n");
-    printf("Files created:\n");
-    printf("  /tmp/neogpu_capture.bin - Message capture (HSCAP1)\n");
-    printf("  /tmp/capture_demo.ppm   - Visual screenshot\n");
-    
-    return 0;
+    printf("Files created (current directory):\n");
+    printf("  %s - Message capture (HSCAP1)\n", cap_path);
+    printf("  %s - Screenshot (%s)\n", shot_path, shot_ok ? "written" : "FAILED");
+
+    return cap_ok && write_ok && read_ok && same && replay_ok && shot_ok ? 0 : 1;
 }

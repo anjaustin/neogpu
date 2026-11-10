@@ -150,12 +150,9 @@ static void hs_gpu_send_simple(HSGpu* gpu, u8 to, OpCode op, u32 payload_idx, u3
 }
 
 bool hs_gpu_send_with_payload(HSGpu* gpu, u8 to, OpCode op, const void* data, u32 len) {
-    u16 idx = 0;
-    u32 copy_len = 0;
-    if (!hs_payload_alloc_and_copy(&gpu->system, data, len, &idx, &copy_len)) {
-        return false;
-    }
-    
+    if (!gpu || len > HS_PAYLOAD_SIZE || (len && !data)) return false;
+    /* Payload bytes travel inline with the message and are placed in the
+     * payload ring by the step thread, so any producer thread may call this. */
     Message msg = {
         .to = to,
         .from = NODE_CPU,
@@ -163,10 +160,10 @@ bool hs_gpu_send_with_payload(HSGpu* gpu, u8 to, OpCode op, const void* data, u3
         .flags = 0,
         .cid = 0,
         .tick = 0,
-        .payload_idx = idx,
-        .payload_len = copy_len
+        .payload_idx = 0,
+        .payload_len = 0
     };
-    return hs_send(&gpu->system, &msg);
+    return hs_send_with_payload(&gpu->system, &msg, data, len);
 }
 
 void hs_gpu_set_shader(HSGpu* gpu, u8 shader) {
@@ -180,31 +177,21 @@ void hs_gpu_set_param(HSGpu* gpu, u8 idx, vec4 value) {
 }
 
 void hs_gpu_set_global(HSGpu* gpu, u8 idx, mat4 value) {
-    /* Layout: [u8 global_idx][padding x3][f32 x 16] = 68 bytes, but payload max is 64.
-     * For now, global idx 0 = camera. Store idx at bytes 0-3, matrix at 4-67.
-     * Since HS_PAYLOAD_SIZE is 64, we can fit idx(4) + 15 floats(60) = 64.
-     * Actually 4 + 64 = 68 > 64. So pack idx as u8 prefix and 15.75 floats won't fit.
-     * Solution: use the simple message field for the index. */
+    /* The global index rides in Message.flags; the 64-byte matrix is the payload. */
     float arr[16];
     m4_to_array(value, arr);
-    
-    u16 pidx = 0;
-    u32 copy_len = 0;
-    if (!hs_payload_alloc_and_copy(&gpu->system, arr, sizeof(arr), &pidx, &copy_len)) {
-        return;
-    }
-    
+
     Message msg = {
         .to = NODE_SHADER,
         .from = NODE_CPU,
         .op = OP_SET_GLOBAL,
-        .flags = idx,          /* Use flags field for the global index */
+        .flags = idx,
         .cid = 0,
         .tick = 0,
-        .payload_idx = pidx,
-        .payload_len = copy_len
+        .payload_idx = 0,
+        .payload_len = 0
     };
-    hs_send(&gpu->system, &msg);
+    (void)hs_send_with_payload(&gpu->system, &msg, arr, sizeof(arr));
 }
 
 void hs_gpu_set_camera(HSGpu* gpu, mat4 view) {

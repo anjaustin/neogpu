@@ -61,7 +61,7 @@ Three consequences fall out of that design:
 | Area | State | Notes |
 |------|-------|-------|
 | Message fabric | **Production-shaped** | Lock-free SPSC/MPSC, channel QoS, overflow accounting |
-| Graphics (GBM/EGL/GLES3) | **Working on hardware** | Verified on Raspberry Pi 4, DRM/GBM, 800x480 DSI |
+| Graphics (GBM/EGL/GLES3) | **Working on hardware** | Raspberry Pi 4, DRM/GBM/KMS page flips; verified on an 800x480 DSI panel, any connected display is accepted |
 | Tooling / IPC | **Working** | Unix socket + TCP server, query/control surface |
 | Capture & replay | **Working** | `HSCAP1`, owned payload journal, strict native-layout file format |
 | NEON math library | **Working** | vec4/mat4/quat, SIMD-backed |
@@ -86,7 +86,15 @@ Other verified measurements:
 
 - Unix CLI: **100/100** correlated responses; three-run median **39.605 ms** total.
 - TCP CLI: **100/100** correlated responses; three-run median **48.781 ms** total.
-- Orbit renderer: **1,092 frames in 10.004662 seconds**, **109.149 display-path FPS**.
+- Ray tracers (render rate, uncapped): `test_06_raycast` **446 FPS**,
+  `test_08_raycast_orbit` **110 FPS**.
+
+Frame rates are uncapped by default: present never waits for the display, so
+they measure what the system can render. The panel shows the newest completed
+page flip at each refresh (60 Hz on the DSI panel) and drops the rest;
+`make present-hardware` verifies with an external CRTC probe that presented
+frames really are scanned out. Set `HSGraphics.vsync = true` to pace rendering
+to the display instead.
 
 **Reproduce:**
 
@@ -116,8 +124,7 @@ development packages.
 git clone https://github.com/anjaustin/neogpu.git
 cd neogpu
 
-make                 # build the core
-make build-tests     # build the graphics test suite
+make                 # build the core and the graphics test suite
 ./neogpu_demo        # run the headless test suite + benchmarks
 ```
 
@@ -197,7 +204,7 @@ VideoCore via DRM/GBM.
 | `test_05_cube3d` | 3D rotating cube | ✅ |
 | `test_06_raycast` | Shader-driven spheres + live FPS HUD | ✅ |
 | `test_07_message_triangle` | Message-driven render path | ✅ |
-| `test_08_raycast_orbit` | Full ray tracer: spheres, shadows, reflections, ground plane | ✅ **107 FPS** |
+| `test_08_raycast_orbit` | Full ray tracer: spheres, shadows, reflections, ground plane | ✅ **110 FPS** (uncapped render rate) |
 
 `test_08` is the showpiece — a real ray tracer (sphere intersection, shadow
 rays, one reflection bounce, Phong + rim lighting) running on a Cortex-A72.
@@ -211,10 +218,16 @@ Additional demos live in `tools/`:
 
 | Tool | What it is |
 |------|-----------|
-| `neogpu_pong` | Pong, driven by the message fabric |
-| `neogpu_pong_ai` | Pong with simulated commentary |
-| `neogpu_capture_demo` | Records an `HSCAP1` capture to disk |
+| `neogpu_pong` | Pong drawn with direct GLES on the display path; Up/Down or W/S in the launching terminal, P screenshot, Q quit |
+| `neogpu_pong_ai` | Self-playing Pong rendered entirely through messages (`OP_DRAW`, `OP_DRAW_TEXT` commentary), then captured, written, re-read and replayed |
+| `neogpu_procgame` | Self-playing procedural shooter (no keyboard input; Ctrl-C quits) |
+| `neogpu_capture_demo` | Records an `HSCAP1` capture, writes it, reads it back and replays the file |
 | `neogpu_tool` | Standalone IPC client for querying a running instance |
+
+The demos need root and a display, and write their files (captures,
+screenshots, pong's high scores) to the working directory. They find the font
+via `$NEOGPU_FONT`, `src/medodica_font` in the working directory, or next to
+the executable.
 
 ## Architecture
 
@@ -255,21 +268,25 @@ The runtime exposes its own internals for inspection and control.
 **IPC server mode:**
 
 ```bash
-./neogpu_demo --ipc-server /tmp/neogpu.sock --ipc-ms 5000   # Unix socket
-./neogpu_demo --ipc-tcp 8765 --ipc-ms 5000                  # TCP/IP
+./neogpu_demo --ipc-server "$XDG_RUNTIME_DIR/neogpu.sock" --ipc-ms 5000   # Unix socket (mode 0600)
+./neogpu_demo --ipc-tcp 8765 --ipc-ms 5000                                 # TCP/IP, 127.0.0.1
 ```
 
 **Client:**
 
 ```bash
 make tool
-./neogpu_tool --sock /tmp/neogpu.sock query-stats
+./neogpu_tool query-stats                       # default: $XDG_RUNTIME_DIR/neogpu.sock, else /tmp/neogpu-<uid>.sock
 ./neogpu_tool --host localhost --port 8765 query-fabric
 ```
 
-TCP server mode binds to loopback by default. Start the matching server before
-running a client; Unix and TCP are separate server modes. Services have finite
-I/O deadlines and bounded admission; callers still need trusted local access.
+TCP server mode binds to loopback by default; `--ipc-bind 0.0.0.0` listens on
+every interface and should only be used on a trusted network (the protocol is
+unauthenticated). The client only talks to a Unix-socket server owned by the
+same user or root. Start the matching server before running a client; Unix and
+TCP are separate server modes. Services have finite I/O deadlines and bounded
+admission. Channel budgets must be at least 1: a zero budget would stop the
+channel draining, so `set-budget` rejects it.
 
 **Channel semantics:**
 
@@ -287,19 +304,27 @@ include/            Public headers
   hs_msg.h            Message packing/unpacking (inline)
   hs_gpu.h            High-level GPU API
   hs_nodes.h          Node message handlers
-  hs_graphics.h       GBM/EGL/GLES graphics backend
+  hs_graphics.h       GBM/EGL/GLES display path (KMS page flips)
+  hs_backend_gles.h   GLES backend for the message runtime
+  hs_ipc.h            IPC server
+  hs_fabric.h         Participant frame fabric
+  hs_input_stream.h   evdev input stream
   hs_text.h           Text rendering
   hs_math_neon.h      NEON vec4/mat4/quat math
+  hs_neonCompat.h     <arm_neon.h>, or a tested portable fallback
 
 src/                Core runtime (graphics + substrate)
   hs_core.c           Message queue, OpCodes, system core
   hs_nodes.c          Node handlers (Shader, Buffer, Texture, Output, Sound)
   hs_gpu.c            High-level GPU API
   hs_async.c          Async completion handling
+  hs_fabric.c         Participant frame fabric
   hs_backend_gles.c   GBM/EGL/GLES3 backend
   hs_ipc.c            IPC server (Unix + TCP), tool-bus
+  hs_input_stream.c   evdev readers, hotplug, resync
   hs_text.c           Text rendering
   main.c              Headless test suite + benchmarks
+  benchmark.c         Historical port comparison (make bench-legacy)
 
 tests/              Graphics + system tests (test_01 … test_08)
 tools/              Standalone demos and utilities
@@ -324,8 +349,15 @@ make CC=aarch64-linux-gnu-gcc STRIP=aarch64-linux-gnu-strip build
 
 | Target | What it does |
 |--------|--------------|
-| `make` / `make build` | Build `neogpu_demo` (core only) |
+| `make` | Build `neogpu_demo` and the graphics test suite |
+| `make build` | Build `neogpu_demo` only |
 | `make build-tests` | Build the graphics test suite |
+| `make test` | Headless regression gate (no display needed) |
+| `make check-sources` | Compile every C source with `-Werror` |
+| `make check-scalar` | Run the headless suite on the portable intrinsics fallback |
+| `sudo make test-hardware` | Display, presentation and evdev checks (needs root + display) |
+| `sudo make present-hardware` | Presentation checks only: page flips observed from outside the process |
+| `make bench-legacy` | Historical port comparison benchmark |
 | `make tool` | Build the standalone IPC client |
 | `make run-test N=06` | Build and run one test (needs display + root) |
 | `make clean` | Remove build artifacts |
@@ -344,9 +376,12 @@ sudo ./tests/test_08_raycast_orbit  # the ray tracer
 
 `make test` exercises the message fabric, node handlers, IPC, thread safety,
 overflow handling, capture persistence, and synthetic input — without a display.
-`sudo make test-hardware` additionally records framebuffer evidence and exercises
-virtual evdev devices; it requires DRM and `/dev/uinput` access. It does not grab
-physical input devices.
+`sudo make test-hardware` additionally records framebuffer evidence, verifies
+presentation with an external scanout probe (every presented frame must be a
+page flip the display controller performs, in order, with the console handed
+back on exit), checks rendered text against the font atlas, and exercises
+virtual evdev devices (hot-add/remove, `SYN_DROPPED` resync, unplug). It
+requires DRM and `/dev/uinput` access and does not grab physical input devices.
 
 ## Documentation
 

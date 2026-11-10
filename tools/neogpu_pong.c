@@ -1,8 +1,10 @@
 /*
  * neogpu_pong.c -- Pong on NeoGPU
  * 
- * Simple pong game demonstrating the game engine.
- * Controls: Arrow keys or WASD to move paddle
+ * Simple pong game drawn with direct GLES calls on NeoGPU's display path
+ * (hs_graphics); it does not use the message runtime.
+ * Controls (in the launching terminal): Up/Down arrows or W/S, P screenshot, Q quit.
+ * Files are written to the working directory.
  */
 
 #define _GNU_SOURCE
@@ -17,6 +19,7 @@
 #include <unistd.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <termios.h>
 #include "hs_graphics.h"
 #include "hs_input.h"
 #include "hs_text.h"
@@ -30,7 +33,8 @@ static bool g_font_loaded = false;
 #define PADDLE_SPEED 0.03f
 #define AI_SPEED 0.015f
 
-#define SAVE_PATH "/tmp/neogpu_pong_save.bin"
+/* Working directory, not a predictable /tmp name (the demo runs as root). */
+#define SAVE_PATH "neogpu_pong_save.bin"
 #define HS_STORAGE_MAGIC 0x504F4E47  // "PONG"
 
 typedef struct {
@@ -106,21 +110,25 @@ static void on_sig(int s) { (void)s; g_run = false; }
 static void save_screenshot(HSGraphics* gfx, const char* path) {
     int w = gfx->screen_width;
     int h = gfx->screen_height;
-    u8* pixels = malloc(w * h * 3);
+    /* GLES only guarantees GL_RGBA/GL_UNSIGNED_BYTE reads. */
+    u8* pixels = malloc((size_t)w * h * 4);
     if (!pixels) return;
-    
+    while (glGetError() != GL_NO_ERROR) {}
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, pixels);
-    
-    FILE* f = fopen(path, "wb");
-    if (f) {
-        fprintf(f, "P6\n%d %d\n255\n", w, h);
-        for (int y = h - 1; y >= 0; y--) {
-            fwrite(pixels + y * w * 3, 1, w * 3, f);
-        }
-        fclose(f);
-        fprintf(stderr, "screenshot saved: %s\n", path);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    if (glGetError() != GL_NO_ERROR) {
+        fprintf(stderr, "screenshot failed: glReadPixels error\n");
+        free(pixels);
+        return;
     }
+    FILE* f = fopen(path, "wb");
+    bool ok = f && fprintf(f, "P6\n%d %d\n255\n", w, h) > 0;
+    for (int y = h - 1; ok && y >= 0; y--) {
+        for (int x = 0; ok && x < w; x++)
+            ok = fwrite(pixels + ((size_t)y * w + x) * 4, 1, 3, f) == 3;
+    }
+    if (f && fclose(f) != 0) ok = false;
+    fprintf(stderr, ok ? "screenshot saved: %s\n" : "screenshot failed: %s\n", path);
     free(pixels);
 }
 
@@ -129,6 +137,39 @@ static void reset_ball(Ball *b) {
     b->y = 0.0f;
     b->vx = (rand() % 2 == 0 ? 1.0f : -1.0f) * (0.005f + 0.01f * (rand() / (float)RAND_MAX));
     b->vy = (rand() % 2 == 0 ? 1.0f : -1.0f) * (0.005f + 0.01f * (rand() / (float)RAND_MAX));
+}
+
+/* Unbuffered, unechoed terminal input so single keys (and arrow escape
+ * sequences) arrive without Enter. Restored at exit. */
+static struct termios g_saved_tty;
+static bool g_tty_raw = false;
+static void restore_terminal(void) {
+    if (g_tty_raw) tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_tty);
+    g_tty_raw = false;
+}
+static void raw_terminal(void) {
+    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &g_saved_tty) != 0) return;
+    struct termios raw = g_saved_tty;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+        g_tty_raw = true;
+        atexit(restore_terminal);
+    }
+}
+
+/* One logical key: arrows map to 'w'/'s'; returns 0 when nothing is pending. */
+static int read_key(void) {
+    unsigned char c;
+    if (read(STDIN_FILENO, &c, 1) != 1) return 0;
+    if (c != 27) return c;
+    unsigned char seq[2];
+    if (read(STDIN_FILENO, &seq[0], 1) != 1 || seq[0] != '[') return 27;
+    if (read(STDIN_FILENO, &seq[1], 1) != 1) return 27;
+    if (seq[1] == 'A') return 'w';
+    if (seq[1] == 'B') return 's';
+    return 0;
 }
 
 static bool kbhit(void) {
@@ -192,7 +233,7 @@ int main(int argc, char **argv) {
     glViewport(0, 0, (GLsizei)gfx.screen_width, (GLsizei)gfx.screen_height);
     glDisable(GL_DEPTH_TEST);
 
-    g_font_loaded = hs_font_load(&g_font, "src/medodica_font");
+    g_font_loaded = hs_font_load_default(&g_font);
     if (g_font_loaded) {
         fprintf(stderr, "Font loaded: size=%d line_height=%d\n", g_font.font_size, g_font.line_height);
         fprintf(stderr, "Font glyph 'A': tex=(%d,%d) size=%dx%d offset=(%d,%d) advance=%d\n",
@@ -218,35 +259,26 @@ int main(int argc, char **argv) {
     fprintf(stderr, "PONG - Use UP/DOWN arrows or W/S to move\n");
     fprintf(stderr, "Press Q to quit\n");
 
+    raw_terminal();
     int ch = 0;
     static int screenshot_num = 0;
+    bool screenshot_pending = false;
     int frame = 0;
     while (g_run) {
         frame++;
-        if (kbhit()) {
-            ch = getchar();
-            if (ch == 'q' || ch == 'Q') break;
-            if (ch == 'p' || ch == 'P') {
-                char path[64];
-                snprintf(path, sizeof(path), "/tmp/pong_%03d.ppm", screenshot_num++);
-                save_screenshot(&gfx, path);
-                ch = 0;
-            }
+        ch = 0;
+        while (kbhit()) {
+            int key = read_key();
+            if (!key) break;
+            if (key == 'q' || key == 'Q') g_run = false;
+            else if (key == 'p' || key == 'P') screenshot_pending = true;
+            else ch = key;
         }
-
-        if (ch == -1 || ch == 27) {
-            ch = 0;
-        }
+        if (!g_run) break;
 
         float move = 0.0f;
-        if (ch == 'w' || ch == 'W' || ch == 126) {
-            move = PADDLE_SPEED;
-            ch = 0;
-        }
-        if (ch == 's' || ch == 'S' || ch == 125) {
-            move = -PADDLE_SPEED;
-            ch = 0;
-        }
+        if (ch == 'w' || ch == 'W') move = PADDLE_SPEED;
+        if (ch == 's' || ch == 'S') move = -PADDLE_SPEED;
 
         player.y += move;
         if (player.y > 1.0f - PADDLE_H) player.y = 1.0f - PADDLE_H;
@@ -324,11 +356,17 @@ int main(int argc, char **argv) {
             glUseProgram(g_prog);
         }
 
-        hs_graphics_present(&gfx);
+        if (screenshot_pending) {
+            /* Read back before presenting: after the flip the back buffer is undefined. */
+            char path[64];
+            snprintf(path, sizeof(path), "pong_%03d.ppm", screenshot_num++);
+            save_screenshot(&gfx, path);
+            screenshot_pending = false;
+        }
 
-        struct timespec ts = {0, 16666667};
-        nanosleep(&ts, NULL);
+        hs_graphics_present(&gfx); /* vsync: one frame per refresh */
     }
+    restore_terminal();
 
     hs_graphics_finish(&gfx);
     save_scores(player_high, ai_high);

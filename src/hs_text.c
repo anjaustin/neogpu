@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static const char* g_vs_text =
     "attribute vec2 a_pos;\n"
@@ -58,24 +59,33 @@ static bool hs_text_init(void) {
     return true;
 }
 
+/* The code attribute is the glyph's character as XML text: one literal byte
+ * ("0" is the digit zero, not code point 0), a named entity, or &#N;/&#xN;. */
+static int hs_font_decode_code_attr(const char* p) {
+    if (!p || !*p) return -1;
+    if (*p != '&') return p[1] == '"' ? (unsigned char)*p : -1;
+    static const struct { const char* name; int code; } entities[] = {
+        {"&quot;", '"'}, {"&amp;", '&'}, {"&lt;", '<'}, {"&gt;", '>'}, {"&apos;", '\''},
+    };
+    for (size_t i = 0; i < sizeof(entities) / sizeof(entities[0]); i++) {
+        size_t n = strlen(entities[i].name);
+        if (strncmp(p, entities[i].name, n) == 0 && p[n] == '"') return entities[i].code;
+    }
+    if (p[1] == '#') {
+        char* end = NULL;
+        long value = (p[2] == 'x' || p[2] == 'X') ? strtol(p + 3, &end, 16) : strtol(p + 2, &end, 10);
+        if (end && end[0] == ';' && end[1] == '"' && value >= 0 && value < 0x110000) return (int)value;
+    }
+    return -1;
+}
+
 static int hs_font_parse_glyph(HSGlyph* g, const char* line) {
     int width = 0, ox = 0, oy = 0, rect_x = 0, rect_y = 0, rect_w = 0, rect_h = 0;
-    int code = -1;
-    
-    if (sscanf(line, " <Char width=\"%d\" offset=\"%d %d\" rect=\"%d %d %d %d\" code=\"%d\"",
-               &width, &ox, &oy, &rect_x, &rect_y, &rect_w, &rect_h, &code) < 8) {
-        // Try parsing code as a single character
-        const char* p = strstr(line, "code=\"");
-        if (p) {
-            p += 6;
-            if (*p >= '0' && *p <= '9') {
-                code = atoi(p);
-            } else {
-                code = (unsigned char)*p;
-            }
-        }
-    }
-    
+    if (sscanf(line, " <Char width=\"%d\" offset=\"%d %d\" rect=\"%d %d %d %d\"",
+               &width, &ox, &oy, &rect_x, &rect_y, &rect_w, &rect_h) != 7) return -1;
+    const char* p = strstr(line, "code=\"");
+    int code = p ? hs_font_decode_code_attr(p + 6) : -1;
+
     if (code >= 0 && code < HS_FONT_MAX_GLYPHS) {
         g[code].width = (u16)rect_w;
         g[code].height = (u16)rect_h;
@@ -116,6 +126,11 @@ bool hs_font_load_fnt(HSFont* font, const char* fnt_path, const u8* atlas_data, 
     }
     
     if (atlas_data && atlas_w > 0 && atlas_h > 0) {
+        /* atlas_data is a fixed HS_FONT_ATLAS_W x HS_FONT_ATLAS_H RGBA array. */
+        if (atlas_w > HS_FONT_ATLAS_W || atlas_h > HS_FONT_ATLAS_H) {
+            font->loaded = false;
+            return false;
+        }
         font->atlas_w = (u16)atlas_w;
         font->atlas_h = (u16)atlas_h;
         memcpy(font->atlas_data, atlas_data, (size_t)atlas_w * atlas_h * 4);
@@ -140,10 +155,27 @@ bool hs_font_load(HSFont* font, const char* base_path) {
     
     u8 atlas_data[HS_FONT_ATLAS_W * HS_FONT_ATLAS_H * 4];
     size_t read_size = fread(atlas_data, 1, sizeof(atlas_data), f);
-    (void)read_size;
+    bool complete = read_size == sizeof(atlas_data) && fgetc(f) == EOF && !ferror(f);
     fclose(f);
+    if (!complete) return false; /* truncated or oversized atlas */
     
     return hs_font_load_fnt(font, fnt_path, atlas_data, HS_FONT_ATLAS_W, HS_FONT_ATLAS_H);
+}
+
+bool hs_font_load_default(HSFont* font) {
+    const char* env = getenv("NEOGPU_FONT");
+    if (env && env[0]) return hs_font_load(font, env);
+    if (hs_font_load(font, "src/medodica_font")) return true;
+    char exe[512];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return false;
+    exe[n] = 0;
+    char* slash = strrchr(exe, '/');
+    if (!slash) return false;
+    *slash = 0;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/src/medodica_font", exe);
+    return hs_font_load(font, path);
 }
 
 void hs_font_upload_texture(HSFont* font) {
@@ -168,6 +200,11 @@ void hs_font_unload(HSFont* font) {
 }
 
 void hs_font_render_text(const HSFont* font, const char* text, float x, float y, float scale, float r, float g, float b, float a) {
+    hs_font_render_text_xy(font, text, x, y, scale, scale, r, g, b, a);
+}
+
+void hs_font_render_text_xy(const HSFont* font, const char* text, float x, float y, float scale_x, float scale_y,
+                            float r, float g, float b, float a) {
     if (!font || !text || !font->loaded || !font->atlas_tex) return;
     
     hs_text_init();
@@ -197,7 +234,7 @@ void hs_font_render_text(const HSFont* font, const char* text, float x, float y,
         
         if (c == '\n') {
             cursor_x = x;
-            cursor_y -= font->line_height * scale;
+            cursor_y -= font->line_height * scale_y;
             text++;
             continue;
         }
@@ -205,10 +242,10 @@ void hs_font_render_text(const HSFont* font, const char* text, float x, float y,
         if (c < HS_FONT_MAX_GLYPHS && font->glyphs[c].width > 0) {
             const HSGlyph* g = &font->glyphs[c];
             
-            float gw = g->width * scale;
-            float gh = g->height * scale;
-            float ox = g->offset_x * scale;
-            float oy = g->offset_y * scale;
+            float gw = g->width * scale_x;
+            float gh = g->height * scale_y;
+            float ox = g->offset_x * scale_x;
+            float oy = g->offset_y * scale_y;
             
             // Glyph quad in NDC: a small rectangle placed at the pen position,
             // offset by the glyph's bearing. x,y and scale arrive already in NDC,
@@ -220,10 +257,13 @@ void hs_font_render_text(const HSFont* font, const char* text, float x, float y,
             float top    = cursor_y - oy;
             float bottom = top - gh;
             
+            /* glTexImage2D stores atlas row 0 at t = 0, so a glyph whose
+             * rect starts at row tex_y spans t = tex_y (top of the glyph)
+             * to t = tex_y + height (bottom). v0 is the quad's bottom edge. */
             float u0 = (float)g->tex_x / atlas_w;
-            float v0 = (float)(atlas_h - g->tex_y - g->height + 1) / atlas_h;
+            float v0 = (float)(g->tex_y + g->height) / atlas_h;
             float u1 = (float)(g->tex_x + g->width) / atlas_w;
-            float v1 = (float)(atlas_h - g->tex_y) / atlas_h;
+            float v1 = (float)g->tex_y / atlas_h;
             
             float q[] = {
                 left,  bottom, u0, v0,
@@ -237,9 +277,9 @@ void hs_font_render_text(const HSFont* font, const char* text, float x, float y,
             glBufferData(GL_ARRAY_BUFFER, sizeof(q), q, GL_DYNAMIC_DRAW);
             glDrawArrays(GL_TRIANGLES, 0, 6);
             
-            cursor_x += g->advance * scale;
+            cursor_x += g->advance * scale_x;
         } else {
-            cursor_x += font->font_size * 0.5f * scale;
+            cursor_x += font->font_size * 0.5f * scale_x;
         }
         
         text++;

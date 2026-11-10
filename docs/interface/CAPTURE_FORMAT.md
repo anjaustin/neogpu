@@ -18,7 +18,7 @@ Where `count` is the number of recorded messages in the capture.
 
 - `magic[8]`: `"HSCAP1\0"`
 - `endian`: `0x01020304`
-- `version`: `2`
+- `version`: `1` (`HS_CAPTURE_VERSION` in `src/hs_core.c`; files with any other value are rejected)
 - `msg_size`: must equal `sizeof(Message)` for this build
 - `payload_size`: must equal `sizeof(Payload)` for this build
 - `count`: number of messages/payload blocks stored

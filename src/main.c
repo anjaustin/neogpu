@@ -108,6 +108,18 @@ static void tool_print_fabric(HSSystem* sys, SystemState* st) {
     printf("telem_drop: rt=%u render=%u telem=%u\n", (unsigned)telem_dropped3[0], (unsigned)telem_dropped3[1], (unsigned)telem_dropped3[2]);
 }
 
+/* Strict unsigned parse (decimal, 0x hex, 0 octal): rejects empty input,
+ * signs, trailing junk, overflow, and values above maximum. */
+static bool tool_parse_u32(const char* text, unsigned long maximum, u32* out) {
+    if (!text || !text[0] || text[0] == '-' || text[0] == '+' || text[0] == ' ') return false;
+    errno = 0;
+    char* end = NULL;
+    unsigned long value = strtoul(text, &end, 0);
+    if (errno || !end || *end || value > maximum) return false;
+    *out = (u32)value;
+    return true;
+}
+
 static int run_tool_mode(int argc, char** argv) {
     if (argc <= 1) {
         tool_usage(argv ? argv[0] : NULL);
@@ -145,30 +157,47 @@ static int run_tool_mode(int argc, char** argv) {
                 printf("missing value for --set-record-mask\n");
                 return 2;
             }
-            new_mask = (u32)strtoul(argv[++i], NULL, 0);
+            if (!tool_parse_u32(argv[++i], UINT32_MAX, &new_mask)) {
+                printf("invalid value for --set-record-mask: %s\n", argv[i]);
+                return 2;
+            }
             do_set_mask = true;
         } else if (strcmp(a, "--set-budget") == 0) {
             if (i + 2 >= argc) {
                 printf("missing values for --set-budget\n");
                 return 2;
             }
-            bud_ch = (u8)strtoul(argv[++i], NULL, 0);
-            bud_val = (u32)strtoul(argv[++i], NULL, 0);
+            u32 ch = 0;
+            if (!tool_parse_u32(argv[i + 1], 255, &ch) || !tool_parse_u32(argv[i + 2], UINT32_MAX, &bud_val)) {
+                printf("invalid values for --set-budget: %s %s\n", argv[i + 1], argv[i + 2]);
+                return 2;
+            }
+            bud_ch = (u8)ch;
+            i += 2;
             do_set_budget = true;
         } else if (strcmp(a, "--set-block") == 0) {
             if (i + 2 >= argc) {
                 printf("missing values for --set-block\n");
                 return 2;
             }
-            block_ch = (u8)strtoul(argv[++i], NULL, 0);
-            block_val = (u8)strtoul(argv[++i], NULL, 0);
+            u32 ch = 0, value = 0;
+            if (!tool_parse_u32(argv[i + 1], 255, &ch) || !tool_parse_u32(argv[i + 2], 1, &value)) {
+                printf("invalid values for --set-block: %s %s\n", argv[i + 1], argv[i + 2]);
+                return 2;
+            }
+            block_ch = (u8)ch;
+            block_val = (u8)value;
+            i += 2;
             do_set_block = true;
         } else if (strcmp(a, "--loop") == 0) {
             if (i + 1 >= argc) {
                 printf("missing value for --loop\n");
                 return 2;
             }
-            loop_ms = (u32)strtoul(argv[++i], NULL, 0);
+            if (!tool_parse_u32(argv[++i], 3600000, &loop_ms)) {
+                printf("invalid value for --loop (0..3600000 ms): %s\n", argv[i]);
+                return 2;
+            }
         } else {
             printf("unknown arg: %s\n", a);
             tool_usage(argv ? argv[0] : NULL);
@@ -221,7 +250,7 @@ static int run_tool_mode(int argc, char** argv) {
                 u32 oldv = 0, newv = 0;
                 (void)hs_unpack_u32x2(gpu.system.payloads[st->last_result_payload_idx].data, st->last_result_len, &oldv, &newv);
                 if (oldv == 0xFFFFFFFFu || newv == 0xFFFFFFFFu) {
-                    printf("set-budget: invalid channel %u\n", (unsigned)bud_ch);
+                    printf("set-budget: rejected (channel %u must be 1..3, budget >= %u)\n", (unsigned)bud_ch, (unsigned)HS_CHAN_BUDGET_MIN);
                 } else {
                     printf("set-budget: ch=%u %u -> %u\n", (unsigned)bud_ch, (unsigned)oldv, (unsigned)newv);
                 }
@@ -270,7 +299,8 @@ static int run_tool_mode(int argc, char** argv) {
         }
 
         if (loop_ms == 0) break;
-        usleep(loop_ms * 1000);
+        struct timespec pause = {.tv_sec = loop_ms / 1000, .tv_nsec = (long)(loop_ms % 1000) * 1000000L};
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {}
     }
 
     return 0;
@@ -287,6 +317,16 @@ static void test_math(void) {
     vec4 b = v4_make(5, 6, 7, 8);
     vec4 sum = v4_add(a, b);
     TEST("v4_add", v4_equal(sum, v4_make(6, 8, 10, 12), 1e-5f));
+
+    /* m4_transpose: element (r,c) becomes (c,r) (exercises vtrnq/vcombine). */
+    float source[16];
+    for (int i = 0; i < 16; i++) source[i] = (float)i;
+    float back[16];
+    m4_to_array(m4_transpose(m4_from_array(source)), back);
+    bool transposed = true;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) transposed = transposed && back[r * 4 + c] == source[c * 4 + r];
+    TEST("m4_transpose", transposed);
 
     vec4 diff = v4_sub(b, a);
     TEST("v4_sub", v4_equal(diff, v4_make(4, 4, 4, 4), 1e-5f));
@@ -1898,25 +1938,35 @@ static bool parse_number(const char* text, unsigned long maximum, u32* out) {
     return true;
 }
 
+static int server_usage_error(const char* detail) {
+    fprintf(stderr, "server options: --ipc-server PATH | --ipc-tcp PORT(1-65535) "
+                    "[--ipc-ms MS(>0)] [--ipc-bind IPv4]: %s\n", detail);
+    return 2;
+}
+
 static int run_server_mode(int argc, char** argv) {
     const char* path = NULL;
     const char* bind_address = "127.0.0.1";
     u32 port = 0, duration = 5000;
     for (int i = 1; i < argc; i++) {
         const char* option = argv[i];
-        if (i + 1 >= argc) return 2;
+        if (i + 1 >= argc) return server_usage_error("missing value");
         if (strcmp(option, "--ipc-server") == 0) {
-            if (path || port) return 2;
+            if (path || port) return server_usage_error("choose one of --ipc-server/--ipc-tcp");
             path = argv[++i];
         } else if (strcmp(option, "--ipc-tcp") == 0) {
-            if (path || port || !parse_number(argv[++i], 65535, &port) || !port) return 2;
+            if (path || port) return server_usage_error("choose one of --ipc-server/--ipc-tcp");
+            if (!parse_number(argv[++i], 65535, &port) || !port) return server_usage_error("bad port");
         } else if (strcmp(option, "--ipc-ms") == 0) {
-            if (!parse_number(argv[++i], UINT32_MAX, &duration) || !duration) return 2;
+            if (!parse_number(argv[++i], UINT32_MAX, &duration) || !duration) return server_usage_error("bad duration");
         } else if (strcmp(option, "--ipc-bind") == 0) {
             bind_address = argv[++i];
-        } else return 2;
+        } else return server_usage_error("unknown option");
     }
-    if (!path && !port) return 2;
+    if (!path && !port) return server_usage_error("no endpoint");
+    /* Handlers first: a signal during startup must still reach hs_ipc_stop. */
+    signal(SIGINT, stop_server_signal);
+    signal(SIGTERM, stop_server_signal);
     static HSGpu gpu;
     hs_gpu_init(&gpu);
     gpu.system.validate_on_send = true;
@@ -1925,8 +1975,6 @@ static int run_server_mode(int argc, char** argv) {
     bool started = path ? hs_ipc_start(&server, &gpu.system, path) :
                          hs_ipc_start_tcp(&server, &gpu.system, bind_address, (u16)port);
     if (!started) { fprintf(stderr, "IPC server startup failed\n"); return 1; }
-    signal(SIGINT, stop_server_signal);
-    signal(SIGTERM, stop_server_signal);
     printf("IPC ready: %s\n", path ? path : bind_address);
     double deadline = monotonic_ms() + duration;
     while (!server_stop && monotonic_ms() < deadline) {
