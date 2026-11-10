@@ -76,6 +76,7 @@ See [../CREDITS.md](../CREDITS.md) for the full acknowledgment.
 | [audit/REFERENCE_REFRESH.md](audit/REFERENCE_REFRESH.md) | Committed-path reference refresh contract, controls and reproduction tools |
 | [audit/REFERENCE_REFRESH_RESULTS.md](audit/REFERENCE_REFRESH_RESULTS.md) | Committed default-path benchmark findings: throughput, parity and rejection gates |
 | [audit/COST_BREAKDOWN_RESULTS.md](audit/COST_BREAKDOWN_RESULTS.md) | Measured cost breakdown: startup, per-frame, teardown and CPU attribution with boundaries |
+| [audit/GLES_COST_P0.md](audit/GLES_COST_P0.md) | P0 speed and efficiency programme: hypotheses, acceptance criteria and measured rejections |
 
 ## Archive
 
