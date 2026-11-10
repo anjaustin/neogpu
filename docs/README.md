@@ -72,6 +72,10 @@ See [../CREDITS.md](../CREDITS.md) for the full acknowledgment.
 | [audit/FRAME_RUNTIME_REDTEAM.md](audit/FRAME_RUNTIME_REDTEAM.md) | Second-pass invocation/provenance attacks and expanded composition/lifecycle checks |
 | [audit/GLES_WORK_PLAN.md](audit/GLES_WORK_PLAN.md) | Renderer/capture profiling contract, invariants and diagnostic scope |
 | [audit/GLES_WORK_RESULTS.md](audit/GLES_WORK_RESULTS.md) | Measured capture costs, graphics teardown repair and rejected state-cache candidates |
+| [audit/GLES_SHUTDOWN_PLAN.md](audit/GLES_SHUTDOWN_PLAN.md) | Graphics shutdown measurement contract and rejected teardown candidates |
+| [audit/REFERENCE_REFRESH.md](audit/REFERENCE_REFRESH.md) | Committed-path reference refresh contract, controls and reproduction tools |
+| [audit/REFERENCE_REFRESH_RESULTS.md](audit/REFERENCE_REFRESH_RESULTS.md) | Committed default-path benchmark findings: throughput, parity and rejection gates |
+| [audit/COST_BREAKDOWN_RESULTS.md](audit/COST_BREAKDOWN_RESULTS.md) | Measured cost breakdown: startup, per-frame, teardown and CPU attribution with boundaries |
 
 ## Archive
 
