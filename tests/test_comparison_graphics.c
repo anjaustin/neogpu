@@ -80,7 +80,10 @@ static GLuint compile(GLenum kind, const char* source) {
 }
 static void setup_raw(void) {
     /* Identical shader text to hs_backend_gles.c, not a different scene/shader. */
-    const char* vertex = "attribute vec2 a_position;\nattribute vec3 a_color;\nvarying vec3 v_color;\nvoid main(){\n  gl_Position = vec4(a_position,0.0,1.0);\n  v_color = a_color;\n}\n";
+    /* Identical to the backend program (checked by the evidence driver); a_offset
+     * stays disabled here, so it reads the default (0,0) as the backend does for
+     * a non-instanced draw. */
+    const char* vertex = "attribute vec2 a_position;\nattribute vec3 a_color;\nattribute vec2 a_offset;\nvarying vec3 v_color;\nvoid main(){\n  gl_Position = vec4(a_position + a_offset,0.0,1.0);\n  v_color = a_color;\n}\n";
     const char* fragment = "precision mediump float;\nvarying vec3 v_color;\nvoid main(){\n  gl_FragColor = vec4(v_color,1.0);\n}\n";
     GLuint vs = compile(GL_VERTEX_SHADER, vertex), fs = compile(GL_FRAGMENT_SHADER, fragment);
     program = glCreateProgram(); glAttachShader(program, vs); glAttachShader(program, fs);
