@@ -24,6 +24,12 @@ DIRS = [
     'tests/evidence-cost-sweep',
     'tests/evidence-e2e-regress-c54d140',
     'tests/evidence-e2e-regress-sweep',
+    'tests/evidence-e2e-regress-redteam',
+    'tests/evidence-cost-scan-2',
+    'tests/evidence-cost-sweep-2',
+    'tests/evidence-cost-sweep-3',
+    'tests/evidence-cost-sweep-4',
+    'tests/evidence-cost-modeset-5',
 ]
 DIRS += [str(p) for p in sorted(Path('tests').glob('evidence-cost-breakdown-*'))]
 FILES = [
@@ -40,11 +46,14 @@ FILES = [
     'tests/package_cost_catalog.py',
     'tests/test_gles_modeset_ab.py',
     'tests/test_gles_sweep_ab.py',
+    'tests/test_gles_connector_scan.c',
+    'tests/test_gles_connector_scan_run.py',
     'tests/panel_mode_probe.c',
 ]
 SKIP_SUFFIXES = ('.verify.rgba', '.rgba', '.data', '.so')
 SKIP_EXACT = {'tests/test_gles_frame_cost', 'tests/test_gles_frame_cost_profile',
-              'tests/panel_mode_probe'}
+              'tests/panel_mode_probe', 'tests/test_gles_connector_scan',
+              'tests/test_gles_connector_scan_asan'}
 
 selected = []
 for directory in DIRS:

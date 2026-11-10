@@ -82,9 +82,9 @@ total throughput alone.
 | Item | Title | Status |
 |---|---|---|
 | P0-1 | Remove the redundant manual modeset | **Rejected (measured)** — it is what puts our frames on the panel |
-| P0-11 | Make display ownership optional | Open — isolates ~38 ms/process of display cost |
+| P0-11 | Make display ownership optional | **Implemented and measured** — ~38 ms/process, now selectable |
 | P0-3 | Single connector sweep | **Accepted (measured)** — first present −8.8 ms, connector queries halved |
-| P0-2 | Display-agnostic connector and mode selection | Open — the DSI-only check is itself a portability bug |
+| P0-2 | Display-agnostic connector and mode selection | **Accepted (measured)** — any connected connector with a mode |
 | P0-10 | Match the surface format to the display's native format | Open — RGB565 vs XRGB8888 halves scanout bandwidth |
 | P0-12 | Cost of taking the display from the console | Open — 25.3 ms takeover, ~13.6 ms handback |
 | P0-4 | Attribute and reduce the `close()` cost | Open |
@@ -160,29 +160,59 @@ example a no-scanout init flag) so a host can ask for offscreen production
 without pretending to display.
 
 **Acceptance.** In no-scanout mode: first present ≤2 ms and shutdown ≤30 ms
-(measured: 0.95 ms and 23.85 ms), identical rendered pixels, and complete
-resource release. Displayed mode must be unchanged.
+(measured: 0.85 ms and 27.86 ms with a forced size), identical rendered
+pixels, and complete resource release. Displayed mode must be unchanged.
+
+**Status.** The opt-out now exists in two forms and both are measured:
+
+- `HSGraphics.take_display` — clear it and the display is never taken.
+  Measured: first present 0.95 ms, shutdown 23.85 ms.
+- `hs_graphics_init_sized(gfx, width, height)` — state the target size and
+  the display is not taken unless that size is the panel's own mode.
+  Measured (`sized` arm): first present **0.85 ms**, shutdown **27.86 ms**,
+  surface 640×480, and the panel keeps the console's framebuffer.
 
 **Note.** This is the "agnostic to the connected display" option made
 concrete: it is not a faster display path, it is *no* display path, and it
 must be selected deliberately rather than by accident.
 
 
-### P0-2 — Display-agnostic connector and mode selection
+### P0-2 — Display-agnostic connector and mode selection — **ACCEPTED (measured)**
 
-**Hypothesis.** Requiring `DRM_MODE_CONNECTOR_DSI` (16) in both the init scan
-and the CRTC setup (`include/hs_graphics.h:77`, `:305`), plus the hard-coded
-800×480 fallback (`:89-92`), means NeoGPU cannot use an HDMI/DP/DPI display
-at all and silently renders at a wrong size when no DSI panel is attached.
+**Problem.** The connector scan required `connector_type ==
+DRM_MODE_CONNECTOR_DSI` (16) in both the init scan and the display setup, and
+fell back to a hard-coded 800×480 when no DSI connector was found. On a
+machine with an HDMI or DPI display and no DSI panel, NeoGPU therefore found
+no connector, never programmed a CRTC, and silently rendered at a size that
+had nothing to do with the attached display.
 
-**Change.** Select any connected connector that has modes, prefer one that can
-drive the current CRTC, and derive the surface size from the chosen mode.
-Keep the DSI preference as a tie-break, not a requirement. Never fall back to
-a hard-coded size — fail cleanly instead.
+**Change.** One selection helper, `hs_graphics_select_display`, now chooses
+the connector for both the init scan and the display setup. A candidate is any
+**connected connector that reports a mode**; among candidates, one whose
+encoder is attached to a CRTC wins, then a DSI panel, then any. The type is
+a preference, not a requirement. The surface size comes from the chosen
+mode. `hs_graphics_init_sized(gfx, width, height)` lets a host state its
+target size explicitly; the legacy 800×480 default is kept for compatibility
+but is now flagged (`size_defaulted`) instead of being silent.
 
-**Acceptance.** Correct size and a live CRTC on the attached display, plus
-identical pixels for the existing E2E equality gates. **Reject.** Any change
-in rendered pixels on the committed path.
+**Result — `tests/evidence-cost-scan-2` and `tests/evidence-cost-sweep-4`:**
+
+| Case | Result |
+|---|---|
+| Selection with any type | connector 50, crtc 93, 800×480 — the attached panel |
+| Selection with a type nothing reports | no display, no connector mishandled |
+| Selection on a device with no resources | no display, no crash |
+| Init cost, before vs after | 120.88 → 120.58 ms (no regression) |
+| E2E harness, 12 configurations | pixel equality, FIFO order, resources released |
+
+**Correctness.** The plain and the ASan/UBSan builds of
+`tests/test_gles_connector_scan.c` are clean on every path, and the real-GLES
+end-to-end harness passes all 12 configurations.
+
+**Limit.** No non-DSI display was attached during this work, so the selection
+rule is verified against the attached panel and against the negative cases,
+not against a physically connected HDMI display.
+
 
 ### P0-3 — Single connector sweep — **ACCEPTED (measured)**
 
@@ -329,7 +359,27 @@ wait (`glFenceSync` + `eglWaitSync`) for CPU per frame and for latency.
 Production does not call `glFinish` per frame, so this mostly affects
 capture, readback and multi-producer scaling paths.
 
-## 5. Out of scope
+## 5. Red-team findings and remediations
+
+The P0-3 and P0-2 work was red-teamed before it was kept. Each finding was
+proved, not asserted, and each remediation was verified.
+
+| # | Finding | Proof | Remediation | Verification |
+|---|---|---|---|---|
+| F1 | **Heap double free** in the connector selection: the loop released every non-matching connector and then released the last one again after the loop, so a run in which no connector matched freed the same object twice. Pre-existing, and preserved by the first P0-3 implementation. | The legacy loop, replayed with a filter nothing matches, trips the sanitiser: `AddressSanitizer: attempting double-free ... in drmModeFreeConnector`. The defect was reachable in exactly the display-agnostic case, which is why P0-2 needed it fixed first. | One selection helper that releases each connector exactly once on every path. | Plain and ASan/UBSan builds clean on the match, no-match and no-resources paths; the replayed legacy loop still trips the sanitiser, so the test proves both the defect and the fix. |
+| F2 | `crtc_setup_done` was a **process-global in a header**: a second graphics context would skip the display takeover entirely, and concurrent contexts raced on it. | Code read of `include/hs_graphics.h` before the change; the flag was never per-instance and never reset. | Moved into `HSGraphics` as `crtc_setup_done`. | Each context now takes the display for itself; the probe asserts the CRTC is bound to our buffer after the first present. |
+| F3 | The sweep A/B compared **kernel-assigned framebuffer ids and handles** across arms. Those are not stable between runs, so the assertion could fail on a correct run. | Read of the assertion; the ids are allocated by the kernel. | Compare only stable properties: CRTC id, width, height and pixel format. Framebuffer ids are recorded but not compared. | Four-arm run passes; ids are still reported for information. |
+| F4 | The hotplug fallback — "if the connector has gone, look again" — was **claimed but never exercised**. | The first implementation had no arm that could reach it. | A `stale` arm invalidates the cached connector id before the first present. | The fallback recovers the takeover and lands on the **same CRTC** as the other arms, at the cost of a second sweep (first present 34.50 ms against 19.67 ms). |
+| F5 | The `stale` arm's first assertion checked a value the fallback legitimately overwrites, so the test failed on correct behaviour. | The assertion compared the connector id reported at the end of the run. | The probe reports what it invalidated (`stale_cache`), not the final id. | The arm passes and still proves the fallback. |
+| F6 | The connector selection was **DSI-only**, so on a machine with no DSI panel the display was never programmed and the size was silently wrong. | The selection code required `connector_type == DRM_MODE_CONNECTOR_DSI`. | P0-2: any connected connector with a mode, an explicit sized init, and an observable `size_defaulted` flag. | Selection test covers the match, no-match and no-resources cases under ASan; E2E passes 12/12. |
+
+Two limits of this red-team pass are worth stating plainly: no non-DSI
+display was attached, so P0-2's selection rule is verified against the
+attached panel and against the negative cases rather than against a physical
+HDMI display; and the panel's own quirks are only visible through the
+kernel's own state.
+
+## 6. Out of scope
 
 - Re-running the four rejected shutdown candidates (close-only, early-RmFB,
   full saved-CRTC restore, page-flip restore). The page-flip path failed its
@@ -337,7 +387,7 @@ capture, readback and multi-producer scaling paths.
 - Re-running the rejected GL-state cache candidates.
 - App-side CPU micro-optimisation: the measured ceiling is 5.7% of cycles.
 
-## 6. Evidence
+## 7. Evidence
 
 - [COST_BREAKDOWN_RESULTS.md](COST_BREAKDOWN_RESULTS.md) — the measurements
   this plan is built on.
