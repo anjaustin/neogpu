@@ -20,6 +20,7 @@ pico/
 *.d
 neogpu_demo
 neogpu_demo_ml
+neogpu_bitnet_chat
 neogpu_tool
 test_*
 tests/test_
@@ -84,6 +85,8 @@ tests/redteam_mt11
 tests/redteam_ternary_v3
 tests/redteam_ternary_formats
 tests/redteam_code_mapping
+tests/redteam_i2s_repack
+tests/redteam_i2s_upstream
 tools/neogpu_bitnet_chat
 tools/neogpu_pix
 tools/neogpu_viz

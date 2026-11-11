@@ -420,9 +420,12 @@ static void f32_proj(HSMLTernary* m, float* out, const float* in,
     u64 t0 = now_ns();
     hs_ml_ternary_f32_proj(out, in, W, N, K);
 
-    /* Apply per-tensor weight scale from BitNet quantization.
-     * weight_scale = mean(|w_original|). Ternary = round(w / scale).
-     * To recover original magnitude: output = ternary_proj(input) * scale. */
+    /* Apply the per-tensor weight scale from BitNet quantization.
+     * The codes are round(w / scale), so to recover the original
+     * magnitude: output = ternary_proj(input) * scale. For an upstream
+     * I2_S tensor the scale is the maximum absolute weight the codes
+     * were quantized against; for this repository's own converter it is
+     * the scale stored in the model's <name>_scale tensor. */
     if (weight_scale && weight_scale[0] != 1.0f) {
         float s = weight_scale[0];
         for (u32 i = 0; i < N; i++) out[i] *= s;

@@ -32,6 +32,23 @@ HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DI
 #     would let a plain `make` silently reuse ML-enabled objects (or the
 #     reverse), quietly breaking the core/ML separation.
 ML_SRC = $(SRC_DIR)/hs_ml.c $(SRC_DIR)/hs_ml_loader.c $(SRC_DIR)/hs_ml_ternary_mt.c
+
+# --- The real ML product: the BitNet chat tool. It links the whole
+#     ternary inference stack -- the GGUF loader, the LUT projection
+#     kernels, the two-stage lm_head, the I2_S layout handling and the
+#     GPU GEMM. The `ml` target above does NOT: it builds the older
+#     routing stack, which the chat tool does not use. Without this
+#     target, a compile error in the ternary stack reaches no build at
+#     all, CI included.
+ML_CHAT_SRC = $(SRC_DIR)/hs_ml_loader.c $(SRC_DIR)/hs_ml_loader_ternary.c \
+              $(SRC_DIR)/hs_ml_infer.c $(SRC_DIR)/hs_ml_ternary_neon.c \
+              $(SRC_DIR)/hs_ml_i2s_layout.c $(SRC_DIR)/hs_ml.c \
+              $(SRC_DIR)/hs_ml_gpu_gemm.c $(SRC_DIR)/hs_ml_msg.c \
+              $(SRC_DIR)/hs_ml_routing.c $(SRC_DIR)/hs_ml_binary.c \
+              $(SRC_DIR)/hs_ml_ternary_mt.c $(SRC_DIR)/hs_ml_ternary.c
+ML_CHAT_TARGET = neogpu_bitnet_chat
+HS_SRC_NO_MAIN = $(filter-out $(SRC_DIR)/main.c,$(HS_SRC))
+
 ML_BUILD_DIR = build/ml
 ML_CFLAGS = $(CFLAGS) -DHS_ENABLE_ML
 ML_FULL_SRC = $(HS_SRC) $(ML_SRC)
@@ -45,7 +62,7 @@ HS_TARGET = neogpu_demo
 
 TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast test_07_message_triangle test_08_raycast_orbit
 
-.PHONY: build clean run all test run-test build-tests version ml test-i8-bounds test-ternary-formats test-code-mapping
+.PHONY: build clean run all test run-test build-tests version ml ml-chat test-i8-bounds test-ternary-formats test-code-mapping test-i2s-repack test-i2s-upstream
 
 all: build build-tests
 
@@ -73,6 +90,18 @@ $(ML_BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 
 $(ML_TARGET): $(ML_FULL_OBJ)
 	$(CC) $(ML_FULL_OBJ) $(LDFLAGS) -o $@
+	$(STRIP) $@
+
+ml-chat: $(ML_CHAT_TARGET)
+
+ML_CHAT_OBJ = $(patsubst $(SRC_DIR)/%.c,$(ML_BUILD_DIR)/%.o,$(HS_SRC_NO_MAIN) $(ML_CHAT_SRC))
+
+$(ML_BUILD_DIR)/neogpu_bitnet_chat.o: tools/neogpu_bitnet_chat.c
+	@mkdir -p $(ML_BUILD_DIR)
+	$(CC) $(ML_CFLAGS) -c $< -o $@
+
+$(ML_CHAT_TARGET): $(ML_BUILD_DIR)/neogpu_bitnet_chat.o $(ML_CHAT_OBJ)
+	$(CC) $(ML_BUILD_DIR)/neogpu_bitnet_chat.o $(ML_CHAT_OBJ) $(LDFLAGS) -o $@
 	$(STRIP) $@
 
 TOOL_TGT = neogpu_tool
@@ -126,7 +155,8 @@ clean:
 	rm -f tests/redteam_lmhead_i8_bounds tests/hs_ml_ternary_neon_asan.o
 	rm -f tests/redteam_ternary_formats tests/hs_ml_ternary_neon_formats.o
 	rm -f tests/redteam_code_mapping
-	rm -rf $(ML_BUILD_DIR) $(ML_TARGET)
+	rm -f tests/redteam_i2s_repack tests/redteam_i2s_upstream
+	rm -rf $(ML_BUILD_DIR) $(ML_TARGET) $(ML_CHAT_TARGET)
 
 run: $(HS_TARGET)
 	./$(HS_TARGET)
@@ -184,6 +214,29 @@ test-ternary-formats:
 test-code-mapping:
 	$(CC) $(CFLAGS) tests/redteam_code_mapping.c -lm -o tests/redteam_code_mapping
 	./tests/redteam_code_mapping
+
+# The I2_S byte-layout conversion. Upstream BitNet packs I2_S as
+# 64-weight blocks; NeoGPU's kernels pack four consecutive weights per
+# byte. The loader converts once, at load time; this pins that the
+# converted bytes are byte-identical to natively-packed ones.
+test-i2s-repack:
+	$(CC) $(CFLAGS) $(SRC_DIR)/hs_ml_i2s_layout.c tests/redteam_i2s_repack.c -lm -o tests/redteam_i2s_repack
+	./tests/redteam_i2s_repack
+
+# Upstream BitNet's own I2_S producer and consumer, extracted from the
+# vendored source at build time, so the conversion is checked against
+# the reference implementation and not against a copy of it that could
+# drift. See tools/extract_upstream_i2s.py.
+UPSTREAM_I2S_SRC = experimental/BitNet/src/ggml-bitnet-mad.cpp
+UPSTREAM_I2S_REF = $(ML_BUILD_DIR)/upstream_i2s_ref.c
+
+$(UPSTREAM_I2S_REF): $(UPSTREAM_I2S_SRC) tools/extract_upstream_i2s.py
+	@mkdir -p $(ML_BUILD_DIR)
+	python3 tools/extract_upstream_i2s.py $(UPSTREAM_I2S_SRC) $@
+
+test-i2s-upstream: $(UPSTREAM_I2S_REF)
+	$(CC) $(CFLAGS) -Wno-unused-parameter -I$(ML_BUILD_DIR) $(SRC_DIR)/hs_ml_i2s_layout.c tests/redteam_i2s_upstream.c -lm -o tests/redteam_i2s_upstream
+	./tests/redteam_i2s_upstream
 
 run-test:
 	@if [ -z "$(N)" ]; then \

@@ -67,6 +67,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   working code.
 
 ### Fixed
+- **I2_S projection weights were decoded with the wrong byte layout.**
+  Upstream BitNet packs I2_S weights as a flat stream of 64-weight
+  blocks; NeoGPU's projection kernels read four consecutive weights per
+  byte. The loader read upstream's bytes and handed them to NeoGPU's
+  decoder unchanged, so every projection weight of an I2_S model was
+  noise. Measured: the NeoGPU rule recovers 0 of 2560 weights at the
+  right index from upstream ARM bytes, and 25594 of 40960 weights are
+  wrong on a real test row.
+
+  The loader now converts once, at load time
+  (`hs_ml_i2s_to_neogpu()`, `src/hs_ml_i2s_layout.c`), so the kernels
+  and the GPU shaders need no special case. After the conversion the
+  bytes are byte-identical to what this repository's own converter
+  produces for the same weights.
+
+  Which layout a file holds is decided from the file itself: this
+  repository's converter writes a separate `<name>_scale` tensor, and
+  upstream's quantizer puts the scale in the tail of the tensor data
+  instead. An upstream file's scale is now read from that tail and
+  applied like any other per-tensor scale.
+
+  New test `tests/redteam_i2s_repack.c` (`make test-i2s-repack`, run in
+  CI) checks the conversion byte-for-byte against both producers, that
+  the converted bytes decode to the original weights, that the
+  unconverted bytes do not, and that a row length which is not a
+  multiple of the 64-weight block is refused rather than mis-converted.
+
+  A second test, `tests/redteam_i2s_upstream.c` (`make test-i2s-upstream`,
+  run in CI), checks the conversion against upstream BitNet's *own* code
+  rather than against a copy of it: `tools/extract_upstream_i2s.py` pulls
+  upstream's `quantize_i2_s()` (the producer) and
+  `ggml_vec_dot_i2_i8_s_1x1()` (the consumer) out of the vendored source
+  at build time, and the test checks that our decode of the converted
+  bytes equals upstream's own answer once the centring is undone.
+  Measured: upstream's raw dot product 191, ours 143, and
+  191 - sum(activations) = 143 exactly; without the conversion the same
+  check gives -54. Upstream's scale, read from the tail of the tensor
+  data, is max|w| as expected.
+- **A shape mismatch between the model config and the tensor was not
+  detected.** The loader took the row and column counts from the model's
+  configuration rather than from the tensor's own dimensions, so a
+  disagreement meant the bytes read were not the bytes the file holds.
+  The I2_S path now checks the tensor's dims against the shape it is
+  about to read and refuses to load a model that disagrees.
+- **The ternary inference stack was built by nothing.** `make ml` builds
+  the older routing stack; the files this project actually does its work
+  in -- `src/hs_ml_loader_ternary.c`, `src/hs_ml_infer.c`,
+  `src/hs_ml_ternary_neon.c` -- were in no build target at all, so a
+  compile error in them would have reached neither `make` nor CI. The
+  new `make ml-chat` target builds the real product, the BitNet chat
+  tool, which links the whole stack, and CI now runs it. Building it
+  also turned up a stale line in AGENTS.md: the documented link command
+  was missing `src/hs_ml_ternary_mt.c` and did not link.
 - **Build fails on current Debian/Ubuntu (including the CI runner)**. The
   build did not compile at `src/hs_async.c`: `include/hs_graphics.h` includes
   `<xf86drm.h>`, and libdrm's `xf86drm.h` does `#include <drm.h>`, but
@@ -128,34 +181,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remains correct; the performance claim was not.
 
 ### Known issues
-- **The I2_S projection path decodes upstream-layout bytes with the
-  NeoGPU layout.**
-  `src/hs_ml_infer.c` contains `i2s_proj_neon()`, which implements the
-  upstream ARM layout (64-weight blocks, `group_idx = j / 16`). It is
-  unreachable: its only call site is inside `ternary_proj()`'s
-  `if (m->use_i2s)` branch, and every one of `ternary_proj()`'s seven
-  call sites is itself inside the `else` branch of the same test.
-
-  A model with I2_S tensors therefore has its projections decoded by
-  `f32_proj()` -> `hs_ml_ternary_f32_proj()`, which decodes the NeoGPU
-  layout — 4 consecutive weights per byte, low bits first. If the model's
-  bytes are in one of upstream's layouts, every projection weight is
-  wrong. Measured, the NeoGPU rule recovers 0 of 2560 weights at the
-  right index from upstream ARM bytes and 40 of 2560 from upstream x86
-  bytes; from NeoGPU-layout bytes it recovers all of them.
-
-  This depends on which layout the model file holds, which is not yet
-  known. `ggml-model-i2_s.gguf` is upstream BitNet's file-naming
-  convention, so it is probably not in the NeoGPU layout; but this
-  repository's own converter writes the NeoGPU layout under a different
-  name. See `docs/interface/TERNARY_WEIGHT_FORMATS.md` sections 1.4 and
-  4.
-
-  A second, milder case: `m->use_i2s` is set if *any* projection tensor
-  in the model is I2_S, and it then selects the path for *all* of them.
-  A model mixing I2_S and F32 tensors would have its F32-packed
-  projections read by the LUT, which uses a different code mapping from
-  the one they were packed with.
+- **Upstream's x86 and 1x4 I2_S layouts are not handled.** The loader
+  assumes the ARM layout for a file that has no separate scale tensor.
+  A file produced by upstream's x86 build would be misread. The loader
+  logs which layout it chose, so a wrong choice is visible rather than
+  silent.
+- **A model mixing I2_S and F32 tensors.** `m->use_i2s` is set if *any*
+  projection tensor in the model is I2_S, and it then selects the path
+  for *all* of them. An F32-packed projection in such a model would be
+  read by the LUT, which uses a different code mapping from the one it
+  was packed with.
 
 ## [0.2.0] - 2026-11-11
 

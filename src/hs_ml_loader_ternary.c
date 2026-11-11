@@ -39,6 +39,7 @@
  */
 
 #include "hs_ml_infer.h"
+#include "hs_ml_i2s_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -220,8 +221,10 @@ static float* load_as_f32(FILE* f, long data_start,
  *     group g covers activations at positions bi*64 + g*16 + [0..15]
  *     code: 0=-1, 1=0, 2=+1
  *
- * We load the raw packed bytes directly — the f32 kernel reads I2_S in-place.
- * No re-packing needed.
+ * The bytes are NOT in the layout the f32 kernel reads. Upstream's ARM
+ * build packs 64-weight blocks; NeoGPU's kernels pack four consecutive
+ * weights per byte. load_ternary_proj() converts between them once, at
+ * load time -- see hs_ml_i2s_to_neogpu().
  *============================================================================*/
 
 static uint8_t* load_i2s_raw(FILE* f, long data_start,
@@ -296,13 +299,50 @@ static int load_ternary_proj(FILE* f, long data_start,
     for(uint32_t r = 0; r < rows; r++) scales[r] = 1.0f;
 
     if(tis[wi].type == GGML_TYPE_I2_S) {
-        /* Load raw I2_S bytes — used directly by hs_ml_ternary_f32_proj */
+        /* Load the raw I2_S bytes. */
         uint8_t* raw = load_i2s_raw(f, data_start, &tis[wi], rows, cols);
         if(!raw) { free(scales); return -1; }
 
+        /* The rows and columns used here come from the model's config,
+         * not from the tensor's own dims. If they disagree, the bytes
+         * read below are not the bytes the file holds -- and the
+         * conversion would then relocate the wrong codes. Check before
+         * reading anything.
+         *
+         * GGUF dims are [cols, rows] for these tensors (see the
+         * TensorInfo comment). */
+        if(tis[wi].dims[0] != (uint64_t)cols || tis[wi].dims[1] != (uint64_t)rows) {
+            fprintf(stderr, "loader: I2_S tensor '%s' has shape %llu x %llu "
+                            "but the model says %u x %u\n",
+                    tis[wi].name,
+                    (unsigned long long)tis[wi].dims[0],
+                    (unsigned long long)tis[wi].dims[1], cols, rows);
+            free(raw); free(scales); return -1;
+        }
+
+        /* Which layout are those bytes in?
+         *
+         * This repository's converter (tools/convert_bitnet_to_gguf.py)
+         * writes NeoGPU's layout and a separate "<name>_scale" tensor.
+         * Upstream BitNet's quantizer writes its own 64-weight block
+         * layout and puts the scale in the tail of the tensor data
+         * instead. So the presence of the separate scale tensor says
+         * which producer made the file.
+         *
+         * Reading upstream's bytes with NeoGPU's layout decodes every
+         * weight to noise, so the conversion is not optional. */
+        hs_i2s_layout layout = hs_ml_i2s_detect_layout(si >= 0);
+        if(layout == HS_I2S_LAYOUT_UPSTREAM_ARM) {
+            if(hs_ml_i2s_to_neogpu(raw, rows, cols) != 0) {
+                fprintf(stderr, "loader: cannot convert I2_S tensor '%s' "
+                                "from upstream's layout\n", tis[wi].name);
+                free(raw); free(scales); return -1;
+            }
+        }
+
         /* Load per-tensor weight scale if present.
          * BitNet uses a single scalar scale per projection:
-         *   output = ternary_proj(input, W) / weight_scale
+         *   output = ternary_proj(input, W) * weight_scale
          * We store it in scales[0]; the inference code reads it from there. */
         if(si >= 0) {
             uint64_t scale_elems = tis[si].dims[0];
@@ -320,6 +360,27 @@ static int load_ternary_proj(FILE* f, long data_start,
                 if(fseek(f, pos, SEEK_SET) != 0 ||
                    fread(scales, sizeof(float), rows, f) != rows)
                     for(uint32_t r = 0; r < rows; r++) scales[r] = 1.0f;
+            }
+        } else if(layout == HS_I2S_LAYOUT_UPSTREAM_ARM) {
+            /* Upstream stores the per-tensor scale in the tail of the
+             * tensor data, right after the packed bytes: it is the
+             * maximum absolute weight the codes were quantized against,
+             * so the original weight is code_value * scale. */
+            float s = 1.0f;
+            long pos = data_start + (long)tis[wi].offset
+                     + (long)hs_ml_i2s_upstream_scale_offset(rows, cols);
+            /* Note: isfinite() is not usable here -- the build uses
+             * -ffast-math, which makes it always true. A magnitude bound
+             * is used instead: it rejects a NaN (every comparison with
+             * one is false) and an infinity, and survives fast-math. */
+            if(fseek(f, pos, SEEK_SET) == 0 &&
+               fread(&s, sizeof(float), 1, f) == 1 &&
+               s > 0.0f && s < 1e30f) {
+                scales[0] = s;
+                for(uint32_t r = 1; r < rows; r++) scales[r] = s;
+            } else {
+                fprintf(stderr, "loader: I2_S scale for '%s' not found in the "
+                                "tensor tail; using 1.0\n", tis[wi].name);
             }
         }
 

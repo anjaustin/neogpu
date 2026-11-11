@@ -5,7 +5,10 @@
  *
  * Two weight paths:
  *   - use_i2s=false: 2-bit packed ternary with int8 quantized activations
- *   - use_i2s=true:  raw I2_S (GGUF type 36) with pure float32 activations
+ *   - use_i2s=true:  I2_S (GGML type 36) with pure float32 activations.
+ *                    The loader converts the bytes from upstream's block
+ *                    layout to ours before they reach the kernels -- see
+ *                    include/hs_ml_i2s_layout.h.
  *
  * BitNet b1.58 layer order (per experimental/BitNet/gpu/model.py):
  *   hidden -> attn_norm -> Q/K/V proj -> RoPE -> attention
@@ -78,7 +81,7 @@ typedef struct {
     float rope_theta;       /* RoPE base frequency (500000 for BitNet 2B-4T) */
 
     /* Weight format flag */
-    bool  use_i2s;          /* true = raw I2_S bytes + f32 activation path */
+    bool  use_i2s;          /* true = I2_S weights + f32 activation path */
 
     /* GPU acceleration */
     bool  gpu_available;    /* true if GPU GEMM is available */

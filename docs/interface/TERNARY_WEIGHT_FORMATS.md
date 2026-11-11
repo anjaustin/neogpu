@@ -78,33 +78,46 @@ one — but the bytes are right.
 The ternary inference stack has two projection paths, selected by
 `m->use_i2s`:
 
-| `m->use_i2s` | weights come from | decoder | code mapping | layout of the bytes | layout the decoder assumes |
+| `m->use_i2s` | weights come from | decoder | code mapping | layout of the bytes | layout the decoder sees |
 |---|---|---|---|---|---|
-| true — the model has any I2_S tensor | `load_i2s_raw()`, raw upstream bytes | `hs_ml_ternary_f32_proj()` (the LUT) | canonical | upstream's (§2) | NeoGPU — **a mismatch unless the file is NeoGPU-layout** |
+| true — the model has any I2_S tensor | `load_i2s_raw()`, upstream's bytes, converted at load time (§1.4) | `hs_ml_ternary_f32_proj()` (the LUT) | canonical | upstream's (§2) | NeoGPU — matches after the conversion |
 | false — an F32 model, or a random one | `f32_to_ternary_packed()` or `alloc_ternary()` | `hs_ml_gemm_ternary_mt()` via `hs_ml_route_mt()` | routing | NeoGPU | NeoGPU — matches |
 
 `m->use_i2s` is set only when a projection tensor is actually stored as
 `GGML_TYPE_I2_S`, so a weight packed by `f32_to_ternary_packed()` can
 only ever reach the routing decoder.
 
-### 1.4 The I2_S path has no upstream-layout decoder
+### 1.4 The I2_S path converts the layout at load time
 
-`src/hs_ml_infer.c` contains `i2s_proj_neon()`, which implements the
-**upstream ARM layout** (64-weight blocks, `group_idx = j / 16`,
-`group_pos = j % 16`, field at `6 - 2 * group_idx`). It is unreachable.
-Its only call site is inside `ternary_proj()`'s `if (m->use_i2s)` branch,
-and every one of `ternary_proj()`'s seven call sites is itself inside
-the `else` branch of the same test.
+An I2_S tensor's bytes are in upstream's layout, but the projection
+kernels read NeoGPU's. The loader reconciles the two once, at load time,
+in `hs_ml_i2s_to_neogpu()` (`src/hs_ml_i2s_layout.c`): after the
+conversion the bytes are byte-identical to what this repository's own
+converter produces for the same weights, so the kernels and the GPU
+shaders need no special case.
 
-So for a model with I2_S tensors, the projections go through
-`f32_proj()` → `hs_ml_ternary_f32_proj()`, which decodes the **NeoGPU**
-layout. If the model's bytes are in one of the upstream layouts, every
-projection weight is wrong — see §2.3 for how wrong, and §4 for how to
-tell which layout the file actually holds.
+Before that conversion existed, an I2_S model's projections were read
+with NeoGPU's layout and every weight was noise — see §2.3 for how
+wrong, and §4 for how the layout is decided.
 
-`tests/stage_probe_real.c` carries its own private copy of the ARM-layout
-decoder, which is how the layout can be probed against the real model
-even though the production path cannot decode it.
+The conversion is checked against upstream BitNet's own code, not
+against a copy of it: `tools/extract_upstream_i2s.py` pulls upstream's
+`quantize_i2_s()` (the producer) and `ggml_vec_dot_i2_i8_s_1x1()` (the
+consumer) out of the vendored source at build time, and
+`tests/redteam_i2s_upstream.c` checks that our decode of the converted
+bytes equals upstream's own answer once the centring is undone
+(upstream accumulates the raw codes 0, 1, 2; ours decodes code − 1).
+Measured: upstream's raw dot product 191, ours 143, and
+191 − Σ(activations) = 143 exactly.
+
+`src/hs_ml_infer.c` also contains `i2s_proj_neon()`, an int8 ARM-layout
+decoder. It is unreachable: its only call site is inside
+`ternary_proj()`'s `if (m->use_i2s)` branch, and every one of
+`ternary_proj()`'s seven call sites is itself inside the `else` branch
+of the same test. It is left in place as a reference implementation of
+the upstream layout, but it must not be re-enabled without also
+removing the load-time conversion — after the conversion the weights are
+in NeoGPU's layout, not upstream's.
 
 ## 2. Bit layouts
 
@@ -226,16 +239,14 @@ coincidence is exactly two weights per 128-block.
 ### 2.4 What the loader actually does
 
 `load_i2s_raw()` in `src/hs_ml_loader_ternary.c` reads the raw tensor
-bytes with a single `fread` and returns them unmodified, with the
-comment "No re-packing needed". Those bytes are then handed to
-`hs_ml_ternary_f32_proj()`, which decodes them with the **NeoGPU** rule.
+bytes with a single `fread`. Those bytes are then converted to NeoGPU's
+layout by `hs_ml_i2s_to_neogpu()` (§1.4) and handed to
+`hs_ml_ternary_f32_proj()`, which decodes them with the **NeoGPU**
+rule.
 
 The code mapping is not the problem there — upstream's `quantize_i2_s`
-emits 0 = −1, 1 = 0, 2 = +1, the same as the LUT. The problem is the
-*layout*, and §1.4 explains why the upstream-layout decoder that exists
-in this repository is unreachable.
-
-That is the open question, and it is described in §4.
+emits 0 = −1, 1 = 0, 2 = +1, the same as the LUT. The problem was the
+*layout*, and the conversion fixes it.
 
 ---
 
@@ -359,79 +370,78 @@ replaces, while doing four planes of arithmetic per weight.
 
 ## 4. Which layout does a given model file use?
 
-`hs_mlt_load_gguf()` reads I2_S tensors as raw bytes and feeds them to
-the NeoGPU-layout decoder with no reordering — and, per §1.4, that is the
-*only* decoder they can reach. If a model's bytes are in one of the
-upstream layouts, every projection weight is wrong — and, per §2.3,
-wrong in a way that looks like noise rather than an obvious failure.
-
-The repository contains reference decoders for two of the layouts, and
-they disagree:
-
-- `tests/redteam_i2s_neon.c` and `tests/i2s_native_probe.c` decode the
-  **upstream ARM** layout (`group_idx = j / 16`, `group_pos = j % 16`,
-  field at `6 - 2 * group_idx`).
-- `tests/redteam_ternary_v3.c` decodes the **NeoGPU** layout
-  (`(byte >> (2*s)) & 3` for weight `4b + s`).
-
 ### 4.1 Two different producers, two different layouts
 
 **This repository's own converter** — `tools/convert_bitnet_to_gguf.py` —
 writes GGML type 36 tensors in the **NeoGPU** layout with the canonical
 code mapping. Its header says so, and its packing code
-(`codes[:, b::4] << (b * 2)`, mapping −1→0, 0→1, +1→2) matches. Its
-output is named `models/bitnet-2b4t-i2s.gguf` by default. A file
-produced this way is read correctly by the current loader.
+(`codes[:, b::4] << (b * 2)`, mapping −1→0, 0→1, +1→2) matches. It
+also writes a separate `<name>_scale` F32 tensor holding the per-tensor
+scale. Its output is named `models/bitnet-2b4t-i2s.gguf` by default.
 
 **Upstream BitNet's tooling** produces I2_S GGUFs through the C++
 quantizer — `experimental/BitNet/utils/convert-helper-bitnet.py` and
-`experimental/BitNet/utils/quantize_embeddings.py` both
-invoke the `llama-quantize` binary with the type argument `"I2_S"`. That
-quantizer is `quantize_i2_s` in
+`experimental/BitNet/utils/quantize_embeddings.py` both invoke the
+`llama-quantize` binary with the type argument `"I2_S"`. That quantizer
+is `quantize_i2_s` in
 `experimental/BitNet/src/ggml-bitnet-mad.cpp`, whose layout is one of
 the three in §2.1 and §2.2 depending on how it was built.
-(`experimental/BitNet/utils/convert-hf-to-gguf-bitnet.py` is not one
-of these: its `ftype_map`
-offers only f32, f16, tl1 and tl2.)
+(`experimental/BitNet/utils/convert-hf-to-gguf-bitnet.py` is not one of
+these: its `ftype_map` offers only f32, f16, tl1 and tl2.)
+
+Upstream's layout also carries its per-tensor scale differently: the
+scale is stored in the 32 bytes that follow the packed data, not in a
+separate tensor. That is visible in upstream's ggml fork, where the
+tensor's byte size is `nrows * n_per_row / 4 + 32` and `quantize_i2_s`
+writes the scale at offset `n / 4`.
 
 Upstream's own inference script defaults to a model file named
 `models/bitnet_b1_58-3B/ggml-model-i2_s.gguf`, and its embedding
 quantizer writes `ggml-model-i2_s-embed-*.gguf`. **`ggml-model-i2_s.gguf`
-is upstream's naming convention, not this repository's.**
+is upstream's naming convention, not this repository's.** The model the
+Pi-side tests use is named exactly that.
 
-The model the Pi-side tests use is
-`/home/ztflynn/001/neogpu/models/ggml-model-i2_s.gguf` — upstream's
-name. So it is unlikely to have come from this repository's converter,
-and is likely to be in one of upstream's layouts rather than NeoGPU's.
+### 4.2 How the loader decides
 
-### 4.2 Settling it
+The two producers differ in a way that is visible in the file itself,
+so the loader does not have to guess:
 
-Given the file, the layouts are separable by inspection, because they
-place weights into bytes differently:
+| the model has | the producer was | the layout is |
+|---|---|---|
+| a separate `<name>_scale` tensor | this repository's converter | NeoGPU — read as-is |
+| no separate scale tensor | upstream's quantizer | upstream ARM — converted on load |
 
-- In the NeoGPU layout the four codes of a byte are four **consecutive**
-  weights, and the byte stream advances by 4 weights per byte.
-- In the upstream ARM and x86 layouts the four codes of a byte are
-  **strided** (16 or 32 apart), and the codes of one weight are spread
-  across 4 or 8 different bytes.
-- In the 1x4 layout the codes of a byte belong to four **different
-  rows**.
+`hs_ml_i2s_detect_layout()` in `src/hs_ml_i2s_layout.c` makes that
+call, and `hs_ml_i2s_to_neogpu()` does the conversion. After it, the
+bytes are byte-identical to what this repository's converter produces for
+the same weights, which `tests/redteam_i2s_repack.c` checks.
 
-The failure signatures differ, which helps narrow it down. If the file
-were in the upstream ARM or 1x4 layout, every weight would decode to
-noise. If it were in the upstream x86 layout, one weight in 64 would be
-exactly right and the rest would be noise — a subtly wrong model rather
-than an obviously broken one.
+For an upstream file, the scale is read from the tail of the tensor data
+(`hs_ml_i2s_upstream_scale_offset()`) and applied by `f32_proj()` like
+any other per-tensor scale.
 
-The decisive test is behavioural rather than statistical: run the real
-model under each decode and keep the one that produces coherent text.
-`tests/stage_probe_real.c` carries a private copy of the ARM-layout
-decoder for exactly this purpose, `tests/i2s_native_probe.c` implements
-the same layout, and `tests/redteam_i2s_neon.c` cross-checks the NEON
-and scalar decoders against each other.
+### 4.3 What is still not covered
 
-What is not yet known is which layout that particular file carries.
-That needs the file itself.
+- **Upstream's x86 and 1x4 layouts are not handled.** The loader assumes
+  the ARM layout for an upstream file. A file produced by upstream's
+  x86 build would be misread. Detecting that would need the file, and
+  the loader logs which layout it chose so a wrong choice is visible.
+- **A model mixing I2_S and F32 tensors.** `m->use_i2s` is set if *any*
+  projection tensor in the model is I2_S, and it then selects the path
+  for *all* of them. An F32-packed projection in such a model would be
+  read by the LUT, which uses a different code mapping from the one it
+  was packed with.
+
+### 4.4 Confirming it on the real model
+
+The conversion removes the need to resolve the layout by inspection, but
+confirming it against the real file is still worth doing. The
+repository carries the reference decoders for the upstream ARM layout:
+`tests/stage_probe_real.c` has a private copy of the ARM-layout decoder,
+`tests/i2s_native_probe.c` implements the same layout, and
+`tests/redteam_i2s_neon.c` cross-checks the NEON and scalar decoders
+against each other. Running the real model under each decode and
+keeping the one that produces coherent text settles it outright.
 
 ---
 
@@ -445,8 +455,11 @@ That needs the file itself.
 | Two-stage lm_head driver, plane weights, divergent random generator | `src/hs_ml_infer.c` (`session_logits_trit`, `lmh_plane_w`, `alloc_ternary`) |
 | Plane buffers, `LMH_CANDIDATES`, `use_trit_lmhead` | `include/hs_ml_infer.h` |
 | This repository's GGUF converter (NeoGPU layout) | `tools/convert_bitnet_to_gguf.py` |
+| I2_S layout conversion, layout decision, scale offset | `src/hs_ml_i2s_layout.c`, `include/hs_ml_i2s_layout.h` |
 | Upstream I2_S quantiser (all three layouts) | `experimental/BitNet/src/ggml-bitnet-mad.cpp` |
 | Upstream I2_S producers | `experimental/BitNet/utils/convert-helper-bitnet.py`, `experimental/BitNet/utils/quantize_embeddings.py` |
 | Upstream-layout reference decoders | `tests/redteam_i2s_neon.c`, `tests/i2s_native_probe.c` |
 | NeoGPU-layout reference decoder | `tests/redteam_ternary_v3.c` |
 | Real-model lm_head checks (top-42 recall, top-1 match) | `tests/redteam_lmhead_trit.c` |
+| I2_S conversion, byte-for-byte against both producers | `tests/redteam_i2s_repack.c` |
+| I2_S conversion, against upstream's own producer and consumer | `tests/redteam_i2s_upstream.c`, `tools/extract_upstream_i2s.py` |
