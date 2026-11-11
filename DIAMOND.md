@@ -87,6 +87,14 @@ The project is called "NeoGPU Game Engine" but is actually a *message-passing su
 ### 4. The "PicoGPU Inspired" Framing
 References to PicoGPU (a Haxe/HashLink project) feel vestigial. The architectures have diverged enough that the inspiration claim is more confusing than clarifying for new readers.
 
+> **Reconsidered (2026-11-11):** This call is reversed. The credit stays and is
+> strengthened (see [CREDITS.md](CREDITS.md) and the README's "Lineage &
+> Acknowledgments"). Acknowledgment tracks *debt*, not *similarity* — NeoGPU
+> owes PicoGPU for the spark even as the architectures diverge, and that
+> divergence is the inspiration succeeding, not grounds to drop it. The
+> "confusing to new readers" concern is resolved by *specificity* (naming
+> exactly what was and wasn't inherited), not by deletion.
+
 ---
 
 ## Summary
@@ -607,6 +615,10 @@ More speculative but distinctive:
 ### 3. The "PicoGPU Inspired" Framing
 
 References to PicoGPU (a Haxe/HashLink project) feel vestigial. The architectures have **diverged enough** that the inspiration claim is more confusing than clarifying for new readers.
+
+> **Reconsidered (2026-11-11):** Reversed — see the note on the same item above
+> and [CREDITS.md](CREDITS.md). The credit stays; divergence is the inspiration
+> succeeding, and specificity (not deletion) resolves the clarity concern.
 
 ### 4. Incomplete Subsystems (Minor)
 

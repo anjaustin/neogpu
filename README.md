@@ -454,6 +454,26 @@ Test results on Raspberry Pi 4:
 - GCC with NEON support
 - Linux (tested)
 
-## Original
+## Lineage & Acknowledgments
 
-This is a standalone C implementation inspired by [PicoGPU](https://github.com/ncannasse/picogpu) by Nicolas Cannasse.
+NeoGPU began as, and remains, a tribute to [**PicoGPU**](https://github.com/ncannasse/picogpu)
+by **Nicolas Cannasse** (creator of Haxe). PicoGPU is a ~300 KB software GPU
+written in Haxe that compiles to WebGL/HashLink — and it proved the idea at the
+heart of this project: that a complete, tiny GPU runtime can be built in
+software and still be genuinely useful.
+
+NeoGPU takes that spark somewhere new — a header-oriented **C** implementation
+targeting the **Raspberry Pi 4's V3D** on bare-metal DRM/GBM, with a
+message-native core and experimental BitNet inference. The architectures have
+diverged a great deal; that divergence is a measure of how far a good idea
+travels, not a reason to forget where it started.
+
+The debt is specific. PicoGPU showed the way on: a compact, self-contained GPU
+runtime; the feature surface NeoGPU still mirrors (vertex/fragment buffers,
+blending, culling, depth/stencil, color mask, render targets, instancing,
+matrix/vector/quaternion math, textured UV mapping); and the 4-channel, 48 kHz
+audio model. Where NeoGPU goes its own way — native ARM/NEON, Pi4 V3D, a
+message-passing substrate, ML in the same runtime — it does so standing on that
+foundation.
+
+Thank you, Nicolas. See [CREDITS.md](CREDITS.md) for the full lineage.
