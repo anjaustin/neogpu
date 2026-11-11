@@ -37,60 +37,144 @@ static const char* fragment_shader_src = R"(
     uniform float u_time;
     uniform vec2 u_resolution;
 
-    #define NUM_SPHERES 5
+    #define NUM_ORBIT 5
     #define PI 3.14159265
 
-    float intersect_sphere(vec3 ro, vec3 rd, vec3 center, float radius) {
-        vec3 oc = ro - center;
+    // Feature toggles (bisect compile/perf by flipping these).
+    #define ENABLE_SHADOWS    1
+    #define ENABLE_REFLECT    1
+
+    #define ORBIT_R 1.7
+    #define SPH_R   0.5
+    #define CORE_R  0.85
+    #define GROUND_Y -0.95
+    #define SPEED   0.6
+
+    // Centre of orbit sphere i (i = 0..NUM_ORBIT-1); i = NUM_ORBIT -> core.
+    vec3 sphere_center(int i, float t) {
+        if (i >= NUM_ORBIT) return vec3(0.0, 0.0, 0.0);       // central anchor
+        float a = (2.0 * PI * float(i)) / float(NUM_ORBIT) + t * SPEED;
+        return vec3(cos(a) * ORBIT_R, 0.0, sin(a) * ORBIT_R);
+    }
+    float sphere_radius(int i) { return (i >= NUM_ORBIT) ? CORE_R : SPH_R; }
+
+    vec3 sphere_albedo(int i) {
+        if (i >= NUM_ORBIT) return vec3(0.85, 0.85, 0.9);     // pale core
+        float fi = float(i) / float(NUM_ORBIT);
+        return 0.5 + 0.5 * cos(2.0 * PI * (fi + vec3(0.0, 0.33, 0.67)));
+    }
+
+    float hit_sphere(vec3 ro, vec3 rd, vec3 c, float r) {
+        vec3 oc = ro - c;
         float b = dot(oc, rd);
-        float c = dot(oc, oc) - radius * radius;
-        float h = b * b - c;
+        float cc = dot(oc, oc) - r * r;
+        float h = b * b - cc;
         if (h < 0.0) return -1.0;
-        return -b - sqrt(h);
+        float t = -b - sqrt(h);
+        return t;
+    }
+
+    float hit_ground(vec3 ro, vec3 rd) {
+        if (abs(rd.y) < 1e-4) return -1.0;
+        float t = (GROUND_Y - ro.y) / rd.y;
+        return (t > 0.0) ? t : -1.0;
+    }
+
+    // Trace scene. Returns nearest t (or -1). Outputs hit id: 0..5 sphere,
+    // 100 = ground, -1 = miss.
+    float trace(vec3 ro, vec3 rd, float tm, out int id, float t) {
+        float best = tm;
+        int bid = -1;
+        for (int i = 0; i <= NUM_ORBIT; i++) {
+            float ts = hit_sphere(ro, rd, sphere_center(i, t), sphere_radius(i));
+            if (ts > 0.001 && ts < best) { best = ts; bid = i; }
+        }
+        float tg = hit_ground(ro, rd);
+        if (tg > 0.001 && tg < best) { best = tg; bid = 100; }
+        id = bid;
+        return (bid < 0) ? -1.0 : best;
+    }
+
+    float in_shadow(vec3 p, vec3 ldir, float t) {
+        for (int i = 0; i <= NUM_ORBIT; i++) {
+            float ts = hit_sphere(p + ldir * 0.01, ldir, sphere_center(i, t), sphere_radius(i));
+            if (ts > 0.001) return 1.0;
+        }
+        return 0.0;
+    }
+
+    vec3 sky(vec3 rd, vec2 uv_y) {
+        return mix(vec3(0.55, 0.22, 0.35), vec3(0.08, 0.10, 0.28), uv_y.y);
+    }
+
+    vec3 shade(vec3 p, vec3 n, vec3 rd, vec3 albedo, vec3 light, float t) {
+        float amb = 0.22;
+        float diff = max(dot(n, light), 0.0);
+        float sh = 0.0;
+        #if ENABLE_SHADOWS
+        sh = in_shadow(p, light, t);
+        #endif
+        diff *= (1.0 - 0.75 * sh);
+        vec3 h = normalize(light - rd);
+        float spec = pow(max(dot(n, h), 0.0), 32.0) * (1.0 - sh);
+        float rim = pow(1.0 - max(dot(n, -rd), 0.0), 2.0) * 0.25;
+        return albedo * (amb + diff * 0.85) + vec3(spec) * 0.7 + vec3(rim);
     }
 
     void main() {
+        float t = u_time;
         float aspect = u_resolution.x / u_resolution.y;
         vec2 uv = (v_uv * 2.0 - 1.0) * vec2(aspect, 1.0);
 
-        // Vertical gradient background (top -> bottom).
-        vec3 top_col = vec3(0.08, 0.10, 0.28);
-        vec3 bot_col = vec3(0.55, 0.22, 0.35);
-        vec3 bg = mix(bot_col, top_col, v_uv.y);
+        vec3 ro = vec3(0.0, 1.1, 4.3);
+        vec3 rd = normalize(vec3(uv, -1.7));
+        vec3 light = normalize(vec3(0.5, 1.0, 0.4));
 
-        // Camera: look slightly down at the orbit plane from +Z.
-        vec3 ro = vec3(0.0, 0.8, 4.2);
-        vec3 rd = normalize(vec3(uv, -1.6));
+        vec3 color;
+        int id;
+        float tt = trace(ro, rd, 1e9, id, t);
 
-        float orbit_r = 1.6;
-        float sph_r   = 0.55;
-        float speed   = 0.6;
-
-        vec3 light = normalize(vec3(0.4, 0.9, 0.6));
-
-        float best_t = 1e9;
-        vec3 color = bg;
-
-        for (int i = 0; i < NUM_SPHERES; i++) {
-            float a = (2.0 * PI * float(i)) / float(NUM_SPHERES) + u_time * speed;
-            vec3 center = vec3(cos(a) * orbit_r, 0.0, sin(a) * orbit_r);
-
-            // Per-sphere hue from its index.
-            float fi = float(i) / float(NUM_SPHERES);
-            vec3 base = 0.5 + 0.5 * cos(2.0 * PI * (fi + vec3(0.0, 0.33, 0.67)));
-
-            float ts = intersect_sphere(ro, rd, center, sph_r);
-            if (ts > 0.0 && ts < best_t) {
-                best_t = ts;
-                vec3 p = ro + rd * ts;
-                vec3 n = normalize(p - center);
-                float diff = max(dot(n, light), 0.0);
-                float amb = 0.25;
-                // simple specular highlight
-                vec3 h = normalize(light - rd);
-                float spec = pow(max(dot(n, h), 0.0), 24.0);
-                color = base * (amb + diff * 0.8) + vec3(spec) * 0.6;
+        if (id < 0) {
+            color = sky(rd, v_uv);
+        } else {
+            vec3 p = ro + rd * tt;
+            vec3 n; vec3 albedo; float reflk;
+            if (id == 100) {
+                n = vec3(0.0, 1.0, 0.0);
+                float chk = mod(floor(p.x) + floor(p.z), 2.0);
+                albedo = mix(vec3(0.20), vec3(0.35), chk);
+                reflk = 0.25;
+            } else {
+                n = normalize(p - sphere_center(id, t));
+                albedo = sphere_albedo(id);
+                reflk = 0.35;
             }
+            color = shade(p, n, rd, albedo, light, t);
+
+            #if ENABLE_REFLECT
+            // one reflection bounce
+            vec3 rrd = reflect(rd, n);
+            vec3 rro = p + n * 0.02;
+            int rid;
+            float rt = trace(rro, rrd, 1e9, rid, t);
+            vec3 rcol;
+            if (rid < 0) {
+                rcol = sky(rrd, v_uv);
+            } else {
+                vec3 rp = rro + rrd * rt;
+                vec3 rn; vec3 ralb;
+                if (rid == 100) {
+                    rn = vec3(0.0, 1.0, 0.0);
+                    float c2 = mod(floor(rp.x) + floor(rp.z), 2.0);
+                    ralb = mix(vec3(0.20), vec3(0.35), c2);
+                } else {
+                    rn = normalize(rp - sphere_center(rid, t));
+                    ralb = sphere_albedo(rid);
+                }
+                rcol = shade(rp, rn, rrd, ralb, light, t);
+            }
+            color = mix(color, rcol, reflk);
+            #endif
         }
 
         gl_FragColor = vec4(color, 1.0);
