@@ -92,7 +92,7 @@ Key techniques:
 3. 4-column blocking (amortizes setup)
 4. Multi-threading (N-dimension parallel)
 
-See docs/TERNARY_KERNEL_NOTES.md for full details.
+See docs/research/TERNARY_KERNEL_NOTES.md for full details.
 
 ## Testing
 

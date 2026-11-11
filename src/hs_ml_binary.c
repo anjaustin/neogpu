@@ -11,7 +11,7 @@
  *           
  * This achieves ~30 GOPS on Pi4, limited by memory bandwidth.
  * 
- * See: docs/theory/GEOMETRIC_INFERENCE.md
+ * See: docs/research/GEOMETRIC_INFERENCE.md
  * See: include/hs_ml_routing.h
  */
 

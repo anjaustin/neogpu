@@ -223,7 +223,7 @@ void hs_window_poll(HSWindow* win);
 ## 5. Milestones
 
 ### Milestone 0: Core Hardening
-- [ ] Add `docs/MESSAGE_ABI.md` (per-op schema + ranges)
+- [ ] Add `docs/interface/MESSAGE_ABI.md` (per-op schema + ranges)
 - [ ] Add opcode pack/unpack helpers (single source of truth)
 - [ ] Add debug-time message validator (send/receive)
 - [ ] Implement self-contained capture (deep-copy payload bytes)
@@ -233,10 +233,10 @@ void hs_window_poll(HSWindow* win);
 - [ ] Add tests: pack/unpack round-trip + replay determinism + validator rejection
 
 Related PRDs:
-- `docs/PRD_COMM_FABRIC.md` (acks/results, structured errors, capture I/O, async completions, backpressure, introspection)
+- `docs/architecture/PRD_COMM_FABRIC.md` (acks/results, structured errors, capture I/O, async completions, backpressure, introspection)
 
 P0:
-- `docs/P0_PRD.md` (thread safety/atomics plan for the messaging layer)
+- `docs/architecture/P0_PRD.md` (thread safety/atomics plan for the messaging layer)
 
 Execution Path:
 - `include/hs_backend.h` defines the backend interface; the next major evolution is connecting the message-driven state + render commands to an execution backend (GLES).

@@ -11,7 +11,7 @@ Make the messaging layer safe and predictable when used from multiple threads, o
 
 ## P0 Extension: Channelized Fabric
 
-See `docs/CHANNEL_FABRIC.md`.
+See `docs/architecture/CHANNEL_FABRIC.md`.
 
 ## P0 Extension: Frame + QoS
 

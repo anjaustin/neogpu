@@ -14,7 +14,7 @@
  * 
  * This is gather-accumulate, not multiply-accumulate.
  * 
- * See: docs/theory/GEOMETRIC_INFERENCE.md
+ * See: docs/research/GEOMETRIC_INFERENCE.md
  */
 
 #ifndef HS_ML_ROUTING_H

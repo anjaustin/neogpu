@@ -2,7 +2,7 @@
  * NeoGPU - Message Packing Helpers
  *
  * Single-source helpers for packing opcode payloads.
- * These helpers match the current message ABI documented in docs/MESSAGE_ABI.md.
+ * These helpers match the current message ABI documented in docs/interface/MESSAGE_ABI.md.
  */
 
 #ifndef HS_MSG_H

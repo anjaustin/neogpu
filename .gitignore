@@ -44,7 +44,7 @@ neogpu_procgame
 xfiles/
 renderer_neogpu.so
 *.so
-journal/
+/journal/
 *.ppm
 *.pbm
 *.cap

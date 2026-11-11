@@ -23,7 +23,7 @@
  *     byte[1] = high 4 bits of code_0 | low 4 bits of code_1
  *     byte[2] = high 8 bits of code_1
  *
- * See: docs/theory/GEOMETRIC_INFERENCE.md
+ * See: docs/research/GEOMETRIC_INFERENCE.md
  */
 
 #include <stdint.h>
