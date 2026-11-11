@@ -862,6 +862,32 @@ static void test_step_work(void) {
     }
 }
 
+/* The producer caches the consumer's head and re-reads it only when its lane
+ * looks full: a drained lane is reused without spilling to the submit ring,
+ * and an undrained one still never overwrites unconsumed slots. */
+static void test_spsc_head_cache(void) {
+    fresh_gpu();
+    u32 spilled = atomic_load(&gpu.system.mpsc_ok[CHAN_RENDER]);
+    for (u32 round = 0; round < 4; round++) {
+        for (u32 i = 0; i < HS_SPSC_SIZE; i++) hs_gpu_set_shader(&gpu, (u8)(round * 16 + (i & 15)));
+        CHECK(atomic_load(&gpu.system.mpsc_ok[CHAN_RENDER]) == spilled);
+        hs_gpu_process(&gpu);
+        CHECK(gpu.shader_state.current_shader == round * 16 + 15);
+    }
+    for (u32 i = 0; i < HS_SPSC_SIZE + 1; i++) hs_gpu_set_shader(&gpu, (u8)(i == HS_SPSC_SIZE ? 99 : 1));
+    CHECK(atomic_load(&gpu.system.mpsc_ok[CHAN_RENDER]) == spilled + 1);
+    hs_gpu_process(&gpu);
+    CHECK(gpu.shader_state.current_shader == 99); /* lanes drain before the submit ring */
+    /* After hs_clear the lane starts empty again. */
+    for (u32 i = 0; i < 10; i++) hs_gpu_set_shader(&gpu, 2);
+    hs_clear(&gpu.system);
+    spilled = atomic_load(&gpu.system.mpsc_ok[CHAN_RENDER]);
+    for (u32 i = 0; i < HS_SPSC_SIZE; i++) hs_gpu_set_shader(&gpu, 3);
+    CHECK(atomic_load(&gpu.system.mpsc_ok[CHAN_RENDER]) == spilled);
+    hs_gpu_process(&gpu);
+    CHECK(gpu.shader_state.current_shader == 3);
+}
+
 static void test_invalid_messages_nacked(void) {
     fresh_gpu();
     SystemState* st = &gpu.system_state_data;
@@ -1129,6 +1155,7 @@ int main(void) {
     test_conforms_matches_validate();
     test_gate_at_routing();
     test_step_work();
+    test_spsc_head_cache();
     test_invalid_messages_nacked();
     test_storage_names_and_files();
     test_font_glyph_codes();

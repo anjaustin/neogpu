@@ -378,8 +378,11 @@ static bool hs_spsc_push(HSSpscQueue* q, const Message* msg, const void* payload
     if (len > HS_PAYLOAD_SIZE) len = HS_PAYLOAD_SIZE;
 
     u32 tail = atomic_load_explicit(&q->tail.v, memory_order_relaxed);
-    u32 head = atomic_load_explicit(&q->head.v, memory_order_acquire);
-    if ((tail - head) >= HS_SPSC_SIZE) return false;
+    if ((tail - q->tail.head_cache) >= HS_SPSC_SIZE) {
+        /* Acquire: slots the consumer released are free to overwrite. */
+        q->tail.head_cache = atomic_load_explicit(&q->head.v, memory_order_acquire);
+        if ((tail - q->tail.head_cache) >= HS_SPSC_SIZE) return false;
+    }
 
     HSSpscSlot* s = &q->slots[hs_ring_index(tail, HS_SPSC_SIZE)];
     s->msg = *msg;
@@ -1108,6 +1111,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
         for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
             atomic_init(&sys->producers[c][i].head.v, 0);
             atomic_init(&sys->producers[c][i].tail.v, 0);
+            sys->producers[c][i].tail.head_cache = 0;
             for (u32 j = 0; j < HS_SPSC_SIZE; j++) {
                 memset(&sys->producers[c][i].slots[j].msg, 0, sizeof(Message));
                 sys->producers[c][i].slots[j].payload_len = 0;
@@ -1538,6 +1542,7 @@ void hs_clear(HSSystem* sys) {
         for (u32 i = 0; i < HS_MAX_PRODUCERS; i++) {
             atomic_store_explicit(&sys->producers[c][i].head.v, 0, memory_order_relaxed);
             atomic_store_explicit(&sys->producers[c][i].tail.v, 0, memory_order_relaxed);
+            sys->producers[c][i].tail.head_cache = 0;
             atomic_store_explicit(&sys->spsc_full_by_prod[c][i], 0, memory_order_relaxed);
             atomic_store_explicit(&sys->spsc_ok_by_prod[c][i], 0, memory_order_relaxed);
         }

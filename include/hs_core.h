@@ -155,9 +155,19 @@ _Static_assert(offsetof(HSSpscSlot, trusted) < 64 && offsetof(HSSubmitSlot, trus
                "the trusted flag shares the message's cache line");
 _Static_assert(sizeof(HSSpscSlot) == 128 && sizeof(HSSubmitSlot) == 128, "slot size unchanged");
 
+/* The producer's line: tail plus the last head it observed. The producer
+ * re-reads the consumer's head only when the ring looks full, so a step
+ * thread publishing head does not cost the producer a miss on every send. */
+typedef struct {
+    atomic_uint v;
+    u32 head_cache; /* producer-owned */
+    u8 pad[64 - sizeof(atomic_uint) - sizeof(u32)];
+} __attribute__((aligned(64))) HSSpscTailLine;
+_Static_assert(sizeof(HSSpscTailLine) == 64, "HSSpscTailLine is one cache line");
+
 typedef struct {
     HSAtomicCacheLine head;
-    HSAtomicCacheLine tail;
+    HSSpscTailLine tail;
     HSSpscSlot slots[HS_SPSC_SIZE];
 } HSSpscQueue;
 
