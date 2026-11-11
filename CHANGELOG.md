@@ -34,10 +34,10 @@ than left as a phantom release.
     `architecture/`, `interface/`, `research/`, `benchmarks/`, `lineage/`,
     `audit/`, and `archive/`, with a `docs/README.md` index.
 - **Performance claim corrected**: the message layer is documented at
-  **12,000,000 msg/s** (measured range 8.2M-16.9M msg/s across 1-16
-  producers). The previous "1,000,000+ fps" figure predated the
-  lock-free optimization work and understated the result by more than an
-  order of magnitude. Reproduce with `make && ./neogpu_demo`.
+  **12,780,000 msg/s** at two producers, within a measured range of
+  6.36M-12.78M msg/s across 1-16 producers. The previous "1,000,000+ fps"
+  figure predated the lock-free optimization work and understated the result
+  by more than an order of magnitude. Reproduce with `make && ./neogpu_demo`.
 - **Lineage credit strengthened**: the PicoGPU acknowledgment is now specific
   about what was inherited and where NeoGPU diverges, rather than a generic
   attribution. `docs/audit/DIAMOND.md` carries a dated note reversing its

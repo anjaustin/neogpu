@@ -77,11 +77,21 @@ Measured on a Raspberry Pi 4 (Cortex-A72, 800x480 DSI display).
 
 | Metric | Value | Source |
 |--------|-------|--------|
-| **Message layer throughput** | **12,000,000 msg/s** | Producer benchmark, `./neogpu_demo` |
-| Message layer (measured range) | 8.2M – 16.9M msg/s | 1–16 producer threads |
+| **Message layer throughput** | **12,780,000 msg/s** | 2 producers, producer benchmark via `./neogpu_demo` |
+| Message layer (1–16 producers) | 6.36M – 12.78M msg/s | Current accepted configuration |
 | GPU frames | ~414K fps | Message-path frame rate |
 | NEON math | ~14B ops/sec | Scalar vs NEON mat4/vec4 |
 | IPC throughput | ~4,700 req/sec | Round-trip latency test |
+
+Throughput by producer count, as measured on the current configuration:
+
+| Producers | 1 | 2 | 4 | 8 | 16 |
+|-----------|---|---|---|---|----|
+| msg/s | 10.67M | **12.78M** | 7.91M | 6.91M | 6.36M |
+
+Throughput peaks at two producers and then falls off as producers contend for
+the same cache lines — which is precisely the bottleneck the optimization work
+targeted.
 
 **Reproduce the message-layer number:**
 
@@ -92,7 +102,8 @@ make && ./neogpu_demo
 The `Comms Producer Benchmark` section prints throughput per producer count:
 
 ```
-  1 thr,  500 ms: 12000000 msg/s (ok=60000000 fail=0 spsc_ok=60000000 ...)
+  1 thr,  500 ms: 10670000 msg/s (ok=5335000 fail=0 spsc_ok=5335000 ...)
+  2 thr,  500 ms: 12780000 msg/s (ok=6390000 fail=0 spsc_ok=6390000 ...)
 ```
 
 That figure is the headline because it is the one that is *hard*. Rendering
