@@ -18,6 +18,24 @@
 #include "hs_graphics.h"
 #include "hs_text.h"
 
+/* Debug: dump one rendered frame to a PPM so the exact pixels can be inspected
+ * off-device. Writes bottom-up flip (GL origin is bottom-left). */
+static void hs_debug_screenshot(HSGraphics* gfx, const char* path) {
+    int w = gfx->screen_width, h = gfx->screen_height;
+    unsigned char* px = (unsigned char*)malloc((size_t)w * h * 3);
+    if (!px) return;
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        for (int y = h - 1; y >= 0; y--) fwrite(px + (size_t)y * w * 3, 1, (size_t)w * 3, f);
+        fclose(f);
+        fprintf(stderr, "screenshot written: %s (%dx%d)\n", path, w, h);
+    }
+    free(px);
+}
+
 static HSFont g_font;
 static bool g_font_loaded = false;
 
@@ -205,6 +223,10 @@ int main(int argc, char** argv) {
             hs_font_render_text(&g_font, fps_buf, -0.95f, 0.85f, 0.006f, 1.0f, 1.0f, 0.0f, 1.0f);
             glDisable(GL_BLEND);
         }
+        
+        /* Debug: capture frame 60 (spheres + HUD) before present, for off-device
+         * inspection. Remove once the HUD layout is confirmed. */
+        if (frame == 60) hs_debug_screenshot(&gfx, "neogpu_frame.ppm");
         
         hs_graphics_present(&gfx);
         
