@@ -160,16 +160,25 @@ int main(int argc, char** argv) {
         draw(n_loc, t_loc, 1, 0);
         raw_swaps = raw_swaps && eglSwapBuffers(gfx.egl_display, gfx.egl_surface) == EGL_TRUE;
     }
+    /* Cheap frames (far below a quarter refresh) finish in time: they are
+     * dropped while a flip is in flight, never held. */
+    bool cheap_unheld = true;
+    for (int i = 0; i < 200; i++) {
+        draw(n_loc, t_loc, 1, 0);
+        hs_graphics_present(&gfx);
+        if (i >= 32) cheap_unheld = cheap_unheld && !gfx.held_bo;
+    }
     bool active = gfx.crtc_active;
     hs_graphics_finish(&gfx);
     double fps = frames * 1000.0 / elapsed;
-    bool ok = active && gfx.present_errors == 0 && presented + dropped == (u64)(frames + extra) && held && raw_swaps && counted &&
+    bool ok = active && gfx.present_errors == 0 && presented + dropped == (u64)(frames + extra) && held && raw_swaps && counted && cheap_unheld &&
               flush_shows && fps > 1.5 * 1000.0 / refresh_ms && seq0 && refreshes > 0 && repeated * 100 <= refreshes;
     printf("{\"frames\":%d,\"iterations\":%d,\"gpu_frame_ms\":%.2f,\"refresh_ms\":%.2f,\"fps\":%.1f,"
-           "\"presented\":%llu,\"dropped\":%llu,\"refreshes\":%u,\"repeated\":%llu,\"errors\":%u,\"held\":%s,\"raw_swaps\":%s,\"counted\":%s,\"flush_owed\":%llu,\"flush_shows\":%s,\"passed\":%s}\n",
+           "\"presented\":%llu,\"dropped\":%llu,\"refreshes\":%u,\"repeated\":%llu,\"errors\":%u,\"held\":%s,\"raw_swaps\":%s,\"counted\":%s,\"cheap_unheld\":%s,\"flush_owed\":%llu,\"flush_shows\":%s,\"passed\":%s}\n",
            frames, n, frame_ms, refresh_ms, fps, (unsigned long long)presented, (unsigned long long)dropped,
            refreshes, (unsigned long long)repeated, gfx.present_errors, held ? "true" : "false",
-           raw_swaps ? "true" : "false", counted ? "true" : "false", (unsigned long long)owed,
+           raw_swaps ? "true" : "false", counted ? "true" : "false",
+           cheap_unheld ? "true" : "false", (unsigned long long)owed,
            flush_shows ? "true" : "false", ok ? "true" : "false");
     return ok ? 0 : 1;
 }

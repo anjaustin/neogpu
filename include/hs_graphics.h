@@ -75,6 +75,11 @@ typedef struct {
      * are locked; call hs_graphics_flush_present() before swapping the
      * surface yourself. */
     struct gbm_bo* held_bo;
+    /* Smoothed time between vsync-off presents. Frames are held only when it
+     * is at least a quarter refresh: cheaper frames finish in time anyway, and
+     * a third locked buffer costs pipelining at very high frame rates. */
+    u64            last_present_ns;
+    u64            present_interval_ns;
     /* EGL_KHR_fence_sync; NULL when unsupported (frames then count as unfinished). */
     PFNEGLCREATESYNCKHRPROC     egl_create_sync;
     PFNEGLDESTROYSYNCKHRPROC    egl_destroy_sync;
@@ -697,9 +702,10 @@ static inline void hs_graphics_clear(HSGraphics* gfx, float r, float g, float b,
  *               (or, if none has, the older candidate): flipping a frame still
  *               rendering behind frames that will be dropped would miss the
  *               next refresh and repeat the old image. While a flip is in
- *               flight the newest frame is held and flipped at the next
- *               present that finds the slot free; a held frame replaced by a
- *               newer one is not shown (frames_dropped). A held frame keeps a
+ *               flight the newest frame is held (when frames take at least a
+ *               quarter refresh; faster ones finish in time and are dropped)
+ *               and flipped at the next present that finds the slot free; a
+ *               frame replaced by a newer one is not shown (frames_dropped). A held frame keeps a
  *               third buffer locked: call hs_graphics_flush_present() before
  *               calling eglSwapBuffers on this surface yourself.
  *   vsync on  - the call returns after the flip completes (one frame per
@@ -742,10 +748,24 @@ static inline void hs_graphics_present(HSGraphics* gfx) {
         return;
     }
 
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    u64 now = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+    if (gfx->last_present_ns) {
+        u64 dt = now - gfx->last_present_ns;
+        gfx->present_interval_ns = gfx->present_interval_ns ? (gfx->present_interval_ns * 7 + dt) / 8 : dt;
+    }
+    gfx->last_present_ns = now;
     if (gfx->flip_pending) {
-        /* Hold the newest frame for the next free flip slot. */
+        u64 refresh_ns = 1000000000ull / (gfx->display_mode.vrefresh ? gfx->display_mode.vrefresh : 60);
         hs_graphics_drop_held(gfx);
-        gfx->held_bo = bo;
+        if (gfx->present_interval_ns * 4 >= refresh_ns) {
+            /* Hold the newest frame for the next free flip slot. */
+            gfx->held_bo = bo;
+        } else {
+            gbm_surface_release_buffer(gfx->gbm_surface, bo);
+            gfx->frames_dropped++;
+        }
         return;
     }
     if (gfx->held_bo) {
