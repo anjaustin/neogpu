@@ -756,6 +756,112 @@ static void test_gate_at_routing(void) {
 #endif
 }
 
+/* hs_step skips nodes with empty inboxes, and hs_gpu_process stops after a
+ * step that leaves nothing behind instead of running a confirming empty step.
+ * Render commands are validated before they are written into the list. */
+static NodeProcessFn step_inner[256];
+static u32 step_calls[256];
+static bool step_relay;
+static int step_count(Node* node) {
+    step_calls[node->id]++;
+    if (step_relay && node->id == NODE_SOUND) {
+        /* A later node sends to one that has already run in this step. */
+        step_relay = false;
+        Message r = {.to = NODE_SHADER, .from = NODE_SOUND, .op = OP_SET_SHADER, .payload_idx = 5,
+                     .channel = CHAN_RENDER};
+        CHECK(hs_send(node->sys, &r));
+    }
+    return step_inner[node->id](node);
+}
+
+static void test_step_work(void) {
+    fresh_gpu();
+    memset(step_calls, 0, sizeof(step_calls));
+    for (u8 i = 0; i < gpu.system.node_count; i++) {
+        Node* n = gpu.system.nodes[i];
+        if (!n->process_fn) continue;
+        step_inner[n->id] = n->process_fn;
+        n->process_fn = step_count;
+    }
+    CHECK(hs_step(&gpu.system) == 0 && !gpu.system.step_pending);
+    for (u32 i = 0; i < 256; i++) CHECK(step_calls[i] == 0);
+
+    /* One message: only its node runs, and the ack it sends to the system
+     * node is applied within the same hs_gpu_process call. */
+    SystemState* st = &gpu.system_state_data;
+    u32 acks = st->ack_count;
+    Message m = {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_SET_SHADER, .payload_idx = 3,
+                 .flags = HS_MSGF_ACK, .cid = 901, .channel = CHAN_RENDER};
+    CHECK(hs_send(&gpu.system, &m));
+    u32 steps = hs_gpu_process(&gpu);
+    CHECK(steps >= 1 && steps <= 2 && !gpu.system.step_pending);
+    CHECK(gpu.shader_state.current_shader == 3);
+    CHECK(st->ack_count == acks + 1 && st->last_ack_cid == 901 && st->last_ack_status == HS_ACK_OK);
+    CHECK(step_calls[NODE_SHADER] == 1 && step_calls[NODE_BUFFER] == 0 && step_calls[NODE_TEXTURE] == 0 &&
+          step_calls[NODE_OUTPUT] == 0 && step_calls[NODE_SOUND] == 0);
+    CHECK(step_calls[NODE_SYSTEM] == 1);
+    CHECK(hs_gpu_process(&gpu) == 0);
+
+    /* A message left in an inbox by a node that ran later is applied too. */
+    u32 shader_calls = step_calls[NODE_SHADER];
+    step_relay = true;
+    hs_gpu_set_channel(&gpu, 0, 1);
+    CHECK(hs_step(&gpu.system) > 0 && gpu.system.step_pending && gpu.shader_state.current_shader == 3);
+    CHECK(hs_gpu_process(&gpu) == 1 && !gpu.system.step_pending);
+    CHECK(gpu.shader_state.current_shader == 5 && step_calls[NODE_SHADER] == shader_calls + 1);
+    step_relay = true;
+    hs_gpu_set_channel(&gpu, 0, 1);
+    CHECK(hs_gpu_process(&gpu) == 2 && gpu.shader_state.current_shader == 5 && !step_relay);
+
+    /* A channel stopped by its budget is pending; one call drains it all. */
+    CHECK(hs_set_channel_budget(&gpu.system, CHAN_RENDER, 4));
+    hs_gpu_begin_frame(&gpu);
+    for (u32 i = 0; i < 50; i++) hs_gpu_draw(&gpu, (u8)(i & 7));
+    CHECK(hs_step(&gpu.system) > 0 && gpu.system.step_pending && gpu.render.count == 4);
+    CHECK(hs_gpu_process(&gpu) == 12 && !gpu.system.step_pending);
+    CHECK(gpu.render.count == 50 && !gpu.render.overflow);
+    for (u32 i = 0; i < 50; i++) {
+        HSRenderCmd want = {.op = HS_RC_DRAW, .a = (u8)(i & 7)};
+        CHECK(!memcmp(&gpu.render.cmds[i], &want, sizeof(want)));
+    }
+    CHECK(hs_set_channel_budget(&gpu.system, CHAN_RENDER, 16384));
+
+    /* Commands are written whole: every field not set by the op is zero. */
+    hs_gpu_begin_frame(&gpu);
+    memset(gpu.render.cmds, 0xA5, 4 * sizeof(HSRenderCmd));
+    hs_gpu_clip(&gpu, 1, 2, 3, 4);
+    hs_gpu_clear(&gpu, v4_make(0.25f, 0.5f, 0.75f, 1));
+    hs_gpu_process(&gpu);
+    HSRenderCmd clip = {.op = HS_RC_SET_CLIP, .x = 1, .y = 2, .payload_idx = 3, .payload_len = 4};
+    HSRenderCmd clear = {.op = HS_RC_CLEAR, .f0 = 0.25f, .f1 = 0.5f, .f2 = 0.75f, .f3 = 1};
+    CHECK(gpu.render.count == 2 && !memcmp(&gpu.render.cmds[0], &clip, sizeof(clip)) &&
+          !memcmp(&gpu.render.cmds[1], &clear, sizeof(clear)));
+
+    /* OP_FRAME_BEGIN resets the list and is then its first command. */
+    hs_gpu_frame_begin(&gpu);
+    hs_gpu_process(&gpu);
+    HSRenderCmd begin = {.op = HS_RC_FRAME_BEGIN};
+    CHECK(gpu.render.count == 1 && !memcmp(&gpu.render.cmds[0], &begin, sizeof(begin)));
+
+    /* A full list: non-render messages do not mark overflow; a draw does,
+     * and nothing is written past the end. */
+    gpu.render.count = HS_RENDER_MAX_CMDS;
+    hs_gpu_set_shader(&gpu, 2);
+    hs_gpu_process(&gpu);
+    CHECK(gpu.render.count == HS_RENDER_MAX_CMDS && !gpu.render.overflow && gpu.shader_state.current_shader == 2);
+    hs_gpu_draw(&gpu, 1);
+    hs_gpu_process(&gpu);
+    CHECK(gpu.render.count == HS_RENDER_MAX_CMDS && gpu.render.overflow);
+    hs_gpu_frame_begin(&gpu);
+    hs_gpu_process(&gpu);
+    CHECK(gpu.render.count == 1 && !gpu.render.overflow);
+
+    for (u8 i = 0; i < gpu.system.node_count; i++) {
+        Node* n = gpu.system.nodes[i];
+        if (n->process_fn == step_count) n->process_fn = step_inner[n->id];
+    }
+}
+
 static void test_invalid_messages_nacked(void) {
     fresh_gpu();
     SystemState* st = &gpu.system_state_data;
@@ -1022,6 +1128,7 @@ int main(void) {
     test_budget_floor();
     test_conforms_matches_validate();
     test_gate_at_routing();
+    test_step_work();
     test_invalid_messages_nacked();
     test_storage_names_and_files();
     test_font_glyph_codes();

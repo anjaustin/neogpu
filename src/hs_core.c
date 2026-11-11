@@ -132,99 +132,123 @@ static void hs_report_queue_full(HSSystem* sys, const Message* msg, u8 dest_node
     }
 }
 
+static inline HSRenderCmd* hs_render_claim(HSRenderList* rl) {
+    if (rl->count >= HS_RENDER_MAX_CMDS) {
+        rl->overflow = true;
+        return NULL;
+    }
+    HSRenderCmd* c = &rl->cmds[rl->count++];
+    *c = (HSRenderCmd){0};
+    return c;
+}
+
 static void hs_render_record(HSSystem* sys, const Message* msg) {
     if (!sys || !sys->render_list || !msg) return;
 
-    HSRenderCmd cmd;
-    memset(&cmd, 0, sizeof(cmd));
+    /* Validate first, then write the command straight into the list. */
+    HSRenderList* rl = sys->render_list;
+    HSRenderCmd* c;
 
     switch ((OpCode)msg->op) {
         case OP_FRAME_BEGIN:
-            hs_render_reset(sys->render_list);
-            cmd.op = HS_RC_FRAME_BEGIN;
+            hs_render_reset(rl);
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_FRAME_BEGIN;
             break;
 
         case OP_FRAME_END:
-            cmd.op = HS_RC_FRAME_END;
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_FRAME_END;
             break;
 
         case OP_PRESENT:
-            cmd.op = HS_RC_PRESENT;
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_PRESENT;
             break;
 
         case OP_CULL:
-            cmd.op = HS_RC_SET_CULL;
-            cmd.a = (u8)msg->payload_idx;
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_SET_CULL;
+            c->a = (u8)msg->payload_idx;
             break;
 
         case OP_BLEND: {
             if (msg->payload_len != 2 || msg->payload_idx >= sys->payload_capacity) return;
             u8 src = 0, dst = 0;
             if (!hs_unpack_u8x2(sys->payloads[msg->payload_idx].data, msg->payload_len, &src, &dst)) return;
-            cmd.op = HS_RC_SET_BLEND;
-            cmd.a = src;
-            cmd.b = dst;
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_SET_BLEND;
+            c->a = src;
+            c->b = dst;
             break;
         }
 
         case OP_ALPHA:
-            cmd.op = HS_RC_SET_ALPHA;
-            cmd.a = (u8)(msg->payload_idx ? 1 : 0);
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_SET_ALPHA;
+            c->a = (u8)(msg->payload_idx ? 1 : 0);
             break;
 
         case OP_DEPTH:
-            cmd.op = HS_RC_SET_DEPTH;
-            cmd.a = (u8)(msg->payload_idx ? 1 : 0);
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_SET_DEPTH;
+            c->a = (u8)(msg->payload_idx ? 1 : 0);
             break;
 
         case OP_DEPTH_COMPARE: {
             if (msg->payload_len != 2 || msg->payload_idx >= sys->payload_capacity) return;
             u8 cmp = 0, wr = 0;
             if (!hs_unpack_u8x2(sys->payloads[msg->payload_idx].data, msg->payload_len, &cmp, &wr)) return;
-            cmd.op = HS_RC_SET_DEPTH_COMPARE;
-            cmd.a = cmp;
-            cmd.b = wr;
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_SET_DEPTH_COMPARE;
+            c->a = cmp;
+            c->b = wr;
             break;
         }
 
         case OP_COLOR_MASK:
-            cmd.op = HS_RC_SET_COLOR_MASK;
-            cmd.a = (u8)msg->payload_idx;
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_SET_COLOR_MASK;
+            c->a = (u8)msg->payload_idx;
             break;
 
         case OP_CLIP: {
             if (msg->payload_len != 8 || msg->payload_idx >= sys->payload_capacity) return;
             u16 v[4];
             if (!hs_unpack_u16x4(sys->payloads[msg->payload_idx].data, msg->payload_len, v)) return;
-            cmd.op = HS_RC_SET_CLIP;
-            cmd.x = v[0];
-            cmd.y = v[1];
-            cmd.payload_idx = v[2];
-            cmd.payload_len = v[3];
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_SET_CLIP;
+            c->x = v[0];
+            c->y = v[1];
+            c->payload_idx = v[2];
+            c->payload_len = v[3];
             break;
         }
 
         case OP_TEXTURE_FILTER:
-            cmd.op = HS_RC_SET_TEX_FILTER;
-            cmd.a = (u8)(msg->payload_idx & 0x0F);
-            cmd.b = (u8)((msg->payload_idx >> 4) & 1);
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_SET_TEX_FILTER;
+            c->a = (u8)(msg->payload_idx & 0x0F);
+            c->b = (u8)((msg->payload_idx >> 4) & 1);
             break;
 
         case OP_TEXTURE_WRAP:
-            cmd.op = HS_RC_SET_TEX_WRAP;
-            cmd.a = (u8)(msg->payload_idx & 0x0F);
-            cmd.b = (u8)((msg->payload_idx >> 4) & 1);
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_SET_TEX_WRAP;
+            c->a = (u8)(msg->payload_idx & 0x0F);
+            c->b = (u8)((msg->payload_idx >> 4) & 1);
             break;
 
         case OP_CLEAR: {
             if (msg->payload_len != 16 || msg->payload_idx >= sys->payload_capacity) return;
             f32 rgba[4];
             if (!hs_unpack_clear_color(sys->payloads[msg->payload_idx].data, msg->payload_len, rgba)) return;
-            cmd.op = HS_RC_CLEAR;
-            cmd.f0 = rgba[0];
-            cmd.f1 = rgba[1];
-            cmd.f2 = rgba[2];
-            cmd.f3 = rgba[3];
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_CLEAR;
+            c->f0 = rgba[0];
+            c->f1 = rgba[1];
+            c->f2 = rgba[2];
+            c->f3 = rgba[3];
             break;
         }
 
@@ -233,15 +257,17 @@ static void hs_render_record(HSSystem* sys, const Message* msg) {
             f32 depth = 0.0f;
             u8 stencil = 0;
             if (!hs_unpack_clear_ds(sys->payloads[msg->payload_idx].data, msg->payload_len, &depth, &stencil)) return;
-            cmd.op = HS_RC_CLEAR_DS;
-            cmd.f0 = depth;
-            cmd.a = stencil;
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_CLEAR_DS;
+            c->f0 = depth;
+            c->a = stencil;
             break;
         }
 
         case OP_DRAW:
-            cmd.op = HS_RC_DRAW;
-            cmd.a = (u8)(msg->payload_idx & 0xF);
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_DRAW;
+            c->a = (u8)(msg->payload_idx & 0xF);
             break;
 
         case OP_DRAW_INSTANCE: {
@@ -249,29 +275,31 @@ static void hs_render_record(HSSystem* sys, const Message* msg) {
             u8 b = 0, ib = 0;
             u32 count = 0;
             if (!hs_unpack_draw_instance(sys->payloads[msg->payload_idx].data, msg->payload_len, &b, &ib, &count)) return;
-            cmd.op = HS_RC_DRAW_INSTANCE;
-            cmd.a = b;
-            cmd.b = ib;
-            cmd.x = count;
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_DRAW_INSTANCE;
+            c->a = b;
+            c->b = ib;
+            c->x = count;
             break;
         }
 
         case OP_DRAW_TEXT:
-            cmd.op = HS_RC_DRAW_TEXT;
-            cmd.payload_idx = msg->payload_idx;
-            cmd.payload_len = (u16)msg->payload_len;
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_DRAW_TEXT;
+            c->payload_idx = msg->payload_idx;
+            c->payload_len = (u16)msg->payload_len;
             break;
 
         case OP_SHOW_TEXTURE:
-            cmd.op = HS_RC_SHOW_TEXTURE;
-            cmd.a = (u8)(msg->payload_idx & 0xF);
+            if (!(c = hs_render_claim(rl))) return;
+            c->op = HS_RC_SHOW_TEXTURE;
+            c->a = (u8)(msg->payload_idx & 0xF);
             break;
 
         default:
             return;
     }
 
-    (void)hs_render_push(sys->render_list, &cmd);
 }
 
 static bool hs_submit_enqueue(HSSystem* sys, HSChannel ch, const Message* msg, const void* payload, u32 payload_len, bool trusted) {
@@ -1041,6 +1069,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->dropped_system_nonrt = 0;
     sys->dropped_result = 0;
     sys->rejected_invalid = 0;
+    sys->step_pending = false;
 
     /* Capture defaults: record render channel only. */
     sys->record_mask = hs_channel_bit(CHAN_RENDER);
@@ -1308,6 +1337,7 @@ static inline void hs_submit_note_depth_step(HSSystem* sys, HSChannel ch) {
 u32 hs_step(HSSystem* sys) {
     hs_lock(sys);
     u32 processed = 0;
+    bool pending = false;
 
     g_tls_in_step = sys;
     sys->inline_processed = 0;
@@ -1357,11 +1387,12 @@ u32 hs_step(HSSystem* sys) {
             used++;
             processed++;
         }
+        pending |= used >= budget;
     }
     
     for (u8 i = 0; i < sys->node_count; i++) {
         Node* node = sys->nodes[i];
-        if (node->process_fn) {
+        if (node->process_fn && node->inbox.count) {
             processed += (u32)hs_process_node(node);
         }
     }
@@ -1374,6 +1405,10 @@ u32 hs_step(HSSystem* sys) {
             (void)hs_route_immediate(sys, &msg, NULL, 0, true); /* node-built results */
         }
     }
+    /* Messages sent while nodes ran (acks, results) wait in inboxes. */
+    for (u8 i = 0; i < sys->node_count && !pending; i++)
+        pending = sys->nodes[i]->process_fn && sys->nodes[i]->inbox.count;
+    sys->step_pending = pending;
     
     sys->tick++;
     processed += sys->inline_processed;
@@ -1487,6 +1522,7 @@ void hs_clear(HSSystem* sys) {
     sys->dropped_system_nonrt = 0;
     sys->dropped_result = 0;
     sys->rejected_invalid = 0;
+    sys->step_pending = false;
 
     /* Reset producer lanes and submit queues (no concurrent producers allowed). */
     atomic_store_explicit(&sys->producer_count, 0, memory_order_relaxed);

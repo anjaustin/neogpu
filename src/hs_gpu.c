@@ -327,6 +327,9 @@ u32 hs_gpu_process(HSGpu* gpu) {
         if (!progress) break;
         total++;
         if (total > 1000) break;
+        /* Skip the confirming empty step when nothing this step saw is left. */
+        if (!gpu->system.step_pending &&
+            !atomic_load_explicit(&gpu->participant_count, memory_order_acquire)) break;
     }
     return total;
 }

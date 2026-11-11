@@ -191,6 +191,8 @@ _Static_assert(sizeof(MessageQueue) % 64 == 0, "Queue aligned to cache line");
 
 typedef struct Node Node;
 
+/* Applies the node's inbox and returns the number of messages applied.
+ * hs_step calls it only when the inbox is non-empty: a node has no idle work. */
 typedef int (*NodeProcessFn)(Node*);
 
 typedef void (*NodeResetFn)(Node*);
@@ -234,6 +236,10 @@ struct HSSystem {
     u32 dropped_system_nonrt;
     u32 dropped_result;
     u32 rejected_invalid; /* untrusted messages refused by the routing schema gate */
+    /* Set by hs_step: it left work it did not apply (a channel reached its
+     * budget, or a message is waiting in a node inbox). When false, another
+     * hs_step applies only messages sent after this one drained its queue. */
+    bool step_pending;
 
     /* Capture policy */
     u32 record_mask; /* bitmask of (1u << HSChannel) */
