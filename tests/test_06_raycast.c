@@ -184,6 +184,15 @@ int main(int argc, char** argv) {
         glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         
+        // (Re)bind the raycast program and its vertex state every frame. The
+        // font renderer below leaves the text program, VBO and attrib pointers
+        // bound, so the sphere draw must re-establish its own state or it will
+        // feed text-VBO data through the text shader (blank screen, no spheres).
+        glUseProgram(program);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glEnableVertexAttribArray(pos_loc);
+        glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        
         glUniform1f(time_loc, t);
         glDrawArrays(GL_TRIANGLES, 0, 6);
         
@@ -193,7 +202,7 @@ int main(int argc, char** argv) {
             glDisable(GL_DEPTH_TEST);
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            hs_font_render_text(&g_font, fps_buf, -0.95f, 0.85f, 0.04f, 1.0f, 1.0f, 0.0f, 1.0f);
+            hs_font_render_text(&g_font, fps_buf, -0.95f, 0.85f, 0.006f, 1.0f, 1.0f, 0.0f, 1.0f);
             glDisable(GL_BLEND);
         }
         
