@@ -46,6 +46,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-decode at the *right index*, which is what turns "the numbers do
   not match" into a statement about which layout the bytes are in.
 
+- **`tests/redteam_code_mapping.c`** (`make test-code-mapping`, run in CI)
+  — pins the code-mapping boundary. This repository has two 2-bit code
+  mappings, and the invariant that matters is not "one of them is right"
+  but "each packer is read by the decoder that uses the matching one".
+  The test asserts that `f32_to_ternary_packed()` and `alloc_ternary()`
+  round-trip through the routing decoder
+  (`hs_ml_gemm_ternary_mt()`), that the 8-plane encoder round-trips
+  through the LUT's canonical rule, that the two rules disagree on every
+  weight, and that the source still routes the packed weights to that
+  GEMM.
+
+  This test exists because of a mistake worth recording. The two
+  packers above use the routing mapping, not the canonical one, and
+  comparing them against the LUT looks exactly like a bug: 4096 of 4096
+  weights decode wrong. They are not wrong. Their bytes are never read
+  by the LUT — `m->use_i2s` is false for exactly the models those
+  packers handle, so their weights go to the routing GEMM instead. A
+  fix applied on the strength of that comparison would have broken
+  working code.
+
 ### Fixed
 - **Build fails on current Debian/Ubuntu (including the CI runner)**. The
   build did not compile at `src/hs_async.c`: `include/hs_graphics.h` includes
@@ -108,22 +128,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remains correct; the performance claim was not.
 
 ### Known issues
-- **Two packers use the wrong code mapping.**
-  `f32_to_ternary_packed()` in `src/hs_ml_loader_ternary.c` packs
-  F32-model weights as `00 = 0`, `01 = +1`, `10 = -1`, but the LUT kernel
-  that reads them back decodes `code - 1`, i.e. `0 = -1`, `1 = 0`,
-  `2 = +1`. Executing both functions from the repository source against a
-  test row shows all 8 weights decoding to the wrong value — signs
-  inverted, and every zero becoming -1. Only models whose tensors are
-  stored as `GGML_TYPE_F32` are affected; I2_S models bypass this
-  function, and no test in the repository exercises the F32 path.
-  `alloc_ternary()` in `src/hs_ml_infer.c` has the same inverted mapping
-  for the random synthetic models: the weights are still random and
-  ternary, but the documented "50% zero, 25% +1, 25% -1" distribution is
-  not what comes out, and the signs are flipped.
-  `tests/redteam_ternary_formats.c` reports both. Documented in
-  `docs/interface/TERNARY_WEIGHT_FORMATS.md` section 1.1; the fix is
-  pending.
+- **The I2_S projection path decodes upstream-layout bytes with the
+  NeoGPU layout.**
+  `src/hs_ml_infer.c` contains `i2s_proj_neon()`, which implements the
+  upstream ARM layout (64-weight blocks, `group_idx = j / 16`). It is
+  unreachable: its only call site is inside `ternary_proj()`'s
+  `if (m->use_i2s)` branch, and every one of `ternary_proj()`'s seven
+  call sites is itself inside the `else` branch of the same test.
+
+  A model with I2_S tensors therefore has its projections decoded by
+  `f32_proj()` -> `hs_ml_ternary_f32_proj()`, which decodes the NeoGPU
+  layout — 4 consecutive weights per byte, low bits first. If the model's
+  bytes are in one of upstream's layouts, every projection weight is
+  wrong. Measured, the NeoGPU rule recovers 0 of 2560 weights at the
+  right index from upstream ARM bytes and 40 of 2560 from upstream x86
+  bytes; from NeoGPU-layout bytes it recovers all of them.
+
+  This depends on which layout the model file holds, which is not yet
+  known. `ggml-model-i2_s.gguf` is upstream BitNet's file-naming
+  convention, so it is probably not in the NeoGPU layout; but this
+  repository's own converter writes the NeoGPU layout under a different
+  name. See `docs/interface/TERNARY_WEIGHT_FORMATS.md` sections 1.4 and
+  4.
+
+  A second, milder case: `m->use_i2s` is set if *any* projection tensor
+  in the model is I2_S, and it then selects the path for *all* of them.
+  A model mixing I2_S and F32 tensors would have its F32-packed
+  projections read by the LUT, which uses a different code mapping from
+  the one they were packed with.
 
 ## [0.2.0] - 2026-11-11
 

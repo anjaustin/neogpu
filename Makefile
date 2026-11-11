@@ -45,7 +45,7 @@ HS_TARGET = neogpu_demo
 
 TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast test_07_message_triangle test_08_raycast_orbit
 
-.PHONY: build clean run all test run-test build-tests version ml test-i8-bounds test-ternary-formats
+.PHONY: build clean run all test run-test build-tests version ml test-i8-bounds test-ternary-formats test-code-mapping
 
 all: build build-tests
 
@@ -125,6 +125,7 @@ clean:
 	rm -f tests/test_01 tests/test_02 tests/test_03 tests/test_04 tests/test_05 tests/test_06 tests/test_07 tests/test_08
 	rm -f tests/redteam_lmhead_i8_bounds tests/hs_ml_ternary_neon_asan.o
 	rm -f tests/redteam_ternary_formats tests/hs_ml_ternary_neon_formats.o
+	rm -f tests/redteam_code_mapping
 	rm -rf $(ML_BUILD_DIR) $(ML_TARGET)
 
 run: $(HS_TARGET)
@@ -176,6 +177,13 @@ test-ternary-formats:
 	$(CC) $(CFLAGS) -c $(SRC_DIR)/hs_ml_ternary_neon.c -o tests/hs_ml_ternary_neon_formats.o
 	$(CC) $(CFLAGS) tests/redteam_ternary_formats.c tests/hs_ml_ternary_neon_formats.o -lm -lpthread -o tests/redteam_ternary_formats
 	./tests/redteam_ternary_formats
+
+# The ternary code-mapping boundary. There are two 2-bit code mappings in
+# this repository, and each packer must be read by the decoder that uses
+# the matching one. CPU-only: links nothing but libm.
+test-code-mapping:
+	$(CC) $(CFLAGS) tests/redteam_code_mapping.c -lm -o tests/redteam_code_mapping
+	./tests/redteam_code_mapping
 
 run-test:
 	@if [ -z "$(N)" ]; then \

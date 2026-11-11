@@ -17,8 +17,12 @@ Related: [ML_API.md](ML_API.md) (the inference API),
 
 ## 1. The code mapping
 
-A ternary weight is stored as a 2-bit code. NeoGPU's canonical mapping is
-**code = weight + 1**:
+There are **two** 2-bit code mappings in this repository. They are not
+interchangeable, but each producer's bytes are read by exactly one
+decoder, and the two agree within that pairing. Getting this wrong in
+either direction silently produces a model made of noise.
+
+### 1.1 The canonical mapping: code = weight + 1
 
 | code | bits | weight |
 |------|------|--------|
@@ -27,49 +31,80 @@ A ternary weight is stored as a 2-bit code. NeoGPU's canonical mapping is
 | 2    | `10` | +1     |
 | 3    | `11` | unused  |
 
-This is the mapping used by the decode LUT in `src/hs_ml_ternary_neon.c`
-(`build_lut`), by the 8-plane encoder in `src/hs_ml_loader_ternary.c`
+Used by the decode LUT in `src/hs_ml_ternary_neon.c` (`build_lut`), by
+the 8-plane encoder in `src/hs_ml_loader_ternary.c`
 (`hs_mlt_lmhead_encode`), by the `hs_ml_mt11.c` kernels, by the GPU GEMM
 shaders in `src/hs_ml_gpu_gemm.c`, by the coprocessor shaders in
-`src/hs_ml_ternary_coproc.c`, by the archived `hs_ml_ternary_f32.c`, and
-by the repository's own converter `tools/convert_bitnet_to_gguf.py`.
+`src/hs_ml_ternary_coproc.c`, by the archived `hs_ml_ternary_f32.c`, by
+this repository's own converter `tools/convert_bitnet_to_gguf.py`, and by
+upstream BitNet's `quantize_i2_s`.
 
 Note that the LUT's arithmetic is `(code) - 1`, so a code of 3 decodes to
 +2 — outside the ternary range. No NeoGPU-produced data contains code 3,
 and upstream's `quantize_i2_s` emits only 0, 1 and 2, so it does not
 arise in practice.
 
-### 1.1 Two places use a different mapping
+### 1.2 The routing mapping: code = 0, +1, −1
 
-Two packers in this repository do not use the canonical mapping. They pack
-`00 = 0`, `01 = +1`, `10 = −1`, which the decoders above read back as
-−1, 0, +1.
+| code | bits | weight |
+|------|------|--------|
+| 0    | `00` | 0      |
+| 1    | `01` | +1     |
+| 2    | `10` | −1     |
 
-**`f32_to_ternary_packed()`** in `src/hs_ml_loader_ternary.c` packs the
-weights of a model whose tensors are stored as `GGML_TYPE_F32`. Its own
-comment calls this "our internal 2-bit code", but it is not the internal
-code.
+Used by the routing stack's GEMM, `hs_ml_gemm_ternary_mt()` in
+`src/hs_ml_ternary_mt.c`:
 
-Measured, using the function taken verbatim from the repository source:
-of a test row `{+0.8, −0.8, +0.2, −0.2, +1.0, −1.0, 0.0, +0.6}`, **8 of 8
-weights decode to the wrong value** — signs inverted, and every zero
-becomes −1. This is the more serious of the two, because the weights are
-real.
+```c
+if (bits == 1) sum += a;
+else if (bits == 2) sum -= a;
+```
 
-**`alloc_ternary()`** in `src/hs_ml_infer.c` generates the random ternary
-weights used by `hs_mlt_alloc_random()`, the synthetic-model API. Its
-comment says "50% zero, 25% +1, 25% −1", but under the canonical reading
-its output is 25% zero, 25% +1 and 50% −1, with the signs inverted. The
-weights are still random and ternary, so the model is still usable, but
-it is not the distribution that was asked for. `tests/test_ml_infer.c`
-exercises this path.
+and therefore by the two packers that feed it:
 
-Neither is used for I2_S models: `load_i2s_raw()` reads the tensor bytes
-verbatim (§2.4). The fix is to make both packers emit the canonical
-mapping, but that is a change to loader behaviour rather than to
-documentation, so it is tracked separately from this document.
+- `f32_to_ternary_packed()` in `src/hs_ml_loader_ternary.c`, for models
+  whose tensors are stored as `GGML_TYPE_F32`;
+- `alloc_ternary()` in `src/hs_ml_infer.c`, for the random synthetic
+  models.
 
----
+Those two packers are **not** wrong. They pack for the routing decoder,
+and they are never read by the LUT. The comment on
+`f32_to_ternary_packed()` that calls its convention "our internal 2-bit
+code" is misleading — it is the routing stack's code, not the internal
+one — but the bytes are right.
+
+### 1.3 Which decoder a weight goes to
+
+The ternary inference stack has two projection paths, selected by
+`m->use_i2s`:
+
+| `m->use_i2s` | weights come from | decoder | code mapping | layout of the bytes | layout the decoder assumes |
+|---|---|---|---|---|---|
+| true — the model has any I2_S tensor | `load_i2s_raw()`, raw upstream bytes | `hs_ml_ternary_f32_proj()` (the LUT) | canonical | upstream's (§2) | NeoGPU — **a mismatch unless the file is NeoGPU-layout** |
+| false — an F32 model, or a random one | `f32_to_ternary_packed()` or `alloc_ternary()` | `hs_ml_gemm_ternary_mt()` via `hs_ml_route_mt()` | routing | NeoGPU | NeoGPU — matches |
+
+`m->use_i2s` is set only when a projection tensor is actually stored as
+`GGML_TYPE_I2_S`, so a weight packed by `f32_to_ternary_packed()` can
+only ever reach the routing decoder.
+
+### 1.4 The I2_S path has no upstream-layout decoder
+
+`src/hs_ml_infer.c` contains `i2s_proj_neon()`, which implements the
+**upstream ARM layout** (64-weight blocks, `group_idx = j / 16`,
+`group_pos = j % 16`, field at `6 - 2 * group_idx`). It is unreachable.
+Its only call site is inside `ternary_proj()`'s `if (m->use_i2s)` branch,
+and every one of `ternary_proj()`'s seven call sites is itself inside
+the `else` branch of the same test.
+
+So for a model with I2_S tensors, the projections go through
+`f32_proj()` → `hs_ml_ternary_f32_proj()`, which decodes the **NeoGPU**
+layout. If the model's bytes are in one of the upstream layouts, every
+projection weight is wrong — see §2.3 for how wrong, and §4 for how to
+tell which layout the file actually holds.
+
+`tests/stage_probe_real.c` carries its own private copy of the ARM-layout
+decoder, which is how the layout can be probed against the real model
+even though the production path cannot decode it.
 
 ## 2. Bit layouts
 
@@ -194,6 +229,11 @@ coincidence is exactly two weights per 128-block.
 bytes with a single `fread` and returns them unmodified, with the
 comment "No re-packing needed". Those bytes are then handed to
 `hs_ml_ternary_f32_proj()`, which decodes them with the **NeoGPU** rule.
+
+The code mapping is not the problem there — upstream's `quantize_i2_s`
+emits 0 = −1, 1 = 0, 2 = +1, the same as the LUT. The problem is the
+*layout*, and §1.4 explains why the upstream-layout decoder that exists
+in this repository is unreachable.
 
 That is the open question, and it is described in §4.
 
@@ -320,10 +360,10 @@ replaces, while doing four planes of arithmetic per weight.
 ## 4. Which layout does a given model file use?
 
 `hs_mlt_load_gguf()` reads I2_S tensors as raw bytes and feeds them to
-the NeoGPU-layout decoder with no reordering. If a model's bytes are in
-one of the upstream layouts, every projection weight is wrong — and, per
-§2.3, wrong in a way that looks like noise rather than an obvious
-failure.
+the NeoGPU-layout decoder with no reordering — and, per §1.4, that is the
+*only* decoder they can reach. If a model's bytes are in one of the
+upstream layouts, every projection weight is wrong — and, per §2.3,
+wrong in a way that looks like noise rather than an obvious failure.
 
 The repository contains reference decoders for two of the layouts, and
 they disagree:
@@ -385,9 +425,10 @@ than an obviously broken one.
 
 The decisive test is behavioural rather than statistical: run the real
 model under each decode and keep the one that produces coherent text.
-`tests/i2s_native_probe.c` already implements the ARM-layout decode for
-exactly this purpose, and `tests/redteam_i2s_neon.c` cross-checks the
-NEON and scalar decoders against each other.
+`tests/stage_probe_real.c` carries a private copy of the ARM-layout
+decoder for exactly this purpose, `tests/i2s_native_probe.c` implements
+the same layout, and `tests/redteam_i2s_neon.c` cross-checks the NEON
+and scalar decoders against each other.
 
 What is not yet known is which layout that particular file carries.
 That needs the file itself.

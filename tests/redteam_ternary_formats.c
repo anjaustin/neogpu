@@ -629,26 +629,32 @@ static void part4_source_invariants(const char* root) {
            raw_read ? "OK" : "CHANGED");
     check(raw_read, "the I2_S raw loader changed");
 
-    /* The divergent packers: both use 0=0, 1=+1, 2=-1, which the LUT
-     * above decodes as -1, 0, +1. Reported, not asserted, so this test
-     * stays green while the divergence exists and stops reporting it once
-     * the loader is fixed. */
-    int div_loader = contains(loader, "uint8_t code = (v > 0.5f) ? 1 : (v < -0.5f) ? 2 : 0;");
+    /* The loader's F32 packer and the random packer use the ROUTING code
+     * mapping (0=0, 1=+1, 2=-1). That is correct: their bytes are read
+     * by hs_ml_gemm_ternary_mt(), never by the LUT above.
+     * tests/redteam_code_mapping.c pins that pairing. */
+    int routing_packers = contains(loader, "uint8_t code = (v > 0.5f) ? 1 : (v < -0.5f) ? 2 : 0;");
     snprintf(path, sizeof(path), "%s/src/hs_ml_infer.c", root);
     char* infer = read_file(path);
-    int div_infer = infer && contains(infer, "u8 v = (r == 0) ? 1 : (r == 1) ? 2 : 0;");
-    if (div_loader || div_infer) {
-        printf("          KNOWN ISSUE: divergent code mapping still present:\n");
-        if (div_loader)
-            printf("                     f32_to_ternary_packed() in the loader\n");
-        if (div_infer)
-            printf("                     alloc_ternary() in hs_ml_infer.c\n");
-        printf("                     Both pack 0=0, 1=+1, 2=-1; the LUT reads\n");
-        printf("                     that as -1, 0, +1. See\n");
-        printf("                     docs/interface/TERNARY_WEIGHT_FORMATS.md\n");
+    if (infer) routing_packers = routing_packers &&
+        contains(infer, "u8 v = (r == 0) ? 1 : (r == 1) ? 2 : 0;");
+    printf("          F32/random packers use the routing mapping    %s\n",
+           routing_packers ? "OK" : "CHANGED");
+    check(routing_packers, "the routing-mapping packers changed");
+
+    /* Known issue: the upstream-layout decoder in hs_ml_infer.c cannot be
+     * reached, so an I2_S model's projections are decoded with the
+     * NeoGPU layout instead. Reported, not asserted, so this test stays
+     * green while the issue exists and stops reporting it once the
+     * unreachable branch is removed. */
+    if (infer && contains(infer, "i2s_proj_neon(out, in, W, N, K);")) {
+        printf("          KNOWN ISSUE: i2s_proj_neon() implements the upstream\n");
+        printf("                     ARM layout but is unreachable, so the I2_S\n");
+        printf("                     path decodes with the NeoGPU layout. See\n");
+        printf("                     docs/interface/TERNARY_WEIGHT_FORMATS.md 1.4\n");
         known_issues++;
     } else {
-        printf("          no divergent code mapping in the loader or infer\n");
+        printf("          the unreachable upstream-layout decoder is gone\n");
     }
     free(infer);
 
