@@ -33,6 +33,17 @@ days. Release headings use the date recorded at the time.
   swapping the surface with `eglSwapBuffers` yourself. `finish()` now shows a
   held last frame instead of dropping it. Checked by `tests/test_present_pacing`
   (`make present-hardware`).
+- **Uncapped frames of about a refresh (55-68 FPS) repeated refreshes.** A flip
+  must be queued 4-7 ms before a vblank to land on it, even for a finished
+  buffer (`tests/flip_deadline_probe`); the next present often came after
+  that, repeating 12-19% of refreshes. When frames take 7/8 refresh or more
+  and the pending flip lands before the next present is due, present now
+  waits for it and queues the next frame at once: at ~64 FPS 0 of 233
+  refreshes repeat (was 30-33), frame rate unchanged. Above ~70 FPS the wait
+  measured less even motion, so it is not used there. New counters
+  `HSGraphics.flip_waits`, `last_flip_ns`. Pacing diagnostics:
+  `make pacing-tools` (`tests/pacing_trace.so` records every flip of any
+  program, `tests/pacing_sweep`, `tests/pacing_trace_report.py`).
 - Display takeover now finds a CRTC through `possible_crtcs` when none is
   active, refuses a display whose mode does not match the surface instead of
   failing with `EINVAL` silently, checks `AddFB`/`SetCrtc` results, and a failed
