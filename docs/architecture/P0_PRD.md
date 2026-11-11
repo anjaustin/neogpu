@@ -28,6 +28,7 @@ P0 also introduces a minimal frame/QoS contract on top of the channelized fabric
 - Producers call `hs_send()` / `hs_send_with_payload()` from any thread.
 - Producers enqueue into per-thread SPSC lanes (up to `HS_MAX_PRODUCERS`), with a fallback MPSC submit queue for overflow/unregistered producers.
 - The step thread calls `hs_step()`, which drains producer lanes (and the fallback submit queue) and routes messages into node inboxes, and only then processes nodes.
+- `hs_step()` runs a node's `process_fn` only when its inbox is non-empty (nodes have no idle work), and sets `HSSystem.step_pending` when it leaves work unapplied: a channel stopped at its budget, or a message sent during the step waiting in an inbox. `hs_gpu_process()` steps until a step leaves nothing pending (or, with participants attached, until a step makes no progress); messages sent by other threads after their lane was drained are applied by the next call.
 - Validation/logging/render-recording happen at route time (on the step thread).
 - Recording is channel-filtered via `HSSystem.record_mask` (default: `CHAN_RENDER` only).
 - The drain schedule is deterministic and budgeted per channel via `HSSystem.chan_budget[]`.

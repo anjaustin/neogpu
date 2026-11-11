@@ -99,6 +99,14 @@ days. Release headings use the date recorded at the time.
   (pre-audit 0.999); 1 draw is unchanged. Lifecycle submit is lower in all
   seven scenes (alternate 396.9 -> 389.3 us); 1-thread message throughput
   11.9 -> 13.6 M msg/s.
+- The legacy message path does no idle work: `hs_step` runs a node only when
+  its inbox has messages, `hs_gpu_process` stops after a step that leaves
+  nothing pending (`HSSystem.step_pending`) instead of running a confirming
+  empty step, render commands are written straight into the list, and a
+  producer re-reads the step thread's queue head only when its lane looks
+  full. Legacy frame benchmark vs the previous main (7 alternating rounds):
+  1 draw per scene 1.080 -> 1.623 M scenes/s (+50%), 64 draws 0.134 -> 0.161
+  (+20%); 1-thread message throughput 13.6 -> 15.8 M msg/s.
 
 ### Added
 - `make present-hardware` (part of `make test-hardware`): presentation and
