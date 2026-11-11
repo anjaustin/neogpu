@@ -5,7 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-04-01
+## [Unreleased]
+
+## [0.2.0] - 2026-11-11
+
+Everything below accumulated since 0.1.0. The project had no release tags
+before this one, so the earlier in-progress work is folded in here rather
+than left as a phantom release.
+
+### Changed
+- **Repository restructured into professional shape** (three staged commits)
+  - *Stage 1 - hygiene*: untracked 17 committed ELF binaries and one `.bak`
+    file; hardened `.gitignore` with explicit per-name binary rules (not
+    globs, so `tests/*.c` and `tools/*.c` sources are never matched); moved
+    `bench_coproc.c` to `tools/`; moved detail docs off the repo root into
+    `docs/`. No source deleted, no build impact.
+  - *Stage 2 - ML/core separation*: `hs_ipc.c` ML tool-bus path wrapped in
+    `#ifdef HS_ENABLE_ML` (include, global ML state, `hs_ipc_handle_ml_op()`,
+    and the `OP_ML_*` dispatch). The `OP_ML_*` enum lives in `hs_core.h`, so
+    the `case` labels still compile with ML off. `HS_SRC` no longer pulls in
+    any ML source; the default `make` builds the core with zero inference
+    dependencies, and `make ml` opts in.
+  - *Stage 3 - front door*: rewrote `README.md` as a project front door
+    (positioning, status table, reproducible performance figures, demo table,
+    architecture, build matrix, documentation index). Added `CONTRIBUTING.md`,
+    `SECURITY.md`, `.github/README.md` (profile README), CI workflow, issue
+    templates, and a pull-request template. Reorganized `docs/` into
+    `architecture/`, `interface/`, `research/`, `benchmarks/`, `lineage/`,
+    `audit/`, and `archive/`, with a `docs/README.md` index.
+- **Performance claim corrected**: the message layer is documented at
+  **12,000,000 msg/s** (measured range 8.2M-16.9M msg/s across 1-16
+  producers). The previous "1,000,000+ fps" figure predated the
+  lock-free optimization work and understated the result by more than an
+  order of magnitude. Reproduce with `make && ./neogpu_demo`.
+- **Lineage credit strengthened**: the PicoGPU acknowledgment is now specific
+  about what was inherited and where NeoGPU diverges, rather than a generic
+  attribution. `docs/audit/DIAMOND.md` carries a dated note reversing its
+  original "vestigial framing" verdict.
+
+### Fixed
+- **`make tool` did not exist.** The README documented it, but the Makefile
+  only had a `.PHONY` declaration and an unused variable. Added a real rule.
+- **`make neogpu_pong_llm` could not build from a clean tree.** Eight ML
+  objects were used in the link line but never declared as prerequisites, so
+  make never built them. All tool targets now declare every object they link.
+- **Core and ML builds shared object files.** `make ml` compiled the core
+  sources into the same `src/*.o` with an extra `-DHS_ENABLE_ML`, so a plain
+  `make` afterwards could silently reuse ML-enabled objects and vice versa.
+  The ML build now uses its own object tree (`build/ml/`) and produces a
+  distinct binary (`neogpu_demo_ml`).
+- **`make run-test` wrote to `/tmp`**, contradicting the project's own
+  `AGENTS.md` rule that test programs live in the project tree. Now builds
+  into `tests/`, links `hs_backend_gles.o` and `hs_text.o` (several tests
+  need them), and lists all eight tests in its usage message.
+- **`.gitignore`'s `journal/` rule matched at any depth**, so relocating the
+  journal under `docs/` would have silently untracked all twelve files.
+  Root-anchored to `/journal/`.
+- **Documentation cross-references updated** after the `docs/` reorganization,
+  including in `include/hs_msg.h`, `include/hs_ml_routing.h`,
+  `src/hs_ml_binary.c`, and `src/hs_ml_mt7.c`.
+
+### Added
+- **`test_08_raycast_orbit`**: full ray tracer with five orbiting spheres, a
+  central sphere, a checkered ground plane, shadow rays, one reflection
+  bounce, and Phong + rim lighting. **107 FPS** on a Raspberry Pi 4.
+- **Seven-segment FPS HUD** in `tests/test_06_raycast.c`, replacing the
+  broken font-atlas path with self-contained rectangle digits - no atlas, no
+  UVs, and no way to smear across the viewport.
+- **CI workflow** (`.github/workflows/ci.yml`) building and running the
+  headless suite on GitHub's ARM64 runners.
+- **Issue and pull-request templates**, `CONTRIBUTING.md`, `SECURITY.md`, and
+  a `docs/README.md` documentation index.
+
+### Archived
+- `docs/archive/` now holds the LLM conversation corpus (`lmm/`, 48 files),
+  the LMM theory explorations (`lmm-theory/`, 4 files), the development
+  journal (12 files), and four superseded remediation plans. Nothing was
+  deleted; every move is a history-preserving rename.
 
 ### Added
 - **Input Streaming System** (`hs_input_stream.h`, `src/hs_input_stream.c`)

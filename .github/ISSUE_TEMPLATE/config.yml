@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: PicoGPU (the project NeoGPU is inspired by)
+    url: https://github.com/ncannasse/picogpu
+    about: Questions about the original Haxe/HashLink GPU runtime.
+  - name: BitNet reference implementation
+    url: https://github.com/microsoft/BitNet
+    about: Questions about Microsoft's bitnet.cpp, vendored under experimental/BitNet/.

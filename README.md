@@ -1,465 +1,336 @@
-# NeoGPU - ARM NEON Optimized GPU
+# NeoGPU
 
-Message-native runtime substrate for graphics, tooling, and experimental inference on ARM/NEON hardware.
+**A message-native runtime substrate for ARM/NEON — graphics, tooling, and
+experimental inference on the Raspberry Pi 4.**
 
-## Performance
+[![Build](https://github.com/anjaustin/neogpu/actions/workflows/ci.yml/badge.svg)](https://github.com/anjaustin/neogpu/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Language: C](https://img.shields.io/badge/language-C%20%7C%20Make-blue.svg)](https://en.wikipedia.org/wiki/C_(programming_language))
 
-- **Message Layer: 1,000,000+ fps** (single-core ARM Cortex-A72)
-- **177x faster** than original HashLink version
-- **73KB binary** (vs 2MB+ HashLink runtime)
-- **270 FPS** on Raspberry Pi 4 (ray casting spheres test)
+NeoGPU is a small, complete GPU runtime where *every* operation is a message.
+Rendering commands, IPC requests, and (in the experimental path) inference ops
+all travel the same lock-free channels — so one fabric carries the whole
+system.
+
+```c
+HSGpu gpu;
+hs_gpu_init(&gpu);
+hs_gpu_set_shader(&gpu, 0);
+hs_gpu_load_buffer(&gpu, 0);
+hs_gpu_draw(&gpu, 0);
+```
+
+---
+
+## Table of Contents
+
+- [What NeoGPU Is](#what-neogpu-is)
+- [Status](#status)
+- [Performance](#performance)
+- [Quick Start](#quick-start)
+- [Demos](#demos)
+- [Architecture](#architecture)
+- [Tooling & IPC](#tooling--ipc)
+- [Project Layout](#project-layout)
+- [Building](#building)
+- [Testing](#testing)
+- [Documentation](#documentation)
+- [Lineage & Acknowledgments](#lineage--acknowledgments)
+- [License](#license)
+
+---
 
 ## What NeoGPU Is
 
-NeoGPU is a message-native runtime substrate. Rendering is its clearest proof surface today. Tooling and IPC are operationally real peers in the same runtime. ML exists in the tree, but remains experimental until it reaches the same operational standard.
+A **message-passing GPU substrate**. Rather than calling into a driver API, you
+post messages onto a channel; the runtime routes them to nodes, which execute
+and record them.
 
-## Runtime Surfaces
+Three consequences fall out of that design:
 
-- **Graphics**: canonical proof surface on Pi hardware
-- **Tooling / IPC**: operational introspection and control path
-- **Inference / ML**: experimental subsystem, not yet production-real inside this repo
+- **One fabric, many workloads.** The same queue carries render commands and
+  IPC requests. Adding a new workload type does not mean adding a new
+  transport.
+- **Capture and replay come free.** Because work is messages, a frame *is* a
+  log. `HSCAP1` captures are portable, inspectable, and replayable.
+- **The substrate is separable.** The graphics core builds with no inference
+  dependencies at all. The BitNet work is a real experiment, not a
+  load-bearing part of the runtime.
 
-## New Features (vs Original)
+## Status
 
-- **Audio**: 4-channel sound at 48KHz (`hs_audio.h`)
-- **Storage**: Persistent storage with file I/O (`hs_storage.h`)
+| Area | State | Notes |
+|------|-------|-------|
+| Message fabric | **Production-shaped** | Lock-free SPSC/MPSC, channel QoS, overflow accounting |
+| Graphics (GBM/EGL/GLES3) | **Working on hardware** | Verified on Raspberry Pi 4, DRM/GBM, 800x480 DSI |
+| Tooling / IPC | **Working** | Unix socket + TCP server, query/control surface |
+| Capture & replay | **Working** | `HSCAP1` format, round-trip verified |
+| NEON math library | **Working** | vec4/mat4/quat, SIMD-backed |
+| BitNet inference | **Experimental** | Opt-in, off by default — see [below](#architecture) |
+
+The honest summary: **the runtime and the renderer are the product; the
+inference engine is a contained experiment.**
+
+## Performance
+
+Measured on a Raspberry Pi 4 (Cortex-A72, 800x480 DSI display).
+
+| Metric | Value | Source |
+|--------|-------|--------|
+| **Message layer throughput** | **12,000,000 msg/s** | Producer benchmark, `./neogpu_demo` |
+| Message layer (measured range) | 8.2M – 16.9M msg/s | 1–16 producer threads |
+| GPU frames | ~414K fps | Message-path frame rate |
+| NEON math | ~14B ops/sec | Scalar vs NEON mat4/vec4 |
+| IPC throughput | ~4,700 req/sec | Round-trip latency test |
+
+**Reproduce the message-layer number:**
+
+```bash
+make && ./neogpu_demo
+```
+
+The `Comms Producer Benchmark` section prints throughput per producer count:
+
+```
+  1 thr,  500 ms: 12000000 msg/s (ok=60000000 fail=0 spsc_ok=60000000 ...)
+```
+
+That figure is the headline because it is the one that is *hard*. Rendering
+performance is bounded by the display; the fabric's throughput is bounded by
+cache-line contention between producers and the consumer, and it took a dozen
+red-teamed optimization rounds to get there. The full optimization log,
+including the rejected ideas, is in
+[docs/benchmarks/ATOMICS_PROFILE_2026-03-13.md](docs/benchmarks/ATOMICS_PROFILE_2026-03-13.md).
+
+> **Binary size:** the core runtime is ~25 KB of `text`+`data` (stripped).
+> Verify it yourself with `size neogpu_demo` after `make` — `text` and `data`
+> are the loadable code, while `bss` is the ~2 MB of buffers allocated at
+> runtime. Older notes in this repo also quote a "73 KB" figure for the whole
+> file; that was a different measurement of a different artifact, and the
+> `size` output is the number to trust.
 
 ## Quick Start
 
-```bash
-# Build all
-make build
+Requires an ARM Cortex-A72 (Raspberry Pi 4) with GCC and the GLES/GBM/DRM
+development packages.
 
-# Run demo
-make run
+```bash
+git clone https://github.com/anjaustin/neogpu.git
+cd neogpu
+
+make                 # build the core (no ML required)
+make build-tests     # build the graphics test suite
+./neogpu_demo        # run the headless test suite + benchmarks
+```
+
+`neogpu_demo` runs headless — no display or root required. The graphics
+tests that drive the DRM/GBM backend do need the display and root:
+
+```bash
+sudo ./tests/test_08_raycast_orbit
 ```
 
 ## Demos
 
-### Pong (Game Engine Demo)
+The graphics tests are the clearest proof surface. They run on the Pi's
+VideoCore via DRM/GBM.
+
+| Test | What it shows | Verified result |
+|------|---------------|-----------------|
+| `test_01_clear` | Clear screen | ✅ |
+| `test_02_triangle` | Single triangle | ✅ |
+| `test_03_instancing` | Hardware instancing | ✅ |
+| `test_04_blending` | Alpha blending | ✅ |
+| `test_05_cube3d` | 3D rotating cube | ✅ |
+| `test_06_raycast` | Shader-driven spheres + live FPS HUD | ✅ |
+| `test_07_message_triangle` | Message-driven render path | ✅ |
+| `test_08_raycast_orbit` | Full ray tracer: spheres, shadows, reflections, ground plane | ✅ **107 FPS** |
+
+`test_08` is the showpiece — a real ray tracer (sphere intersection, shadow
+rays, one reflection bounce, Phong + rim lighting) running on a Cortex-A72.
+
 ```bash
-make neogpu_pong
-sudo ./neogpu_pong
-# Controls: W/S or UP/DOWN arrows, Q to quit
+make build-tests
+sudo ./tests/test_08_raycast_orbit
 ```
 
-### Pong + AI (Simulated Commentary)
-```bash
-make neogpu_pong_ai
-sudo ./neogpu_pong_ai
+Additional demos live in `tools/`:
+
+| Tool | What it is |
+|------|-----------|
+| `neogpu_pong` | Pong, driven by the message fabric |
+| `neogpu_pong_ai` | Pong with simulated commentary |
+| `neogpu_pong_llm` | Pong alongside real BitNet inference *(experimental)* |
+| `neogpu_capture_demo` | Records an `HSCAP1` capture to disk |
+| `neogpu_tool` | Standalone IPC client for querying a running instance |
+
+## Architecture
+
+```
+        ┌──────────────────────────────────────────┐
+        │              Application                  │
+        │   render commands · IPC requests · ops    │
+        └───────────────────┬──────────────────────┘
+                            │  messages
+        ┌───────────────────▼──────────────────────┐
+        │        Channel Fabric (QoS)               │
+        │  RT (critical) · RENDER (interactive)     │
+        │  TELEM (background, auto-drop)            │
+        └───────────────────┬──────────────────────┘
+                            │
+        ┌───────────────────▼──────────────────────┐
+        │   Nodes: Shader · Buffer · Texture ·      │
+        │          Output · Sound · Input           │
+        └───────────────────┬──────────────────────┘
+                            │
+        ┌───────────────────▼──────────────────────┐
+        │   Backend: GBM / EGL / GLES3 → DRM        │
+        └──────────────────────────────────────────┘
 ```
 
-### Pong + Real LLM (Combined Game + Inference)
-```bash
-make neogpu_pong_llm
-sudo ./neogpu_pong_llm --model models/bitnet-2b4t-i2s.gguf --prompt "Hello"
-```
-This demonstrates:
-- Real BitNet inference running alongside game
-- Message capture of combined workload
-- Screenshot output
+### Core vs. experimental
 
-### Message Capture Demo
-```bash
-make neogpu_capture_demo
-sudo ./neogpu_capture_demo
-# Output: /tmp/neogpu_capture.bin (HSCAP1 format)
-```
+The build is split so the two concerns are structurally separate, not just
+nominally:
 
-### BitNet Chat (Standalone LLM)
-```bash
-# Already built: tools/neogpu_bitnet_chat
-sudo ./tools/neogpu_bitnet_chat --model models/bitnet-2b4t-i2s.gguf --prompt "Hello"
-```
+| | Core (`make`) | ML (`make ml`) |
+|---|---|---|
+| Sources | `src/hs_core.c`, `hs_nodes.c`, `hs_gpu.c`, `hs_async.c`, `hs_backend_gles.c`, `hs_ipc.c`, `hs_text.c`, `main.c` | Core **plus** `hs_ml.c`, `hs_ml_loader.c`, `hs_ml_ternary_mt.c` |
+| `hs_ipc.c` ML ops | Compiled out (`#ifdef HS_ENABLE_ML`) | Compiled in |
+| Object tree | `src/*.o` | `build/ml/*.o` (separate) |
+| Binary | `neogpu_demo` | `neogpu_demo_ml` |
 
-## Tooling Mode
+The object trees are deliberately separate so the two builds can never
+contaminate each other — a plain `make` after `make ml` cannot silently
+reuse ML-enabled objects.
 
-### In-Process Tooling
+## Tooling & IPC
 
-`neogpu_demo` exposes in-process tooling via `--tool`:
+The runtime exposes its own internals for inspection and control.
+
+**In-process tooling:**
 
 ```bash
 ./neogpu_demo --tool --query-stats --query-fabric
-
-# Set record mask (example: record render+rt)
 ./neogpu_demo --tool --set-record-mask 0x00000006 --query-stats
-
-# Set render budget and query
 ./neogpu_demo --tool --set-budget 2 8192 --query-stats
 ```
 
-### IPC Server Mode
-
-Start an IPC server to attach external tools:
+**IPC server mode:**
 
 ```bash
-# Unix socket (local)
-./neogpu_demo --ipc-server /tmp/neogpu.sock --ipc-ms 5000
-
-# TCP/IP (remote)
-./neogpu_demo --ipc-tcp 8765 --ipc-ms 5000
+./neogpu_demo --ipc-server /tmp/neogpu.sock --ipc-ms 5000   # Unix socket
+./neogpu_demo --ipc-tcp 8765 --ipc-ms 5000                  # TCP/IP
 ```
 
-Then use the standalone `neogpu_tool` client:
+**Client:**
 
 ```bash
 make tool
-
 ./neogpu_tool --sock /tmp/neogpu.sock query-stats
-./neogpu_tool --sock /tmp/neogpu.sock query-fabric
-./neogpu_tool --host localhost --port 8765 query-fabric  # TCP/IP
+./neogpu_tool --host localhost --port 8765 query-fabric
 ```
 
-Channel IDs: 1=RT, 2=RENDER, 3=TELEM
-
-## Channel Fabric (QoS)
-
-NeoGPU implements explicit RT/RENDER/TELEM channel semantics:
+**Channel semantics:**
 
 | Channel | QoS | Budget (msgs/tick) | Behavior |
-|---------|-----|-------------------|----------|
+|---------|-----|--------------------|----------|
 | RT | Critical | 4096 | Strict priority, no drops |
 | RENDER | Interactive | 16384 | Fair share, limited drops |
 | TELEM | Background | 1024 | Best-effort, auto-drop |
 
-Query fabric stats:
+## Project Layout
 
-```bash
-./neogpu_tool --sock /tmp/neogpu.sock query-fabric
-# Output includes: spsc_ok, spsc_full, mpsc_ok, submit_full, submit_hw, telem_dropped
+```
+include/            Public headers
+  hs_core.h           Core system, OpCodes, message ABI
+  hs_msg.h            Message packing/unpacking (inline)
+  hs_gpu.h            High-level GPU API
+  hs_nodes.h          Node message handlers
+  hs_graphics.h       GBM/EGL/GLES graphics backend
+  hs_text.h           Text rendering
+  hs_math_neon.h      NEON vec4/mat4/quat math
+  hs_ml*.h            Experimental ML interfaces
+
+src/                Core runtime (graphics + substrate, no ML)
+  hs_core.c           Message queue, OpCodes, system core
+  hs_nodes.c          Node handlers (Shader, Buffer, Texture, Output, Sound)
+  hs_gpu.c            High-level GPU API
+  hs_async.c          Async completion handling
+  hs_backend_gles.c   GBM/EGL/GLES3 backend
+  hs_ipc.c            IPC server (Unix + TCP), tool-bus
+  hs_text.c           Text rendering
+  main.c              Headless test suite + benchmarks
+  hs_ml*.c            Experimental ML (only in the `make ml` build)
+  archive_ternary_kernels/  Historical ternary kernel variants
+
+tests/              Graphics + system tests (test_01 … test_08)
+tools/              Standalone demos and utilities
+docs/               Documentation (see docs/README.md)
+experimental/BitNet/  Vendored Microsoft bitnet.cpp reference (MIT)
 ```
 
-## Building for Different Targets
+## Building
 
-### Native ARM (Cortex-A72)
+**Native ARM (Cortex-A72):**
+
 ```bash
-make build
+make                  # core + tests
+make ml               # opt-in experimental ML build → neogpu_demo_ml
 ```
 
-### Cross-compile for Raspberry Pi
+**Cross-compile:**
+
 ```bash
 make CC=aarch64-linux-gnu-gcc STRIP=aarch64-linux-gnu-strip build
 ```
 
-## Canonical Proof Surface
+**Targets:**
 
-The clearest proof that NeoGPU is real is visible hardware behavior plus runtime tooling:
-
-- `tests/test_06_raycast.c` - shader-driven sphere demo with live FPS HUD
-- `tests/test_07_message_triangle.c` - message-driven render path demo
-- `./neogpu_demo --tool --query-stats --query-fabric` - runtime fabric introspection
-
-If a change improves local code but weakens these proof surfaces, treat it as suspect until revalidated.
-
-## Project Structure
-
-```
-src/
-  hs_core.c       - Message queue, OpCodes, system core
-  hs_nodes.c      - Node message handlers (Shader, Buffer, Texture, Output, Sound)
-  hs_gpu.c        - High-level GPU API
-  hs_ipc.c        - IPC server (Unix domain + TCP/IP)
-  hs_ml_*.c       - ML inference (BitNet 2B)
-  main.c          - Demo/test suite
-  benchmark.c     - Benchmarks
-
-include/
-  hs_core.h       - Core header (includes toolbus for IPC)
-  hs_ipc.h        - IPC server interface
-  hs_nodes.h      - Node headers
-  hs_gpu.h        - GPU API header
-  hs_math_neon.h  - NEON-optimized vec4/mat4 math
-  hs_buffer.h     - Buffer/Texture data types
-  hs_input.h      - Input/controls system
-  hs_audio.h      - 4-channel audio system (48KHz)
-  hs_storage.h    - Persistent storage (16 slots × 256B)
-  hs_graphics.h   - GBM/EGL/GLES graphics backend
-  hs_ml_infer.h   - ML inference API
-
-tools/
-  neogpu_bitnet_chat.c   - Standalone LLM chat
-  neogpu_pong.c         - Simple Pong game
-  neogpu_pong_ai.c      - Pong with AI commentary
-  neogpu_pong_llm.c     - Pong + real BitNet inference
-  neogpu_capture_demo.c - Message capture demo
-  neogpu_viz.c          - ML visualization
-
-tests/
-  test_01_clear.c     - Clear screen test
-  test_02_triangle.c   - Single triangle
-  test_03_instancing.c - Hardware instancing
-  test_04_blending.c   - Alpha blending
-  test_05_cube3d.c     - 3D rotating cube
-  test_06_raycast.c    - Ray casting spheres (270 FPS on Pi)
-
-src/archive_ternary_kernels/
-  - Archived kernel variants (v2-v21)
-```
-
-## API Reference
-
-### GPU Setup
-```c
-HSGpu gpu;
-hs_gpu_init(&gpu);
-```
-
-### Drawing
-```c
-hs_gpu_clear(&gpu, v4_make(0, 0, 0, 1));  // Clear with color
-hs_gpu_set_shader(&gpu, 0);                 // Set shader
-hs_gpu_set_param(&gpu, 0, v4_one());       // Set param
-hs_gpu_set_camera(&gpu, m4_identity());     // Set camera
-hs_gpu_load_buffer(&gpu, 0);                // Load buffer
-hs_gpu_draw(&gpu, 0);                       // Draw
-```
-
-### State
-```c
-hs_gpu_cull(&gpu, 1);           // Back-face culling
-hs_gpu_blend(&gpu, 1, 0);       // No blending
-hs_gpu_alpha(&gpu, true);       // Alpha blending
-hs_gpu_depth(&gpu, true);       // Enable depth test
-hs_gpu_color_mask(&gpu, 0x0F);  // RGBA mask
-hs_gpu_clip(&gpu, 0, 0, 640, 480);
-```
-
-### Textures
-```c
-hs_gpu_load_texture(&gpu, 0);
-hs_gpu_set_target(&gpu, 0, 0);           // Texture + depth
-hs_gpu_show_texture(&gpu, 0);
-hs_gpu_texture_filter(&gpu, 0, true);    // Linear filtering
-hs_gpu_texture_wrap(&gpu, 0, true);      // Repeat wrap
-```
-
-### Recording/Replay
-```c
-hs_gpu_start_recording(&gpu);
-hs_gpu_frame_begin(&gpu);
-// ... draw calls ...
-hs_gpu_frame_end(&gpu);
-hs_gpu_present(&gpu);
-u32 msg_count = hs_gpu_stop_recording(&gpu);
-
-// Replay later
-hs_gpu_replay(&gpu, gpu.log_buffer, msg_count);
-```
-
-Notes:
-
-- Recording is channel-filtered by default (P0: render channel only). See `HSSystem.record_mask` and `hs_set_record_mask()`.
-- Use `hs_gpu_fence(&gpu, CHAN_RENDER, cid)` to request an apply-time fence result via `OP_RESULT`.
-- Use `OP_QUERY_STATS` / `OP_QUERY_FABRIC` to retrieve runtime fabric stats via `OP_RESULT`.
-
-### Input
-```c
-HSInput input;
-hs_input_init(&input);
-
-// Poll each frame
-hs_input_tick(&input);
-
-f32 dx = hs_dir_x(&input);    // -1 to 1
-f32 dy = hs_dir_y(&input);    // -1 to 1
-bool btn = hs_button(&input);
-f32 mx = hs_mouse_x(&input);
-f32 t = hs_time(&input);      // Frame time
-```
-
-### Audio (4 channels, 48KHz)
-```c
-HSAudio audio;
-hs_audio_init(&audio);
-
-// Set channel 0 to shader 1
-hs_audio_set_channel(&audio, 0, 1);
-
-// Get audio buffer for channel 0
-float* buf = hs_audio_get_buffer(&audio, 0);
-if (buf) {
-    // Fill with samples (3000 samples per buffer)
-    for (int i = 0; i < HS_AUDIO_BUFFER_SIZE; i++) {
-        buf[i] = sinf(i * 0.01f);  // Simple sine wave
-    }
-}
-
-// Advance to next buffer
-hs_audio_advance(&audio, 0);
-
-// Stop channel
-hs_audio_stop(&audio, 0);
-```
-
-### Storage (16 slots × 256 bytes)
-```c
-HSStorage store;
-hs_storage_init(&store);
-
-// Load or create slot
-HSStorageSlot* slot = hs_storage_load(&store, "savegame1");
-
-// Read/write data
-u8 val = hs_storage_get_u8(&store, "savegame1", 0);
-hs_storage_set_u8(&store, "savegame1", 0, 42);
-
-f32 fval = hs_storage_get_f32(&store, "savegame1", 4);
-hs_storage_set_f32(&store, "savegame1", 4, 3.14f);
-
-// Save to file
-hs_storage_save(&store, "save.dat");
-
-// Load from file
-hs_storage_load_file(&store, "save.dat");
-```
-
-### Graphics (GBM/EGL/GLES for Pi display)
-```c
-HSGraphics gfx;
-hs_graphics_init(&gfx);  // Opens DRM, GBM, EGL
-
-// Create texture from buffer
-HSTexture* tex = hs_graphics_create_texture(&gfx, 0, 256, 256, pixel_data);
-
-// Check if texture is disposed
-bool disposed = hs_graphics_texture_disposed(&gfx, 0);
-
-// Clear and present
-hs_graphics_clear(&gfx, 0.0f, 0.0f, 0.0f, 1.0f);
-hs_graphics_present(&gfx);
-
-// Cleanup
-hs_graphics_finish(&gfx);
-```
-
-## Math Library
-
-All math uses ARM NEON SIMD for maximum performance:
-
-```c
-vec4 v1 = v4_make(1, 2, 3, 4);
-vec4 v2 = v4_make(5, 6, 7, 8);
-
-vec4 sum = v4_add(v1, v2);
-vec4 diff = v4_sub(v1, v2);
-f32 dot = v4_dot(v1, v2);
-vec4 cross = v4_cross(v1, v2);
-vec4 norm = v4_normalize(v1);
-vec4 lerp = v4_lerp(v1, v2, 0.5f);
-
-mat4 m1 = m4_identity();
-mat4 m2 = m4_translation(1, 2, 3);
-mat4 m3 = m4_multiply(m1, m2);
-mat4 inv = m4_invert(m3);
-```
-
-## Constants
-
-```c
-#define HS_FPS      60
-#define HS_WIDTH    640
-#define HS_HEIGHT   480
-#define HS_MAX_NODES       16
-#define HS_MAX_MSG_LOG     65536
-#define HS_QUEUE_SIZE      256
-```
-
-## Debug Mode
-
-Enable verbose debug output:
-
-```bash
-gcc -DHS_DEBUG=1 -O3 -Iinclude -c src/main.c -o main.o
-...
-```
+| Target | What it does |
+|--------|--------------|
+| `make` / `make build` | Build `neogpu_demo` (core only) |
+| `make build-tests` | Build the graphics test suite |
+| `make ml` | Build `neogpu_demo_ml` (core + experimental ML) |
+| `make tool` | Build the standalone IPC client |
+| `make run-test N=06` | Build and run one test (needs display + root) |
+| `make clean` | Remove build artifacts |
+| `make version` | Print the version |
 
 ## Testing
 
-### Core Tests (x86/ARM)
 ```bash
-make build && ./neogpu_demo
+make build && ./neogpu_demo        # headless: system tests + benchmarks
+make build-tests                    # graphics tests (need display + root)
+sudo ./tests/test_08_raycast_orbit  # the ray tracer
 ```
 
-### Graphics Tests (Raspberry Pi with DRM/GBM/EGL/GLES)
+`neogpu_demo` exercises the message fabric, node handlers, IPC, thread safety,
+overflow handling, and the producer benchmark — all without a display.
 
-One-liner to compile and run any test (replace XX with 01-06):
-```bash
-make build && gcc -O3 -march=armv8.2-a+fp16+simd -mtune=cortex-a72 -Iinclude -c tests/test_XX_raycast.c -o /tmp/test.o && gcc src/hs_core.o src/hs_gpu.o src/hs_nodes.o /tmp/test.o -o /tmp/test -lm -lGLESv2 -lgbm -ldrm -lEGL && sudo /tmp/test
-```
+## Documentation
 
-**Available tests:**
-| Test | Description |
-|------|-------------|
-| test_01_clear | Clear screen |
-| test_02_triangle | Single triangle |
-| test_03_instancing | Hardware instancing |
-| test_04_blending | Alpha blending |
-| test_05_cube3d | 3D rotating cube |
-| test_06_raycast | Ray casting spheres (**270 FPS**) |
+Full documentation index: **[docs/README.md](docs/README.md)**
 
-Run specific test:
-```bash
-# Test 06 (raycast)
-make build && gcc -O3 -march=armv8.2-a+fp16+simd -mtune=cortex-a72 -Iinclude -c tests/test_06_raycast.c -o /tmp/test.o && gcc src/hs_core.o src/hs_gpu.o src/hs_nodes.o /tmp/test.o -o /tmp/test -lm -lGLESv2 -lgbm -ldrm -lEGL && sudo /tmp/test
-```
+| Area | Where to look |
+|------|---------------|
+| Design & architecture | [docs/architecture/](docs/architecture/) |
+| Wire formats & interfaces | [docs/interface/](docs/interface/) |
+| Research & concepts | [docs/research/](docs/research/) |
+| Benchmarks & methodology | [docs/benchmarks/](docs/benchmarks/) |
+| PicoGPU relationship | [docs/lineage/](docs/lineage/) |
+| Self-audit | [docs/audit/DIAMOND.md](docs/audit/DIAMOND.md) |
+| Historical material | [docs/archive/](docs/archive/) |
 
-Test results on Raspberry Pi 4:
-- test_01-05: All working
-- test_06 (raycast): **270 FPS**
-
-## Features
-
-| Feature | Status |
-|---------|--------|
-| Message queue (64-byte aligned) | ✅ |
-| 5 nodes (Shader, Buffer, Texture, Output, Sound) | ✅ |
-| Recording & replay (HSCAP1 format) | ✅ |
-| Overflow detection | ✅ |
-| All vec4/mat4 ops (NEON) | ✅ |
-| Input system | ✅ |
-| Alpha blending | ✅ |
-| Render targets + depth | ✅ |
-| Texture filter/wrap | ✅ |
-| Audio system (4 channels, 48KHz) | ✅ |
-| Storage (16 slots × 256B, file I/O) | ✅ |
-| Graphics (GBM/EGL/GLES for Pi display) | ✅ |
-| **Test suite** (6 graphics tests) | ✅ |
-| BitNet inference (1.58-bit, 2B params) | ✅ |
-| Pong game demo | ✅ |
-| Pong + LLM combined demo | ✅ |
-| Message capture & replay | ✅ |
-
-## Memory Usage
-
-### Runtime Memory
-
-| Component | Size |
-|-----------|------|
-| Full HSGpu (with buffers) | 1,055 KB |
-| Core system only (no logs) | 32 KB |
-| Per-frame bandwidth @60fps | 1.9 KB/frame |
-
-### Binary Size
-
-| Section | Size |
-|--------|------|
-| text (code) | 24 KB |
-| data | 1 KB |
-| bss (buffers at runtime) | 2.1 MB |
-| **Total** | **~25 KB** (stripped) |
-
-## Platform Requirements
-
-- ARM Cortex-A72 (or compatible ARMv8.2-a+)
-- GCC with NEON support
-- Linux (tested)
+Contributing guidelines: [CONTRIBUTING.md](CONTRIBUTING.md).
+Changelog: [CHANGELOG.md](CHANGELOG.md).
 
 ## Lineage & Acknowledgments
 
 NeoGPU began as, and remains, a tribute to [**PicoGPU**](https://github.com/ncannasse/picogpu)
 by **Nicolas Cannasse** (creator of Haxe). PicoGPU is a ~300 KB software GPU
-written in Haxe that compiles to WebGL/HashLink — and it proved the idea at the
-heart of this project: that a complete, tiny GPU runtime can be built in
+written in Haxe that compiles to WebGL/HashLink — and it proved the idea at
+the heart of this project: that a complete, tiny GPU runtime can be built in
 software and still be genuinely useful.
 
 NeoGPU takes that spark somewhere new — a header-oriented **C** implementation
@@ -477,3 +348,11 @@ message-passing substrate, ML in the same runtime — it does so standing on tha
 foundation.
 
 Thank you, Nicolas. See [CREDITS.md](CREDITS.md) for the full lineage.
+
+NeoGPU also incorporates the experimental `bitnet.cpp` reference
+implementation from Microsoft (MIT, see [experimental/BitNet/](experimental/BitNet/)),
+used for comparison against NeoGPU's own ternary kernels.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

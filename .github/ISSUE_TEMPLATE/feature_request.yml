@@ -1,0 +1,53 @@
+name: Feature request
+description: Suggest a capability or improvement for NeoGPU
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the need, not the implementation. This helps us work out whether it fits the project's scope.
+      placeholder: |
+        I want to be able to ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: If you have one in mind, sketch it. A rough idea is fine.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this touch?
+      options:
+        - Message fabric / core
+        - Graphics backend (GBM/EGL/GLES)
+        - IPC / tooling
+        - Capture & replay
+        - NEON math library
+        - Experimental ML / BitNet
+        - Build system / tooling
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: ml-scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This touches the BitNet / inference path
+          description: Inference is experimental and deliberately isolated from the core build. Changes there won't affect the default `make` build.
+        - label: This affects the message ABI
+          description: New or changed opcodes need docs/interface/MESSAGE_ABI.md updated in the same change.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered

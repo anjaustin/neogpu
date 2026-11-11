@@ -1,0 +1,76 @@
+name: Bug report
+description: Something in NeoGPU doesn't behave as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. NeoGPU's primary target is the Raspberry Pi 4,
+        so hardware and toolchain details matter a lot here.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe? Include the exact output or error.
+      placeholder: |
+        $ ./neogpu_demo
+        ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+      placeholder: The behavior the docs lead you to expect.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that shows the problem.
+      placeholder: |
+        1. make clean && make
+        2. ./neogpu_demo
+        3. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area is affected?
+      options:
+        - Message fabric / core
+        - Graphics backend (GBM/EGL/GLES)
+        - IPC / tooling
+        - Capture & replay
+        - NEON math library
+        - Experimental ML / BitNet
+        - Build system
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Hardware and toolchain. `uname -a`, `gcc --version`, and the Pi revision help.
+      render: text
+      placeholder: |
+        Hardware: Raspberry Pi 4 Model B Rev 1.4, 800x480 DSI
+        OS: Raspberry Pi OS 64-bit, kernel 6.6
+        Compiler: gcc (Ubuntu 13.2.0) 13.2.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Logs, core dumps, or a capture file.
