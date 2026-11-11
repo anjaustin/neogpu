@@ -3,6 +3,14 @@ CC = gcc
 CFLAGS = -O3 -march=armv8-a+simd -mtune=cortex-a72 \
          -ffast-math -funroll-loops -Wall -Wextra -DNDEBUG -Iinclude \
          -MMD -MP
+
+# libdrm installs its headers under /usr/include/libdrm on Debian/Ubuntu,
+# and xf86drm.h does #include <drm.h> -- so that directory has to be on the
+# include path or the build fails at src/hs_async.c. gcc ignores a -I path
+# that does not exist, so this is harmless on systems that lay the headers
+# out differently (and on the Pi).
+CFLAGS += -I/usr/include/libdrm
+
 LDFLAGS = -lm -lGLESv2 -lgbm -ldrm -lEGL -lpthread
 STRIP = strip
 

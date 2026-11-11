@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Build fails on current Debian/Ubuntu (including the CI runner)**. The
+  build did not compile at `src/hs_async.c`: `include/hs_graphics.h` includes
+  `<xf86drm.h>`, and libdrm's `xf86drm.h` does `#include <drm.h>`, but
+  libdrm installs `drm.h` under `/usr/include/libdrm`. libdrm's own
+  `libdrm.pc` prescribes `-I${includedir}/libdrm` for exactly this reason.
+  The Makefile now adds `-I/usr/include/libdrm`; gcc ignores a `-I` path that
+  does not exist, so this is harmless on systems that lay the headers out
+  differently. Verified by building the core, all eight graphics tests, the
+  experimental ML target and the standalone IPC client for aarch64.
+- **CI was missing a build dependency.** `EGL/eglplatform.h` includes
+  `<KHR/khrplatform.h>`, which ships in `libgl-dev` — not in `libegl-dev`
+  or `libgles-dev`. Every external header the build needs was mapped to its
+  package and the CI dependency list corrected.
+
 ## [0.2.0] - 2026-11-11
 
 Everything below accumulated since 0.1.0. The project had no release tags
