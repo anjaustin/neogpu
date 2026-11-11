@@ -16,38 +16,6 @@
 #include <string.h>
 #include <time.h>
 #include "hs_graphics.h"
-#include "hs_text.h"
-
-/* Debug: dump one rendered frame to a PPM so the exact pixels can be inspected
- * off-device. Writes bottom-up flip (GL origin is bottom-left). */
-static void hs_debug_screenshot(HSGraphics* gfx, const char* path) {
-    int w = gfx->screen_width, h = gfx->screen_height;
-    unsigned char* px = (unsigned char*)malloc((size_t)w * h * 3);
-    if (!px) return;
-    glFinish();  /* force the GPU to complete all draws before reading back */
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
-    /* quick content check: how many non-black pixels, and where? */
-    long nonblack = 0; int miny = h, maxy = -1;
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            size_t o = (size_t)y * w * 3 + x * 3;
-            if (px[o] | px[o+1] | px[o+2]) { nonblack++; if (y<miny) miny=y; if (y>maxy) maxy=y; }
-        }
-    }
-    FILE* f = fopen(path, "wb");
-    if (f) {
-        fprintf(f, "P6\n%d %d\n255\n", w, h);
-        for (int y = h - 1; y >= 0; y--) fwrite(px + (size_t)y * w * 3, 1, (size_t)w * 3, f);
-        fclose(f);
-        fprintf(stderr, "screenshot written: %s (%dx%d) nonblack=%ld rows[%d..%d]\n",
-                path, w, h, nonblack, miny, maxy);
-    }
-    free(px);
-}
-
-static HSFont g_font;
-static bool g_font_loaded = false;
 
 static const char* vertex_shader_src = R"(
     attribute vec2 a_position;
@@ -147,6 +115,110 @@ static GLuint create_program(const char* vs_src, const char* fs_src) {
     return program;
 }
 
+/* ------------------------------------------------------------------------
+ * Seven-segment FPS HUD.
+ *
+ * Draws the FPS number as solid-color rectangles (segments), with no font
+ * atlas, no textures and no UVs -- it cannot smear or mis-sample. Each digit
+ * is drawn in its own cell using the classic seven-segment layout:
+ *
+ *      aaa
+ *     f   b
+ *     f   b
+ *      ggg
+ *     e   c
+ *     e   c
+ *      ddd
+ *
+ * Coordinates are NDC. x grows right, y grows up. Width is corrected by the
+ * screen aspect so digits are not stretched on a non-square panel.
+ * ---------------------------------------------------------------------- */
+
+static const char* hud_vs_src = R"(
+    attribute vec2 a_position;
+    void main() { gl_Position = vec4(a_position, 0.0, 1.0); }
+)";
+static const char* hud_fs_src = R"(
+    precision mediump float;
+    uniform vec4 u_color;
+    void main() { gl_FragColor = u_color; }
+)";
+
+typedef struct {
+    GLuint program;
+    GLuint vbo;
+    GLint  a_pos;
+    GLint  u_color;
+    float  verts[4096];   /* batched triangle vertices (x,y) pairs */
+    int    nverts;        /* number of vertices pushed */
+} HudCtx;
+
+static void hud_init(HudCtx* c) {
+    memset(c, 0, sizeof(*c));
+    c->program = create_program(hud_vs_src, hud_fs_src);
+    c->a_pos   = glGetAttribLocation(c->program, "a_position");
+    c->u_color = glGetUniformLocation(c->program, "u_color");
+    glGenBuffers(1, &c->vbo);
+}
+
+/* Append one axis-aligned rectangle (two triangles) in NDC. */
+static void hud_rect(HudCtx* c, float x0, float y0, float x1, float y1) {
+    if (c->nverts + 12 > (int)(sizeof(c->verts) / sizeof(float))) return;
+    float* v = &c->verts[c->nverts];
+    v[0]=x0; v[1]=y0;  v[2]=x1; v[3]=y0;  v[4]=x0; v[5]=y1;
+    v[6]=x1; v[7]=y0;  v[8]=x1; v[9]=y1;  v[10]=x0; v[11]=y1;
+    c->nverts += 12;
+}
+
+/* Seven-segment table: bit0=a top, b, c, d bottom, e, f, g middle. */
+static const unsigned char HUD_SEG[10] = {
+    /*0*/ 0x3F, /*1*/ 0x06, /*2*/ 0x5B, /*3*/ 0x4F, /*4*/ 0x66,
+    /*5*/ 0x6D, /*6*/ 0x7D, /*7*/ 0x07, /*8*/ 0x7F, /*9*/ 0x6F,
+};
+
+/* Render a dotted decimal number string (digits and '.') as a HUD at (x,y),
+ * top-left anchored, with digit height dh (NDC). Returns nothing; draws once. */
+static void hud_draw_number(HudCtx* c, const char* str, float x, float y,
+                            float dh, int screen_w, int screen_h,
+                            float r, float g, float b, float a) {
+    c->nverts = 0;
+    float aspect = (float)screen_h / (float)screen_w;  /* y-units per x-unit */
+    float dw = dh * 0.6f * aspect;   /* digit cell width, aspect-corrected */
+    float t  = dh * 0.14f;           /* segment thickness (in y) */
+    float tx = t * aspect;           /* thickness in x */
+    float gap = dw * 0.35f;          /* spacing between glyphs */
+    float cx = x;
+    for (const char* p = str; *p; ++p) {
+        if (*p >= '0' && *p <= '9') {
+            /* use x-thickness for vertical strokes via a per-digit helper */
+            unsigned char s = HUD_SEG[*p - '0'];
+            float xl = cx, xr = cx + dw;
+            float yt = y, ym = y - dh*0.5f, yb = y - dh;
+            if (s & 0x01) hud_rect(c, xl+tx, yt,        xr-tx, yt-t);
+            if (s & 0x02) hud_rect(c, xr-tx, yt-t,      xr,    ym+t*0.5f);
+            if (s & 0x04) hud_rect(c, xr-tx, ym-t*0.5f, xr,    yb+t);
+            if (s & 0x08) hud_rect(c, xl+tx, yb,        xr-tx, yb+t);
+            if (s & 0x10) hud_rect(c, xl,    ym-t*0.5f, xl+tx, yb+t);
+            if (s & 0x20) hud_rect(c, xl,    yt-t,      xl+tx, ym+t*0.5f);
+            if (s & 0x40) hud_rect(c, xl+tx, ym-t*0.5f, xr-tx, ym+t*0.5f);
+            cx += dw + gap;
+        } else if (*p == '.') {
+            hud_rect(c, cx, y - dh, cx + tx, y - dh + t);  /* dot at baseline */
+            cx += tx + gap;
+        } else {
+            cx += dw * 0.5f + gap;  /* space / unknown */
+        }
+    }
+    if (c->nverts == 0) return;
+    glUseProgram(c->program);
+    glBindBuffer(GL_ARRAY_BUFFER, c->vbo);
+    glBufferData(GL_ARRAY_BUFFER, c->nverts * sizeof(float), c->verts, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(c->a_pos);
+    glVertexAttribPointer(c->a_pos, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glUniform4f(c->u_color, r, g, b, a);
+    glDrawArrays(GL_TRIANGLES, 0, c->nverts / 2);
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -160,11 +232,8 @@ int main(int argc, char** argv) {
     
     printf("Screen: %dx%d\n", gfx.screen_width, gfx.screen_height);
     
-    g_font_loaded = hs_font_load(&g_font, "src/medodica_font");
-    if (g_font_loaded) {
-        hs_font_upload_texture(&g_font);
-        printf("Font loaded successfully\n");
-    }
+    HudCtx hud;
+    hud_init(&hud);
     
     GLuint program = create_program(vertex_shader_src, fragment_shader_src);
     if (!program) return 1;
@@ -224,19 +293,13 @@ int main(int argc, char** argv) {
         glUniform1f(time_loc, t);
         glDrawArrays(GL_TRIANGLES, 0, 6);
         
-        if (g_font_loaded && frame > 0) {
+        if (frame > 0) {
             char fps_buf[32];
-            snprintf(fps_buf, sizeof(fps_buf), "FPS: %.1f", fps);
-            glDisable(GL_DEPTH_TEST);
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            hs_font_render_text(&g_font, fps_buf, -0.95f, 0.85f, 0.006f, 1.0f, 1.0f, 0.0f, 1.0f);
-            glDisable(GL_BLEND);
+            snprintf(fps_buf, sizeof(fps_buf), "%.1f", fps);
+            hud_draw_number(&hud, fps_buf, -0.96f, 0.92f, 0.12f,
+                            gfx.screen_width, gfx.screen_height,
+                            1.0f, 1.0f, 0.0f, 1.0f);
         }
-        
-        /* Debug: capture frame 60 (spheres + HUD) before present, for off-device
-         * inspection. Remove once the HUD layout is confirmed. */
-        if (frame == 60) hs_debug_screenshot(&gfx, "neogpu_frame.ppm");
         
         hs_graphics_present(&gfx);
         
