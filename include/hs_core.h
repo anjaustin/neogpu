@@ -320,6 +320,37 @@ const char* hs_op_name(OpCode op);
 /* Debug/validation helper: validates message schema and routing. */
 bool hs_validate_message(const HSSystem* sys, const Message* msg, const char** out_err);
 
+/* Per-opcode message schema (hs_core.c). */
+typedef enum {
+    HS_PAYLOAD_NONE = 0,
+    HS_PAYLOAD_FIXED,
+    HS_PAYLOAD_RANGE,
+    HS_PAYLOAD_STRING
+} HSPayloadKind;
+
+typedef struct {
+    u8           expected_to; /* 0xFF means any registered node */
+    HSPayloadKind kind;
+    u16          min_len;
+    u16          max_len;
+} HSOpSpec;
+
+extern const HSOpSpec hs_op_spec_table[OP_COUNT];
+
+/* Same verdict as hs_validate_message(sys, msg, NULL), without the error
+ * text, cheap enough for every message a node handles. NONE and FIXED specs
+ * reduce to the [min_len, max_len] range check (table invariant). */
+static inline bool hs_message_conforms(const HSSystem* sys, const Message* msg) {
+    if (!sys || !msg || msg->op >= OP_COUNT || !sys->node_map[msg->to]) return false;
+    const HSOpSpec* spec = &hs_op_spec_table[msg->op];
+    u32 len = msg->payload_len;
+    if ((spec->expected_to != 0xFF && msg->to != spec->expected_to) |
+        (len < spec->min_len) | (len > spec->max_len)) return false;
+    if (len == 0) return true;
+    if (!sys->payloads || msg->payload_idx >= sys->payload_capacity) return false;
+    return spec->kind != HS_PAYLOAD_STRING || sys->payloads[msg->payload_idx].data[len - 1] == 0;
+}
+
 /*
  * Self-contained capture for deterministic replay.
  *

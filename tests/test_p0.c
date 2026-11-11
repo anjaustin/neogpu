@@ -489,6 +489,40 @@ static void test_budget_floor(void) {
     CHECK(gpu.system.chan_budget[CHAN_RT] == 64);
 }
 
+/* Nodes use the inline hs_message_conforms(); it must give exactly the
+ * verdict of hs_validate_message() for every opcode, destination, length,
+ * payload index and string terminator. */
+static void test_conforms_matches_validate(void) {
+    fresh_gpu();
+    HSSystem* sys = &gpu.system;
+    for (u32 op = 0; op < OP_COUNT; op++) {
+        const HSOpSpec* spec = &hs_op_spec_table[op];
+        if (spec->kind == HS_PAYLOAD_NONE) CHECK(spec->min_len == 0 && spec->max_len == 0);
+        if (spec->kind == HS_PAYLOAD_FIXED) CHECK(spec->min_len == spec->max_len);
+        CHECK(spec->min_len <= spec->max_len && spec->max_len <= HS_PAYLOAD_SIZE);
+    }
+    u32 mismatches = 0, accepted = 0, rejected = 0;
+    const u32 lengths[] = {0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 19, 20, 21, 51, 52, 53, 63, 64, 65,
+                           HS_PAYLOAD_SIZE - 1, HS_PAYLOAD_SIZE, HS_PAYLOAD_SIZE + 1, 65535};
+    const u32 indices[] = {0, 1, sys->payload_capacity - 1, sys->payload_capacity, 65535};
+    for (u32 op = 0; op <= OP_COUNT + 1 && op < 256; op++)
+        for (u32 to = 0; to < 256; to++)
+            for (u32 l = 0; l < sizeof(lengths) / sizeof(lengths[0]); l++)
+                for (u32 i = 0; i < sizeof(indices) / sizeof(indices[0]); i++)
+                    for (u32 term = 0; term < 2; term++) {
+                        Message m = {.to = (u8)to, .op = (u8)op, .payload_idx = (u16)indices[i],
+                                     .payload_len = lengths[l]};
+                        if (m.payload_len && m.payload_idx < sys->payload_capacity && m.payload_len <= HS_PAYLOAD_SIZE)
+                            sys->payloads[m.payload_idx].data[m.payload_len - 1] = term ? 0 : 'x';
+                        bool full = hs_validate_message(sys, &m, NULL);
+                        mismatches += full != hs_message_conforms(sys, &m);
+                        accepted += full; rejected += !full;
+                    }
+    CHECK(mismatches == 0);
+    CHECK(accepted > 0 && rejected > 0);
+    CHECK(!hs_message_conforms(NULL, &(Message){0}) && !hs_message_conforms(sys, NULL));
+}
+
 static void test_invalid_messages_nacked(void) {
     fresh_gpu();
     SystemState* st = &gpu.system_state_data;
@@ -753,6 +787,7 @@ int main(void) {
     test_input_ownership();
     test_submit_ring_wrap();
     test_budget_floor();
+    test_conforms_matches_validate();
     test_invalid_messages_nacked();
     test_storage_names_and_files();
     test_font_glyph_codes();

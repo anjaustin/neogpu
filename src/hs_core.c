@@ -734,20 +734,6 @@ static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u3
     return hs_submit_enqueue(sys, ch, msg, payload, len);
 }
 
-typedef enum {
-    HS_PAYLOAD_NONE = 0,
-    HS_PAYLOAD_FIXED,
-    HS_PAYLOAD_RANGE,
-    HS_PAYLOAD_STRING
-} HSPayloadKind;
-
-typedef struct {
-    u8           expected_to; /* 0xFF means any registered node */
-    HSPayloadKind kind;
-    u16          min_len;
-    u16          max_len;
-} HSOpSpec;
-
 static HSChannel hs_default_channel_for_op(OpCode op) {
     switch (op) {
         /* telemetry */
@@ -782,7 +768,10 @@ static HSChannel hs_default_channel_for_op(OpCode op) {
     }
 }
 
-static const HSOpSpec hs_op_spec_table[OP_COUNT] = {
+/* Every entry obeys the invariants hs_message_conforms() relies on:
+ * HS_PAYLOAD_NONE has min_len == max_len == 0, HS_PAYLOAD_FIXED has
+ * min_len == max_len (checked by test_p0). Missing entries are zero. */
+const HSOpSpec hs_op_spec_table[OP_COUNT] = {
     [OP_NOOP]          = {0xFF,        HS_PAYLOAD_NONE,   0, 0},
 
     [OP_SET_SHADER]    = {NODE_SHADER, HS_PAYLOAD_NONE,   0, 0},

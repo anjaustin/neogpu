@@ -16,6 +16,7 @@ static GLuint current_program, current_buffer;
 static struct { bool enabled; GLint size; GLsizei stride; const void* pointer; GLuint buffer; GLuint divisor; } attributes[3];
 static struct { GLuint program, buffer; GLsizei vertices; GLsizei instances; GLuint offsets; } expected[32];
 static u32 expected_count, draws, uploads, program_calls, pointer_calls, constant_offsets;
+static bool offset_value_zero; /* generic a_offset value known to be (0,0) */
 static GLint scissor[4];
 static bool scissor_enabled;
 
@@ -23,7 +24,7 @@ void __wrap_glUseProgram(GLuint program) { current_program = program; program_ca
 void __wrap_glBindBuffer(GLenum target, GLuint buffer) { REQUIRE(target == GL_ARRAY_BUFFER); current_buffer = buffer; }
 void __wrap_glEnableVertexAttribArray(GLuint index) { REQUIRE(index < 3); attributes[index].enabled = true; }
 void __wrap_glDisableVertexAttribArray(GLuint index) { REQUIRE(index == 2); attributes[index].enabled = false; }
-void __wrap_glVertexAttrib2f(GLuint index, GLfloat x, GLfloat y) { REQUIRE(index == 2 && x == 0 && y == 0); constant_offsets++; }
+void __wrap_glVertexAttrib2f(GLuint index, GLfloat x, GLfloat y) { REQUIRE(index == 2 && x == 0 && y == 0); constant_offsets++; offset_value_zero = true; }
 void __wrap_glVertexAttribDivisor(GLuint index, GLuint divisor) { REQUIRE(index == 2 && divisor <= 1); attributes[index].divisor = divisor; }
 void __wrap_glScissor(GLint x, GLint y, GLsizei w, GLsizei h) { scissor[0] = x; scissor[1] = y; scissor[2] = w; scissor[3] = h; }
 void __wrap_glEnable(GLenum cap) { if (cap == GL_SCISSOR_TEST) scissor_enabled = true; }
@@ -40,15 +41,18 @@ static void check_draw(GLenum mode, GLint first, GLsizei count, GLsizei instance
     if (expected[draws].offsets) {
         REQUIRE(attributes[2].enabled && attributes[2].divisor == 1 && attributes[2].size == 2);
         REQUIRE(attributes[2].buffer == expected[draws].offsets && attributes[2].stride == 8);
-    } else {
-        REQUIRE(!attributes[2].enabled);
+    } else if (current_program == backend.program) {
+        REQUIRE(!attributes[2].enabled && offset_value_zero);
     }
     bool textured = current_program == backend.tex_program;
+    /* No instanced divisor may leak into the textured quad. */
+    if (textured) REQUIRE(attributes[2].divisor == 0);
     for (u32 i = 0; i < 2; i++) {
-        REQUIRE(attributes[i].enabled && attributes[i].buffer == expected[draws].buffer);
-        REQUIRE(attributes[i].size == (i == 0 || textured ? 2 : 3));
-        REQUIRE(attributes[i].stride == (GLsizei)((textured ? 4 : 5) * sizeof(float)));
-        REQUIRE(attributes[i].pointer == (void*)(uintptr_t)(i ? 2 * sizeof(float) : 0));
+        GLint at = textured ? (i ? backend.quad_uv_loc : backend.quad_pos_loc) : (GLint)i;
+        REQUIRE(attributes[at].enabled && attributes[at].buffer == expected[draws].buffer);
+        REQUIRE(attributes[at].size == (i == 0 || textured ? 2 : 3));
+        REQUIRE(attributes[at].stride == (GLsizei)((textured ? 4 : 5) * sizeof(float)));
+        REQUIRE(attributes[at].pointer == (void*)(uintptr_t)(i ? 2 * sizeof(float) : 0));
     }
     draws++;
 }
@@ -67,6 +71,9 @@ void __wrap_glUniform1i(GLint location, GLint value) { REQUIRE(location == 2 && 
 static void reset_external_state(void) {
     memset(attributes, 0, sizeof(attributes)); current_program = 999; current_buffer = 0;
     draws = expected_count = 0;
+    /* Arbitrary state left by code between frames: an enabled a_offset array
+     * and an unknown generic value. */
+    attributes[2].enabled = true; offset_value_zero = false;
 }
 /* Banks 0 and 1 hold geometry; the vertex count follows the bank length. */
 static GLsizei bank_vertices(u8 bank) {
@@ -90,10 +97,10 @@ static void push_full(u8 op, u8 bank, u8 instance_bank, u32 instances) {
     expected_count++;
 }
 static void push(u8 op, u8 bank) { push_full(op, bank, 0, 0); }
-static u32 draws_total;
+static u32 draws_total, frames_total;
 static void execute(void) {
     HSFrameContext frame = {.gpu = &gpu, .render = &gpu.render};
-    gles_execute(&backend, &frame); REQUIRE(draws == expected_count); draws_total += draws;
+    gles_execute(&backend, &frame); REQUIRE(draws == expected_count); draws_total += draws; frames_total++;
 }
 int main(void) {
     backend.gfx_ok = true;
@@ -137,7 +144,27 @@ int main(void) {
     clip.y = 600; hs_render_reset(&gpu.render);   /* entirely below the target */
     REQUIRE(hs_render_push(&gpu.render, &clip)); execute();
     REQUIRE(scissor[3] == 0);
+    /* a_offset is specified once per run of plain draws, not once per draw. */
+    hs_render_reset(&gpu.render); reset_external_state(); constant_offsets = 0;
+    for (u32 i = 0; i < 8; i++) push(HS_RC_DRAW, 0);
+    execute(); REQUIRE(constant_offsets == 1);
+    /* Instanced -> plain -> instanced -> plain in one frame, and an instanced
+     * draw last: the frame must end with divisor 0 and the array disabled. */
+    hs_render_reset(&gpu.render); reset_external_state(); constant_offsets = 0;
+    push(HS_RC_DRAW, 0); push_full(HS_RC_DRAW_INSTANCE, 1, 0, 7); push(HS_RC_DRAW, 0); push(HS_RC_DRAW, 1);
+    push_full(HS_RC_DRAW_INSTANCE, 1, 0, 7);
+    execute(); REQUIRE(constant_offsets == 2);
+    REQUIRE(!attributes[2].enabled && attributes[2].divisor == 0);
+    /* The textured quad may use the same attribute location as a_offset (it
+     * leaves its arrays enabled): the next plain draw must not inherit it,
+     * and a preceding instanced divisor must not leak into the quad. */
+    backend.quad_uv_loc = 2; expected_count = 0;
+    hs_render_reset(&gpu.render); reset_external_state(); constant_offsets = 0;
+    push(HS_RC_DRAW, 0); push_full(HS_RC_DRAW_INSTANCE, 1, 0, 7); push(HS_RC_SHOW_TEXTURE, 0);
+    push(HS_RC_DRAW, 0); push(HS_RC_DRAW, 0);
+    execute(); REQUIRE(constant_offsets == 2);
+    backend.quad_uv_loc = 1;
     hs_memory_free(&gpu.memory);
-    printf("{\"test\":\"gles_real_backend_headless_state_transitions\",\"frames\":6,\"draws\":%u,\"uploads\":%u,\"program_calls\":%u,\"pointer_calls\":%u,\"passed\":true}\n", draws_total, uploads, program_calls, pointer_calls);
+    printf("{\"test\":\"gles_real_backend_headless_state_transitions\",\"frames\":%u,\"draws\":%u,\"uploads\":%u,\"program_calls\":%u,\"pointer_calls\":%u,\"passed\":true}\n", frames_total, draws_total, uploads, program_calls, pointer_calls);
     return 0;
 }

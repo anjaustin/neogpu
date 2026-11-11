@@ -16,6 +16,7 @@ typedef struct {
     GLint pos_loc;
     GLint color_loc;
     GLint offset_loc;  /* per-instance vec2 offset; constant (0,0) for plain draws */
+    u8    offset_state; /* HS_GLES_OFFSET_*: what a_offset is known to source */
 
     HSFont font;       /* loaded at init; OP_DRAW_TEXT is a no-op without it */
     bool   font_ok;
@@ -270,10 +271,26 @@ static bool gles_capture_ppm(HSGLESBackend* b, const char* path) {
     return ok;
 }
 
+/* a_offset state is only re-specified when it changes: consecutive plain
+ * draws share the constant (0,0). Anything outside the draw case (text,
+ * texture quads, code between frames) may use the same attribute location,
+ * so the state is forgotten around it, and an instanced array is first
+ * returned to divisor 0/disabled so it cannot leak into that code. */
+enum { HS_GLES_OFFSET_UNKNOWN = 0, HS_GLES_OFFSET_ZERO, HS_GLES_OFFSET_INSTANCED };
+
+static void gles_offset_forget(HSGLESBackend* b) {
+    if (b->offset_state == HS_GLES_OFFSET_INSTANCED) {
+        glVertexAttribDivisor((GLuint)b->offset_loc, 0);
+        glDisableVertexAttribArray((GLuint)b->offset_loc);
+    }
+    b->offset_state = HS_GLES_OFFSET_UNKNOWN;
+}
+
 static void gles_execute(void* ctx, const HSFrameContext* frame) {
     HSGLESBackend* b = (HSGLESBackend*)ctx;
     if (!b->gfx_ok || !frame || !frame->render) return;
     b->text_line = 0;
+    /* offset_state is UNKNOWN here: zeroed at creation, forgotten at frame end. */
 
     for (u32 i = 0; i < frame->render->count; i++) {
         const HSRenderCmd* c = &frame->render->cmds[i];
@@ -411,17 +428,17 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
                         glEnableVertexAttribArray((GLuint)b->offset_loc);
                         glVertexAttribPointer((GLuint)b->offset_loc, 2, GL_FLOAT, GL_FALSE, HS_GLES_INSTANCE_BYTES, (void*)0);
                         glVertexAttribDivisor((GLuint)b->offset_loc, 1);
-                    } else {
+                        b->offset_state = HS_GLES_OFFSET_INSTANCED;
+                    } else if (b->offset_state != HS_GLES_OFFSET_ZERO) {
+                        if (b->offset_state == HS_GLES_OFFSET_INSTANCED)
+                            glVertexAttribDivisor((GLuint)b->offset_loc, 0);
                         glDisableVertexAttribArray((GLuint)b->offset_loc);
                         glVertexAttrib2f((GLuint)b->offset_loc, 0.0f, 0.0f);
+                        b->offset_state = HS_GLES_OFFSET_ZERO;
                     }
                 }
                 if (instanced) glDrawArraysInstanced(GL_TRIANGLES, 0, vertices, (GLsizei)instances);
                 else glDrawArrays(GL_TRIANGLES, 0, vertices);
-                if (instance_vbo) {
-                    glVertexAttribDivisor((GLuint)b->offset_loc, 0);
-                    glDisableVertexAttribArray((GLuint)b->offset_loc);
-                }
                 break;
             }
 
@@ -447,6 +464,7 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
                 float x = -1.0f + 8.0f * px;
                 float y = 1.0f - 8.0f * py - (float)b->text_line * line;
                 b->text_line++;
+                if (b->offset_loc >= 0) gles_offset_forget(b);
                 /* The text renderer enables alpha blending; keep the frame's own blend state. */
                 GLboolean blend_on = glIsEnabled(GL_BLEND);
                 GLint src = GL_ONE, dst = GL_ZERO;
@@ -461,6 +479,7 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
                 u8 slot = c->a & 0x0F;
                 GLuint tex = hs_graphics_get_gl_texture(&b->gfx, slot);
                 if (!tex) tex = hs_graphics_get_gl_texture(&b->gfx, 0);
+                if (b->offset_loc >= 0) gles_offset_forget(b);
 
                 glUseProgram(b->tex_program);
                 glActiveTexture(GL_TEXTURE0);
@@ -479,6 +498,7 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
         }
     }
 
+    if (b->offset_loc >= 0) gles_offset_forget(b);
     if (b->capture_path[0]) {
         b->capture_ok = gles_capture_ppm(b, b->capture_path);
         b->capture_path[0] = 0;

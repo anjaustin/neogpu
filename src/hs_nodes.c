@@ -54,7 +54,7 @@ static inline bool hs_f32_bits_finite(f32 value) {
 static bool node_message_valid(Node* node, const Message* msg) {
     HSSystem* sys = hs_node_system(node);
     if (!sys) return msg->payload_len == 0;
-    return hs_validate_message(sys, msg, NULL);
+    return hs_message_conforms(sys, msg);
 }
 
 static void emit_ack(Node* node, const Message* req, u8 status) {
