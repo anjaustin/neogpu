@@ -75,7 +75,6 @@ typedef struct {
      * are locked; call hs_graphics_flush_present() before swapping the
      * surface yourself. */
     struct gbm_bo* held_bo;
-    EGLSyncKHR     held_sync;         /* GPU completion of held_bo's rendering */
     /* EGL_KHR_fence_sync; NULL when unsupported (frames then count as unfinished). */
     PFNEGLCREATESYNCKHRPROC     egl_create_sync;
     PFNEGLDESTROYSYNCKHRPROC    egl_destroy_sync;
@@ -485,9 +484,7 @@ static inline void hs_graphics_fence_destroy(HSGraphics* gfx, EGLSyncKHR sync) {
 static inline void hs_graphics_drop_held(HSGraphics* gfx) {
     if (!gfx->held_bo) return;
     gbm_surface_release_buffer(gfx->gbm_surface, gfx->held_bo);
-    hs_graphics_fence_destroy(gfx, gfx->held_sync);
     gfx->held_bo = NULL;
-    gfx->held_sync = EGL_NO_SYNC_KHR;
     gfx->frames_dropped++;
 }
 
@@ -570,9 +567,7 @@ static inline void hs_graphics_flush_present(HSGraphics* gfx) {
     if (gfx->flip_pending && hs_graphics_wait_flip(gfx, 100)) hs_graphics_retire_flip(gfx);
     if (!gfx->held_bo) return;
     struct gbm_bo* bo = gfx->held_bo;
-    hs_graphics_fence_destroy(gfx, gfx->held_sync);
     gfx->held_bo = NULL;
-    gfx->held_sync = EGL_NO_SYNC_KHR;
     if (gfx->crtc_active && !gfx->flip_pending) {
         hs_graphics_queue_flip(gfx, bo);
         if (gfx->flip_pending && hs_graphics_wait_flip(gfx, 100)) hs_graphics_retire_flip(gfx);
@@ -747,26 +742,27 @@ static inline void hs_graphics_present(HSGraphics* gfx) {
         return;
     }
 
-    EGLSyncKHR sync = hs_graphics_fence(gfx);
     if (gfx->flip_pending) {
         /* Hold the newest frame for the next free flip slot. */
         hs_graphics_drop_held(gfx);
         gfx->held_bo = bo;
-        gfx->held_sync = sync;
         return;
     }
-    if (gfx->held_bo && !hs_graphics_fence_done(gfx, sync)) {
-        /* This frame is still rendering: flip the older held one, which
-         * finishes first, and hold this one. */
-        struct gbm_bo* show = gfx->held_bo;
-        hs_graphics_fence_destroy(gfx, gfx->held_sync);
-        gfx->held_bo = bo;
-        gfx->held_sync = sync;
-        hs_graphics_queue_flip(gfx, show);
-        return;
+    if (gfx->held_bo) {
+        /* At most once per refresh: flip this frame if the GPU has already
+         * finished it, else the older held one (it finishes first) and hold
+         * this one. Without a fence, the held one. */
+        EGLSyncKHR sync = hs_graphics_fence(gfx);
+        bool done = hs_graphics_fence_done(gfx, sync);
+        hs_graphics_fence_destroy(gfx, sync);
+        if (!done) {
+            struct gbm_bo* show = gfx->held_bo;
+            gfx->held_bo = bo;
+            hs_graphics_queue_flip(gfx, show);
+            return;
+        }
+        hs_graphics_drop_held(gfx);
     }
-    hs_graphics_drop_held(gfx);
-    hs_graphics_fence_destroy(gfx, sync);
     hs_graphics_queue_flip(gfx, bo);
 }
 
