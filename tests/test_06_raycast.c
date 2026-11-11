@@ -24,14 +24,24 @@ static void hs_debug_screenshot(HSGraphics* gfx, const char* path) {
     int w = gfx->screen_width, h = gfx->screen_height;
     unsigned char* px = (unsigned char*)malloc((size_t)w * h * 3);
     if (!px) return;
+    glFinish();  /* force the GPU to complete all draws before reading back */
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
+    /* quick content check: how many non-black pixels, and where? */
+    long nonblack = 0; int miny = h, maxy = -1;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            size_t o = (size_t)y * w * 3 + x * 3;
+            if (px[o] | px[o+1] | px[o+2]) { nonblack++; if (y<miny) miny=y; if (y>maxy) maxy=y; }
+        }
+    }
     FILE* f = fopen(path, "wb");
     if (f) {
         fprintf(f, "P6\n%d %d\n255\n", w, h);
         for (int y = h - 1; y >= 0; y--) fwrite(px + (size_t)y * w * 3, 1, (size_t)w * 3, f);
         fclose(f);
-        fprintf(stderr, "screenshot written: %s (%dx%d)\n", path, w, h);
+        fprintf(stderr, "screenshot written: %s (%dx%d) nonblack=%ld rows[%d..%d]\n",
+                path, w, h, nonblack, miny, maxy);
     }
     free(px);
 }
