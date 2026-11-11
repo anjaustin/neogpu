@@ -51,6 +51,7 @@ typedef struct {
     
     bool           initialized;
     bool           vsync;
+    int            swap_interval; /* EGL swap interval last applied; -1 = not yet */
     bool           take_display;
     bool           reuse_connector_scan;
     bool           display_found;
@@ -170,6 +171,7 @@ static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height)
      * completed flip at each refresh; frames it cannot show are dropped, not
      * waited for. Set vsync = true to pace to the display instead. */
     gfx->vsync = false;
+    gfx->swap_interval = -1;
     /* Taking the CRTC away from whatever currently owns it is what puts our
      * frames on the panel; it costs a full modeset on the first present. At
      * close() the kernel hands the CRTC back to the console (fbcon); an
@@ -616,7 +618,10 @@ static inline void hs_graphics_clear(HSGraphics* gfx, float r, float g, float b,
 static inline void hs_graphics_present(HSGraphics* gfx) {
     if (!gfx->initialized) return;
 
-    if (!gfx->vsync) eglSwapInterval(gfx->egl_display, 0);
+    /* Applied only when vsync changes: an EGL call per frame is measurable. */
+    int interval = gfx->vsync ? 1 : 0;
+    if (gfx->swap_interval != interval && eglSwapInterval(gfx->egl_display, interval))
+        gfx->swap_interval = interval;
     eglSwapBuffers(gfx->egl_display, gfx->egl_surface);
 
     if (!gfx->take_display) return;
