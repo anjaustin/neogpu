@@ -210,18 +210,28 @@ void hs_font_render_text(const HSFont* font, const char* text, float x, float y,
             float ox = g->offset_x * scale;
             float oy = g->offset_y * scale;
             
+            // Glyph quad in NDC: a small rectangle placed at the pen position,
+            // offset by the glyph's bearing. x,y and scale arrive already in NDC,
+            // so the quad spans [left,right] x [bottom,top] around the cursor.
+            // (Previously the quad was hardcoded to the full -1..1 viewport, which
+            // stretched every glyph across the whole screen.)
+            float left   = cursor_x + ox;
+            float right  = left + gw;
+            float top    = cursor_y - oy;
+            float bottom = top - gh;
+            
             float u0 = (float)g->tex_x / atlas_w;
             float v0 = (float)(atlas_h - g->tex_y - g->height + 1) / atlas_h;
             float u1 = (float)(g->tex_x + g->width) / atlas_w;
             float v1 = (float)(atlas_h - g->tex_y) / atlas_h;
             
             float q[] = {
-                -1.0f, -1.0f, u0, v0,
-                1.0f, -1.0f, u1, v0,
-                -1.0f, 1.0f, u0, v1,
-                1.0f, -1.0f, u1, v0,
-                1.0f, 1.0f, u1, v1,
-                -1.0f, 1.0f, u0, v1,
+                left,  bottom, u0, v0,
+                right, bottom, u1, v0,
+                left,  top,    u0, v1,
+                right, bottom, u1, v0,
+                right, top,    u1, v1,
+                left,  top,    u0, v1,
             };
             
             glBufferData(GL_ARRAY_BUFFER, sizeof(q), q, GL_DYNAMIC_DRAW);
