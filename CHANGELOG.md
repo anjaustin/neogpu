@@ -73,6 +73,18 @@ days. Release headings use the date recorded at the time.
   or `libgles-dev`. Every external header the build needs was mapped to its
   package and the CI dependency list corrected.
 
+### Performance (reference benchmark against d6a59eb)
+- The audit fixes cost measurable CPU, now recovered. Node schema checks use
+  the inline `hs_message_conforms()` (same verdicts as
+  `hs_validate_message()`, checked exhaustively in `test_p0`); plain draws use
+  the original two-attribute shader, with a separate program only for
+  per-instance offsets; the EGL swap interval is set only when vsync changes.
+  Pre-audit vs now: GLES lifecycle submit time is lower in all seven scenes
+  (e.g. alternate 399.6 -> 396.9 us, retained 223.4 -> 214.2 us); the
+  executor's frame total is 465.5 -> 467.6 us, the difference being the
+  page flip that now shows every frame; the legacy message path is +1.3% at
+  1 draw per scene and -3% at 64 draws (per-message schema check).
+
 ### Added
 - `make present-hardware` (part of `make test-hardware`): presentation and
   text-rendering checks against the real display controller.
