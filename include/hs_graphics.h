@@ -76,10 +76,13 @@ typedef struct {
      * surface yourself. */
     struct gbm_bo* held_bo;
     /* Smoothed time between vsync-off presents. Frames are held only when it
-     * is at least a quarter refresh: cheaper frames finish in time anyway, and
-     * a third locked buffer costs pipelining at very high frame rates. */
+     * is at least a quarter refresh: below that, not holding never repeated a
+     * refresh and holding added ~4.5 ms latency; at 0.28 refresh and above
+     * not holding repeats refreshes (tests/evidence-measure-20261114/sweep). */
     u64            last_present_ns;
     u64            present_interval_ns;
+    u64            last_flip_ns;      /* vblank timestamp of the last completed flip (CLOCK_MONOTONIC) */
+    u64            flip_waits;        /* vsync off: presents that waited for a flip about to land */
     /* EGL_KHR_fence_sync; NULL when unsupported (frames then count as unfinished). */
     PFNEGLCREATESYNCKHRPROC     egl_create_sync;
     PFNEGLDESTROYSYNCKHRPROC    egl_destroy_sync;
@@ -427,8 +430,9 @@ static inline uint32_t hs_graphics_fb_for_bo(HSGraphics* gfx, struct gbm_bo* bo)
 
 static inline void hs_graphics_flip_done(int fd, unsigned int sequence, unsigned int sec,
                                          unsigned int usec, void* data) {
-    (void)fd; (void)sec; (void)usec;
+    (void)fd;
     HSGraphics* gfx = (HSGraphics*)data;
+    gfx->last_flip_ns = (u64)sec * 1000000000ull + (u64)usec * 1000ull;
     if (gfx->last_flip_sequence && sequence - gfx->last_flip_sequence > 1)
         gfx->refreshes_repeated += sequence - gfx->last_flip_sequence - 1;
     gfx->last_flip_sequence = sequence;
@@ -704,7 +708,10 @@ static inline void hs_graphics_clear(HSGraphics* gfx, float r, float g, float b,
  *               next refresh and repeat the old image. While a flip is in
  *               flight the newest frame is held (when frames take at least a
  *               quarter refresh; faster ones finish in time and are dropped)
- *               and flipped at the next present that finds the slot free; a
+ *               and flipped at the next present that finds the slot free
+ *               (frames of 7/8 refresh or more wait for a flip about to
+ *               land, so the next one is queued before the display's
+ *               deadline); a
  *               frame replaced by a newer one is not shown (frames_dropped). A held frame keeps a
  *               third buffer locked: call hs_graphics_flush_present() before
  *               calling eglSwapBuffers on this surface yourself.
@@ -756,8 +763,22 @@ static inline void hs_graphics_present(HSGraphics* gfx) {
         gfx->present_interval_ns = gfx->present_interval_ns ? (gfx->present_interval_ns * 7 + dt) / 8 : dt;
     }
     gfx->last_present_ns = now;
+    u64 refresh_ns = 1000000000ull / (gfx->display_mode.vrefresh ? gfx->display_mode.vrefresh : 60);
+    if (gfx->flip_pending && gfx->present_interval_ns * 8 >= refresh_ns * 7 && gfx->last_flip_ns) {
+        /* Frames take about a refresh or more. A flip must be queued some
+         * 4-7 ms before a vblank to land on it; the next present would often
+         * come too late and repeat a refresh. When the pending flip lands
+         * before the next present is due, wait for it and queue the next
+         * frame at once. Measured smoother below 68 FPS, not above. */
+        u64 next_vblank = gfx->last_flip_ns + refresh_ns;
+        while (next_vblank < now) next_vblank += refresh_ns;
+        u64 until = next_vblank - now;
+        if (until < gfx->present_interval_ns) {
+            gfx->flip_waits++;
+            if (hs_graphics_wait_flip(gfx, (int)(until / 1000000ull) + 3)) hs_graphics_retire_flip(gfx);
+        }
+    }
     if (gfx->flip_pending) {
-        u64 refresh_ns = 1000000000ull / (gfx->display_mode.vrefresh ? gfx->display_mode.vrefresh : 60);
         hs_graphics_drop_held(gfx);
         if (gfx->present_interval_ns * 4 >= refresh_ns) {
             /* Hold the newest frame for the next free flip slot. */

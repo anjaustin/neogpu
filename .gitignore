@@ -62,6 +62,9 @@ tests/*.o
 /tests/scanout_probe
 /tests/test_present_flip
 /tests/test_present_pacing
+/tests/pacing_trace.so
+/tests/pacing_sweep
+/tests/flip_deadline_probe
 /tests/test_text_render
 /tests/test_headless_scalar
 /bench_legacy

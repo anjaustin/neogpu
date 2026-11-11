@@ -210,6 +210,22 @@ tests/test_present_flip: tests/test_present_flip.c include/hs_graphics.h
 tests/test_present_pacing: tests/test_present_pacing.c include/hs_graphics.h
 	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
 
+# Pacing diagnostics (not part of a gate): pacing_trace.so records every page
+# flip and swap of any program it is preloaded into; pacing_sweep renders a
+# shader calibrated to a fraction of a refresh; flip_deadline_probe measures
+# how early a flip must be queued. See tests/pacing_trace_report.py.
+.PHONY: pacing-tools
+pacing-tools: tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe
+
+tests/pacing_trace.so: tests/pacing_trace.c
+	$(CC) -O2 -Wall -Wextra -shared -fPIC -I/usr/include/libdrm $< -o $@ -ldl -lgbm
+
+tests/pacing_sweep: tests/pacing_sweep.c include/hs_graphics.h
+	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
+
+tests/flip_deadline_probe: tests/flip_deadline_probe.c include/hs_graphics.h
+	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
+
 tests/test_text_render: tests/test_text_render.c src/hs_text.o include/hs_graphics.h
 	$(CC) $(CFLAGS) $< src/hs_text.o $(LDFLAGS) -o $@
 
@@ -277,6 +293,7 @@ clean:
 	rm -f tests/test_p0 tests/test_p0_sanitize tests/test_p0_tsan tests/test_headless_sanitize tests/test_headless_tsan tests/*.d tools/*.d *.d
 	rm -f tests/test_evdev
 	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/panel_mode_probe tests/test_text_render
+	rm -f tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe
 	rm -f bench_legacy tests/test_headless_scalar
 	rm -f tests/test_tool_sanitize tests/test_tool_tsan
 	rm -f $(HS_OBJ) $(HS_DEPS) $(HS_TARGET) tests/*.o tests/test_01_clear tests/test_02_triangle tests/test_03_instancing tests/test_04_blending tests/test_05_cube3d tests/test_06_raycast tests/test_07_message_triangle tests/test_08_raycast_orbit neogpu_tool neogpu_pong neogpu_pong_ai neogpu_capture_demo neogpu_procgame
