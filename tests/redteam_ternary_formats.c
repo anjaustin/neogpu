@@ -9,9 +9,10 @@
  *           Links the real src/hs_ml_ternary_neon.c and compares the fused
  *           4-plane kernel's output against a scalar reference decode.
  *
- *   Part 2  The three bit layouts in play -- NeoGPU internal, upstream
- *           BitNet ARM, upstream BitNet x86 -- are each self-consistent and
- *           mutually incompatible.
+ *   Part 2  The four bit layouts in play -- NeoGPU internal, upstream
+ *           BitNet ARM, upstream BitNet x86 (ACT_PARALLEL), and upstream
+ *           BitNet x86 (non-ACT_PARALLEL, the 1x4 row-interleaved one) --
+ *           are each self-consistent and mutually incompatible.
  *
  *   Part 3  The 8-plane base-3 expansion reconstructs a weight to within
  *           1.5/3^k after k planes.
@@ -19,6 +20,13 @@
  *   Part 4  The source text the documentation depends on still says what
  *           the documentation says it says. This is what stops Part 3's
  *           copy of the encoder from drifting away from the real one.
+ *
+ *   Part 5  The upstream layout rules are checked against the vendored
+ *           upstream source, so Part 2 cannot silently agree with a
+ *           misreading of that source.
+ *
+ *   Part 6  The layout table in the document is checked against what the
+ *           packers actually do. A wrong table is a wrong document.
  *
  * Build and run (from the repository root):
  *     make test-ternary-formats
@@ -55,14 +63,32 @@ extern void hs_ml_lmhead_stage1(float *out, const float *in,
                                  const u16 *row_scale,
                                  u32 N, u32 K);
 
-/* The kernel's inline F16 decode, copied from lmhead_stage1_rows(). */
-static float kernel_fp16_to_f32(u16 h) {
-    u32 eu = (h >> 10) & 0x1Fu;
-    u32 mu = h & 0x03FFu;
-    u32 fu = ((eu + 112u) << 23) | (mu << 13);
-    float f;
-    memcpy(&f, &fu, 4);
-    return f;
+/* An independent IEEE-754 binary16 -> binary32 conversion.
+ *
+ * This is deliberately NOT the kernel's own hand-rolled decoder, so that
+ * the kernel's F16 row_scale decode is checked too rather than assumed. */
+static float std_fp16_to_f32(u16 h) {
+    u32 sign = (u32)(h & 0x8000u) << 16;
+    u32 exp  = (u32)(h >> 10) & 0x1Fu;
+    u32 mant = (u32)h & 0x3FFu;
+    u32 f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;                       /* signed zero */
+        } else {                            /* subnormal */
+            exp = 127u - 15u + 1u;
+            while ((mant & 0x400u) == 0) { mant <<= 1; exp--; }
+            mant &= 0x3FFu;
+            f = sign | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = sign | 0x7F800000u | (mant << 13);   /* inf / NaN */
+    } else {
+        f = sign | ((exp - 15u + 127u) << 23) | (mant << 13);
+    }
+    float r;
+    memcpy(&r, &f, 4);
+    return r;
 }
 
 /* Scalar reference: decode the NeoGPU layout directly.
@@ -92,7 +118,7 @@ static void reference_stage1(float *out, const float *in,
                 acc += v * in[bi * 4 + s];
             }
         }
-        out[n] = acc * kernel_fp16_to_f32(row_scale[n]);
+        out[n] = acc * std_fp16_to_f32(row_scale[n]);
     }
 }
 
@@ -155,10 +181,22 @@ static int part1_production_kernel(void) {
 }
 
 /* ================================================================
- * Part 2 -- the three bit layouts
+ * Part 2 -- the four bit layouts
  * ================================================================ */
 
-/* NeoGPU internal: 4 consecutive weights per byte, low bits first. */
+/* A xorshift64 generator. The LCG used elsewhere in this repository has
+ * a weak low-bit period, which is not good enough for a per-weight
+ * distribution this precise. */
+static uint64_t rng_state = 0x123456789abcdefULL;
+static u32 rng_next(void) {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 7;
+    rng_state ^= rng_state << 17;
+    return (u32)(rng_state >> 32);
+}
+
+/* NeoGPU internal: 4 consecutive weights per byte, low bits first.
+ * src/hs_ml_ternary_neon.c / src/hs_ml_loader_ternary.c */
 static void pack_neogpu(const u8* codes, int K, u8* out) {
     memset(out, 0, (size_t)K / 4);
     for (int bi = 0; bi < K / 4; bi++)
@@ -172,7 +210,8 @@ static void unpack_neogpu(const u8* in, int K, u8* out) {
 }
 
 /* Upstream BitNet, ARM NEON build: QK_I2_S = 64, group_idx = j / 16.
- * experimental/BitNet/src/ggml-bitnet-mad.cpp, quantize_i2_s #else branch:
+ * experimental/BitNet/src/ggml-bitnet-mad.cpp, quantize_i2_s, #elif
+ * __ARM_NEON branch:
  *     group_idx = j / 16 ; group_pos = j % 16
  *     i2_weight[i * 16 + group_pos] |= code << (6 - 2 * group_idx) */
 static void pack_up_arm(const u8* codes, int K, u8* out) {
@@ -191,7 +230,8 @@ static void unpack_up_arm(const u8* in, int K, u8* out) {
         }
 }
 
-/* Upstream BitNet, x86 build: QK_I2_S = 128, group_idx = j / 32. */
+/* Upstream BitNet, x86 build with ACT_PARALLEL: QK_I2_S = 128,
+ * group_idx = j / 32. */
 static void pack_up_x86(const u8* codes, int K, u8* out) {
     memset(out, 0, (size_t)K / 4);
     for (int i = 0; i < K / 128; i++)
@@ -208,6 +248,23 @@ static void unpack_up_x86(const u8* in, int K, u8* out) {
         }
 }
 
+/* Upstream BitNet, x86 build WITHOUT ACT_PARALLEL ("quantize_i2_s_1x4"):
+ * four ROWS are interleaved into one byte, column-major within a group
+ * of four rows:
+ *     packed = (q0 << 6) | (q1 << 4) | (q2 << 2) | (q3)
+ *   where q0..q3 are column `col` of rows r0..r3. Byte index is
+ *   rg * n_per_row + col. This is not a per-row layout at all. */
+static void pack_up_1x4(const u8* codes, int nrow, int ncol, u8* out) {
+    memset(out, 0, (size_t)nrow * ncol / 4);
+    for (int rg = 0; rg < nrow / 4; rg++)
+        for (int col = 0; col < ncol; col++)
+            out[rg * ncol + col] =
+                (u8)((codes[(rg * 4 + 0) * ncol + col] << 6) |
+                     (codes[(rg * 4 + 1) * ncol + col] << 4) |
+                     (codes[(rg * 4 + 2) * ncol + col] << 2) |
+                      codes[(rg * 4 + 3) * ncol + col]);
+}
+
 static double agreement(const u8* a, const u8* b, int K) {
     int same = 0;
     for (int i = 0; i < K; i++) if (a[i] == b[i]) same++;
@@ -216,22 +273,19 @@ static double agreement(const u8* a, const u8* b, int K) {
 
 static int part2_layouts(void) {
     const int K = 2560;
-    const int TRIALS = 2000;
+    const int TRIALS = 5000;
 
     u8* codes = (u8 *)malloc(K);
     u8* bytes = (u8 *)malloc(K / 4);
     u8* d1 = (u8 *)malloc(K);
     u8* d2 = (u8 *)malloc(K);
 
-    u32 seed = 987654321u;
     double arm_arm = 0, x86_x86 = 0, ne_ne = 0;
     double arm_ne = 0, x86_ne = 0, arm_x86 = 0;
 
     for (int t = 0; t < TRIALS; t++) {
-        for (int i = 0; i < K; i++) {
-            seed = seed * 1103515245u + 12345u;
-            codes[i] = (u8)((seed >> 16) % 3);
-        }
+        for (int i = 0; i < K; i++)
+            codes[i] = (u8)(rng_next() % 3);
 
         pack_up_arm(codes, K, bytes);
         unpack_up_arm(bytes, K, d1);
@@ -255,20 +309,97 @@ static int part2_layouts(void) {
     arm_arm /= TRIALS; x86_x86 /= TRIALS; ne_ne /= TRIALS;
     arm_ne /= TRIALS;  x86_ne /= TRIALS;  arm_x86 /= TRIALS;
 
-    printf("  Part 2  bit layout compatibility (K = %d, %d random ternary rows)\n", K, TRIALS);
-    printf("          upstream ARM   read with upstream ARM : %.4f\n", arm_arm);
-    printf("          upstream x86   read with upstream x86 : %.4f\n", x86_x86);
-    printf("          NeoGPU         read with NeoGPU       : %.4f\n", ne_ne);
-    printf("          upstream ARM   read with NeoGPU       : %.4f  (chance is 0.3333)\n", arm_ne);
-    printf("          upstream x86   read with NeoGPU       : %.4f\n", x86_ne);
-    printf("          NeoGPU         read with upstream ARM : %.4f\n", arm_x86);
+    /* The 1x4 layout interleaves rows, so it is measured over a whole
+     * matrix: read each row's bytes the way the NeoGPU per-row rule would
+     * and compare with the original codes. */
+    {
+        const int ROWS = 512;
+        u8* m_codes = (u8 *)malloc((size_t)ROWS * K);
+        u8* m_bytes = (u8 *)malloc((size_t)ROWS * K / 4);
+        u8* m_dec   = (u8 *)malloc(K);
+        double acc = 0;
+        for (int t = 0; t < 20; t++) {
+            for (int i = 0; i < ROWS * K; i++)
+                m_codes[i] = (u8)(rng_next() % 3);
+            pack_up_1x4(m_codes, ROWS, K, m_bytes);
+            int same = 0;
+            for (int r = 0; r < ROWS; r++) {
+                unpack_neogpu(m_bytes + (size_t)r * K / 4, K, m_dec);
+                for (int c = 0; c < K; c++)
+                    if (m_dec[c] == m_codes[(size_t)r * K + c]) same++;
+            }
+            acc += (double)same / (ROWS * K);
+        }
+        acc /= 20;
+        printf("  Part 2  bit layout compatibility (K = %d, %d random ternary rows)\n", K, TRIALS);
+        printf("          upstream ARM   read with upstream ARM   : %.4f\n", arm_arm);
+        printf("          upstream x86   read with upstream x86   : %.4f\n", x86_x86);
+        printf("          NeoGPU         read with NeoGPU         : %.4f\n", ne_ne);
+        printf("          upstream ARM   read with NeoGPU         : %.4f  (chance is 0.3333)\n", arm_ne);
+        printf("          upstream x86   read with NeoGPU         : %.4f\n", x86_ne);
+        printf("          NeoGPU         read with upstream ARM   : %.4f\n", arm_x86);
+        printf("          upstream 1x4   read with NeoGPU         : %.4f\n", acc);
 
-    check(arm_arm == 1.0, "upstream ARM layout is not self-consistent");
-    check(x86_x86 == 1.0, "upstream x86 layout is not self-consistent");
-    check(ne_ne   == 1.0, "NeoGPU layout is not self-consistent");
-    check(arm_ne <= 0.5, "upstream ARM and NeoGPU layouts unexpectedly agree");
-    check(x86_ne <= 0.5, "upstream x86 and NeoGPU layouts unexpectedly agree");
-    check(arm_x86 <= 0.5, "upstream ARM and x86 layouts unexpectedly agree");
+        check(arm_arm == 1.0, "upstream ARM layout is not self-consistent");
+        check(x86_x86 == 1.0, "upstream x86 layout is not self-consistent");
+        check(ne_ne   == 1.0, "NeoGPU layout is not self-consistent");
+        check(arm_ne <= 0.5, "upstream ARM and NeoGPU layouts unexpectedly agree");
+        check(x86_ne <= 0.5, "upstream x86 and NeoGPU layouts unexpectedly agree");
+        check(arm_x86 <= 0.5, "upstream ARM and x86 layouts unexpectedly agree");
+        check(acc <= 0.5, "upstream 1x4 and NeoGPU layouts unexpectedly agree");
+        free(m_codes); free(m_bytes); free(m_dec);
+    }
+
+    /* How many weights survive the cross-decode at the RIGHT index?
+     *
+     * Agreement at chance is not quite the whole story. The upstream x86
+     * layout has 32-weight stride against the NeoGPU layout's 4, and the
+     * two grids coincide on two weights out of every 128-block. So reading
+     * x86 bytes with the NeoGPU rule recovers 2/128 = 1.5625% of the
+     * weights exactly, and the rest only coincidentally -- which is why
+     * the agreement figure is 0.015625 + 0.984375/3 = 0.34375 rather than
+     * 0.3333.
+     *
+     * Measured by perturbation: set one weight's code to 2 and every
+     * other code to 0, then find which decoded index became 2.
+     */
+    {
+        u8* codes = (u8*)malloc(K);
+        u8* bytes = (u8*)malloc(K / 4);
+        u8* dec   = (u8*)malloc(K);
+        u8* mat   = (u8*)malloc((size_t)4 * K);
+        /* The 1x4 packer writes a whole 4-row group: nrow*ncol/4 bytes. */
+        u8* mat_bytes = (u8*)malloc((size_t)4 * K / 4);
+
+        int arm_exact = 0, x86_exact = 0, one_x_four_exact = 0;
+        for (int w = 0; w < K; w++) {
+            memset(codes, 0, K);
+            codes[w] = 2;
+
+            pack_up_arm(codes, K, bytes);
+            unpack_neogpu(bytes, K, dec);
+            for (int i = 0; i < K; i++) if (dec[i] == 2) { if (i == w) arm_exact++; break; }
+
+            pack_up_x86(codes, K, bytes);
+            unpack_neogpu(bytes, K, dec);
+            for (int i = 0; i < K; i++) if (dec[i] == 2) { if (i == w) x86_exact++; break; }
+
+            memset(mat, 0, (size_t)4 * K);
+            memcpy(mat, codes, K);              /* row 0 */
+            pack_up_1x4(mat, 4, K, mat_bytes);
+            unpack_neogpu(mat_bytes, K, dec);
+            for (int i = 0; i < K; i++) if (dec[i] == 2) { if (i == w) one_x_four_exact++; break; }
+        }
+
+        int x86_expected = 2 * (K / 128);
+        printf("          weights recovered at the right index: ARM %d/%d, "
+               "x86 %d/%d, 1x4 %d/%d\n",
+               arm_exact, K, x86_exact, K, one_x_four_exact, K);
+        check(arm_exact == 0, "the upstream ARM layout should recover no weight at the right index");
+        check(x86_exact == x86_expected, "the upstream x86 layout should recover 2 weights per 128-block");
+        check(one_x_four_exact == 0, "the upstream 1x4 layout should recover no weight at the right index");
+        free(codes); free(bytes); free(dec); free(mat); free(mat_bytes);
+    }
 
     free(codes); free(bytes); free(d1); free(d2);
     return 0;
@@ -289,7 +420,7 @@ static int part2_layouts(void) {
  *   byte |= (code & 3u) << (s * 2);                    low bits first
  *   row_f[hi] = (row_f[hi] - (float)t) * 3.0f;         base-3 magnification
  */
-static void encode_planes(float *row_f, u32 H, u8 **planes, u32 row_bytes) {
+static void encode_planes(float *row_f, u8 **planes, u32 row_bytes) {
     for (int k = 0; k < 8; k++) {
         u8 *plane_row = planes[k];
         for (u32 bi = 0; bi < row_bytes; bi++) {
@@ -308,7 +439,6 @@ static void encode_planes(float *row_f, u32 H, u8 **planes, u32 row_bytes) {
             plane_row[bi] = byte;
         }
     }
-    (void)H;
 }
 
 static void decode_plane(const u8* plane_row, u32 row_bytes, u8* codes_out) {
@@ -349,7 +479,7 @@ static int part3_wavelet(void) {
         if (scale == 0.0f) scale = 1.0f;
         for (u32 h = 0; h < H; h++) { row_f[h] /= scale; orig[h] = row_f[h]; }
 
-        encode_planes(row_f, H, planes, row_bytes);
+        encode_planes(row_f, planes, row_bytes);
 
         for (u32 h = 0; h < H; h++) {
             double r = fabs((double)row_f[h]);
@@ -403,7 +533,7 @@ static int part3_wavelet(void) {
 }
 
 /* ================================================================
- * Part 4 -- the source invariants the documentation depends on
+ * Parts 4, 5, 6 -- the source and document invariants
  * ================================================================ */
 
 static char* read_file(const char* path) {
@@ -445,14 +575,7 @@ static int contains(const char* hay, const char* needle) {
     return hay && strstr(hay, needle) != NULL;
 }
 
-static int part4_source_invariants(void) {
-    char root[1024];
-    if (find_root(root, sizeof(root)) != 0) {
-        printf("  Part 4  SKIPPED -- could not locate the repository root\n");
-        known_issues++;
-        return 0;
-    }
-
+static void part4_source_invariants(const char* root) {
     char path[1200];
     snprintf(path, sizeof(path), "%s/src/hs_ml_ternary_neon.c", root);
     char* neon = read_file(path);
@@ -463,9 +586,9 @@ static int part4_source_invariants(void) {
 
     if (!neon || !loader) {
         printf("          SKIPPED -- could not read the sources\n");
-        free(neon); free(loader);
         known_issues++;
-        return 0;
+        free(neon); free(loader);
+        return;
     }
 
     /* The decode LUT uses code - 1: 0 -> -1, 1 -> 0, 2 -> +1. */
@@ -506,24 +629,190 @@ static int part4_source_invariants(void) {
            raw_read ? "OK" : "CHANGED");
     check(raw_read, "the I2_S raw loader changed");
 
-    /* The divergent packer: f32_to_ternary_packed() uses 0=0, 1=+1,
-     * 2=-1, which the LUT above decodes as -1, 0, +1. Reported, not
-     * asserted, so this test stays green while the divergence exists and
-     * stops reporting it once the loader is fixed. */
-    int divergent = contains(loader, "uint8_t code = (v > 0.5f) ? 1 : (v < -0.5f) ? 2 : 0;");
-    if (divergent) {
-        printf("          KNOWN ISSUE: f32_to_ternary_packed() still uses the\n");
-        printf("                     opposite code mapping (0=0, 1=+1, 2=-1).\n");
-        printf("                     The LUT reads that as -1, 0, +1 -- every\n");
-        printf("                     F32-model weight decodes wrong.\n");
-        printf("                     See docs/interface/TERNARY_WEIGHT_FORMATS.md\n");
+    /* The divergent packers: both use 0=0, 1=+1, 2=-1, which the LUT
+     * above decodes as -1, 0, +1. Reported, not asserted, so this test
+     * stays green while the divergence exists and stops reporting it once
+     * the loader is fixed. */
+    int div_loader = contains(loader, "uint8_t code = (v > 0.5f) ? 1 : (v < -0.5f) ? 2 : 0;");
+    snprintf(path, sizeof(path), "%s/src/hs_ml_infer.c", root);
+    char* infer = read_file(path);
+    int div_infer = infer && contains(infer, "u8 v = (r == 0) ? 1 : (r == 1) ? 2 : 0;");
+    if (div_loader || div_infer) {
+        printf("          KNOWN ISSUE: divergent code mapping still present:\n");
+        if (div_loader)
+            printf("                     f32_to_ternary_packed() in the loader\n");
+        if (div_infer)
+            printf("                     alloc_ternary() in hs_ml_infer.c\n");
+        printf("                     Both pack 0=0, 1=+1, 2=-1; the LUT reads\n");
+        printf("                     that as -1, 0, +1. See\n");
+        printf("                     docs/interface/TERNARY_WEIGHT_FORMATS.md\n");
         known_issues++;
     } else {
-        printf("          f32_to_ternary_packed() now uses the canonical mapping\n");
+        printf("          no divergent code mapping in the loader or infer\n");
     }
+    free(infer);
 
     free(neon); free(loader);
-    return 0;
+}
+
+static void part5_upstream_invariants(const char* root) {
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/experimental/BitNet/src/ggml-bitnet-mad.cpp", root);
+    char* up = read_file(path);
+
+    printf("  Part 5  upstream layout rules, read from the vendored source\n");
+
+    if (!up) {
+        printf("          SKIPPED -- could not read the vendored upstream source\n");
+        known_issues++;
+        return;
+    }
+
+    /* ARM: 64-weight blocks, 16 bytes, group_idx = j / 16. */
+    int arm = contains(up, "int group_idx = j / 16;") &&
+              contains(up, "int group_pos = j % 16;") &&
+              contains(up, "i2_weight[i * 16 + group_pos] |= temp;");
+    printf("          ARM layout: group j/16, byte i*16+group_pos   %s\n",
+           arm ? "OK" : "CHANGED");
+    check(arm, "the upstream ARM layout rule changed");
+
+    /* x86 with ACT_PARALLEL: 128-weight blocks, 32 bytes, group_idx = j / 32. */
+    int x86 = contains(up, "int group_idx = j / 32;") &&
+              contains(up, "int group_pos = j % 32;") &&
+              contains(up, "i2_weight[i * 32 + group_pos] |= temp;");
+    printf("          x86 layout: group j/32, byte i*32+group_pos   %s\n",
+           x86 ? "OK" : "CHANGED");
+    check(x86, "the upstream x86 layout rule changed");
+
+    /* x86 without ACT_PARALLEL: four rows interleaved into one byte. */
+    int one_x_four = contains(up, "uint8_t packed = (uint8_t)((q0 << 6) | (q1 << 4) | (q2 << 2) | (q3 << 0));");
+    printf("          1x4 layout: 4 rows interleaved per byte       %s\n",
+           one_x_four ? "OK" : "CHANGED");
+    check(one_x_four, "the upstream 1x4 layout rule changed");
+
+    /* The block sizes that follow from those rules. */
+    int qk = contains(up, "#define QK_I2_S 128") &&
+             contains(up, "#define QK_I2_S 64");
+    printf("          block sizes: QK_I2_S 128 (x86) and 64 (ARM)  %s\n",
+           qk ? "OK" : "CHANGED");
+    check(qk, "the upstream block size definitions changed");
+
+    /* The shift is what puts the most significant field first; without it
+     * the group rules alone would not pin the bit order. */
+    int shift = contains(up, "<< (6 - 2 * group_idx)");
+    printf("          field shift: code << (6 - 2*group_idx)        %s\n",
+           shift ? "OK" : "CHANGED");
+    check(shift, "the upstream field shift changed");
+
+    free(up);
+}
+
+/* Measure, for each layout, which weight each bit-field of a byte holds.
+ * This is what the document's table has to say. */
+static void measure_field_offsets(int* ne_off, int* arm_off, int* x86_off) {
+    const int K = 2560;
+    u8* codes = (u8*)malloc(K);
+    u8* bytes = (u8*)malloc(K / 4);
+
+    for (int field = 0; field < 4; field++) {
+        /* NeoGPU: 4 consecutive weights per byte, low bits first. */
+        for (int i = 0; i < K; i++) codes[i] = 0;
+        for (int w = 0; w < 4; w++) {
+            codes[w] = 2;
+            pack_neogpu(codes, K, bytes);
+            if (((bytes[0] >> (2 * field)) & 3) == 2) { ne_off[field] = w; break; }
+        }
+        /* upstream ARM: 64-weight block, 16 bytes. */
+        for (int w = 0; w < 64; w++) {
+            for (int i = 0; i < K; i++) codes[i] = 0;
+            codes[w] = 2;
+            pack_up_arm(codes, K, bytes);
+            if (((bytes[0] >> (2 * field)) & 3) == 2) { arm_off[field] = w; break; }
+        }
+        /* upstream x86: 128-weight block, 32 bytes. */
+        for (int w = 0; w < 128; w++) {
+            for (int i = 0; i < K; i++) codes[i] = 0;
+            codes[w] = 2;
+            pack_up_x86(codes, K, bytes);
+            if (((bytes[0] >> (2 * field)) & 3) == 2) { x86_off[field] = w; break; }
+        }
+    }
+    free(codes); free(bytes);
+}
+
+/* Measure which ROW of a 4-row group each bit-field of byte (group 0,
+ * column 0) holds in the upstream 1x4 layout. */
+static void measure_1x4_rows(int* row_of_field) {
+    const int K = 2560;
+    const int ROWS = 16;
+    u8* codes = (u8*)malloc((size_t)ROWS * K);
+    u8* bytes = (u8*)malloc((size_t)ROWS * K / 4);
+    for (int field = 0; field < 4; field++) {
+        row_of_field[field] = -1;
+        for (int r = 0; r < 4; r++) {
+            for (int i = 0; i < ROWS * K; i++) codes[i] = 0;
+            codes[r * K] = 2;                  /* row r, column 0 */
+            pack_up_1x4(codes, ROWS, K, bytes);
+            if (((bytes[0] >> (2 * field)) & 3) == 2) { row_of_field[field] = r; break; }
+        }
+    }
+    free(codes); free(bytes);
+}
+
+static void part6_document_table(const char* root) {
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/docs/interface/TERNARY_WEIGHT_FORMATS.md", root);
+    char* doc = read_file(path);
+
+    printf("  Part 6  the document's layout table matches what the code does\n");
+
+    if (!doc) {
+        printf("          SKIPPED -- could not read the document\n");
+        known_issues++;
+        return;
+    }
+
+    int ne_off[4], arm_off[4], x86_off[4];
+    measure_field_offsets(ne_off, arm_off, x86_off);
+
+    const char* field_name[4] = { "bits[1:0]", "bits[3:2]", "bits[5:4]", "bits[7:6]" };
+
+    for (int f = 0; f < 4; f++) {
+        char row[256];
+        /* NeoGPU has no block: b is the byte index within the row and the
+         * four weights of a byte are consecutive. The upstream layouts
+         * have blocks: b is the byte index within the block and the four
+         * weights of a byte are strided. */
+        char ne_cell[32], arm_cell[32], x86_cell[32];
+        snprintf(ne_cell, sizeof(ne_cell), "weight 4b+%d", ne_off[f]);
+        /* An offset of zero is written "weight b", not "weight 0+b". */
+        if (arm_off[f] == 0) snprintf(arm_cell, sizeof(arm_cell), "weight b");
+        else                snprintf(arm_cell, sizeof(arm_cell), "weight %d+b", arm_off[f]);
+        if (x86_off[f] == 0) snprintf(x86_cell, sizeof(x86_cell), "weight b");
+        else                snprintf(x86_cell, sizeof(x86_cell), "weight %d+b", x86_off[f]);
+        snprintf(row, sizeof(row), "| `%s` | %s | %s | %s |",
+                 field_name[f], ne_cell, arm_cell, x86_cell);
+        int ok = contains(doc, row);
+        printf("          %-12s -> NeoGPU %d, ARM %d, x86 %d   %s\n",
+               field_name[f], ne_off[f], arm_off[f], x86_off[f], ok ? "OK" : "DOC WRONG");
+        check(ok, "the document's layout table row is wrong");
+    }
+
+    /* The 1x4 layout has its own table: each field holds a different ROW
+     * rather than a different weight. */
+    int r_of[4];
+    measure_1x4_rows(r_of);
+    for (int f = 0; f < 4; f++) {
+        char row[160];
+        snprintf(row, sizeof(row), "| `%s` | row 4*rg+%d, column col |",
+                 field_name[f], r_of[f]);
+        int ok = contains(doc, row);
+        printf("          %-12s -> 1x4 row %d                 %s\n",
+               field_name[f], r_of[f], ok ? "OK" : "DOC WRONG");
+        check(ok, "the document's 1x4 layout table row is wrong");
+    }
+
+    free(doc);
 }
 
 /* ================================================================ */
@@ -536,7 +825,16 @@ int main(void) {
     part1_production_kernel();
     part2_layouts();
     part3_wavelet();
-    part4_source_invariants();
+
+    char root[1024];
+    if (find_root(root, sizeof(root)) != 0) {
+        printf("\n  Parts 4-6 SKIPPED -- could not locate the repository root\n");
+        known_issues++;
+    } else {
+        part4_source_invariants(root);
+        part5_upstream_invariants(root);
+        part6_document_table(root);
+    }
 
     printf("\n%s\n", checks_failed ? "FAILURES DETECTED" : "DONE");
     if (known_issues)

@@ -35,15 +35,19 @@
  *   calls this same LUT kernel. There is no separate implementation left
  *   to measure, so the number cannot be reproduced.
  *
- *   The GOPS unit is ambiguous as well, because this repository uses two
- *   conventions:
- *     tests/bench_proj.c     1 op per MAC
- *     tests/profile_step.c   2 ops per MAC (2*N*K)
- *   The figures above do not record which was used. The LUT line's 650.9M
- *   ops matches 2*V*H = 656.7M -- the profile_step.c count for a single
- *   F16 lm_head pass -- to within 0.9%, but this kernel performs 4*V*H
- *   MACs, so the published GOPS does not describe the work it actually
- *   does under either convention. Recompute before quoting it.
+ *   The GOPS unit is ambiguous as well, because this repository does not
+ *   use one convention. Two ops-per-MAC schemes are in use:
+ *     1 op per MAC : tests/bench_proj.c, tests/test_ml_ternary.c,
+ *                     tests/test_ml_msg.c
+ *     2 ops per MAC: tests/profile_step.c, tests/bench_sizes.c,
+ *                     tests/bench_stable.c
+ *   and the XNOR+popcount path in tests/test_binary.c counts bit
+ *   operations, which is a third unit again. The figures above do not
+ *   record which was used. The LUT line's 650.9M ops matches 2*V*H =
+ *   656.7M -- the profile_step.c count for a single F16 lm_head pass --
+ *   to within 0.9%, but this kernel performs 4*V*H MACs, so the published
+ *   GOPS does not describe the work it actually does under either
+ *   convention. Recompute before quoting it.
  *
  *   No benchmark in this repository TIMES this kernel. The lm_head
  *   timings that do exist are tests/profile_step.c (F16 lm_head only, not

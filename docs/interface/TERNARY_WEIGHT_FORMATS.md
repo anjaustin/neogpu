@@ -29,71 +29,77 @@ A ternary weight is stored as a 2-bit code. NeoGPU's canonical mapping is
 
 This is the mapping used by the decode LUT in `src/hs_ml_ternary_neon.c`
 (`build_lut`), by the 8-plane encoder in `src/hs_ml_loader_ternary.c`
-(`hs_mlt_lmhead_encode`), by the `hs_ml_mt11.c` kernels, and by the
-archived `hs_ml_ternary_f32.c`.
+(`hs_mlt_lmhead_encode`), by the `hs_ml_mt11.c` kernels, by the GPU GEMM
+shaders in `src/hs_ml_gpu_gemm.c`, by the coprocessor shaders in
+`src/hs_ml_ternary_coproc.c`, by the archived `hs_ml_ternary_f32.c`, and
+by the repository's own converter `tools/convert_bitnet_to_gguf.py`.
 
 Note that the LUT's arithmetic is `(code) - 1`, so a code of 3 decodes to
 +2 — outside the ternary range. No NeoGPU-produced data contains code 3,
 and upstream's `quantize_i2_s` emits only 0, 1 and 2, so it does not
 arise in practice.
 
-### 1.1 One place uses a different mapping — and it is wrong
+### 1.1 Two places use a different mapping
 
-`f32_to_ternary_packed()` in `src/hs_ml_loader_ternary.c` packs weights
-using the opposite convention: `00 = 0`, `01 = +1`, `10 = −1`. Its own
+Two packers in this repository do not use the canonical mapping. They pack
+`00 = 0`, `01 = +1`, `10 = −1`, which the decoders above read back as
+−1, 0, +1.
+
+**`f32_to_ternary_packed()`** in `src/hs_ml_loader_ternary.c` packs the
+weights of a model whose tensors are stored as `GGML_TYPE_F32`. Its own
 comment calls this "our internal 2-bit code", but it is not the internal
-code; it is the only place in the repository that disagrees.
+code.
 
-The two are not merely different names for the same thing — they assign
-different weights to the same bits:
-
-| code | `f32_to_ternary_packed` writes | the LUT kernel reads back |
-|------|-------------------------------|---------------------------|
-| 0    | 0                             | −1                        |
-| 1    | +1                            | 0                         |
-| 2    | −1                            | +1                        |
-
-Measured, using both functions taken verbatim from the repository source:
+Measured, using the function taken verbatim from the repository source:
 of a test row `{+0.8, −0.8, +0.2, −0.2, +1.0, −1.0, 0.0, +0.6}`, **8 of 8
 weights decode to the wrong value** — signs inverted, and every zero
-becomes −1.
+becomes −1. This is the more serious of the two, because the weights are
+real.
 
-This affects only models whose tensors are stored as `GGML_TYPE_F32`,
-which the loader packs on the fly. I2_S models bypass this function
-entirely (see §2.3), and no test in the repository exercises the F32
-path. The fix is to make the packer emit the canonical mapping, but that
-is a change to loader behaviour rather than to documentation, so it is
-tracked separately from this document.
+**`alloc_ternary()`** in `src/hs_ml_infer.c` generates the random ternary
+weights used by `hs_mlt_alloc_random()`, the synthetic-model API. Its
+comment says "50% zero, 25% +1, 25% −1", but under the canonical reading
+its output is 25% zero, 25% +1 and 50% −1, with the signs inverted. The
+weights are still random and ternary, so the model is still usable, but
+it is not the distribution that was asked for. `tests/test_ml_infer.c`
+exercises this path.
+
+Neither is used for I2_S models: `load_i2s_raw()` reads the tensor bytes
+verbatim (§2.4). The fix is to make both packers emit the canonical
+mapping, but that is a change to loader behaviour rather than to
+documentation, so it is tracked separately from this document.
 
 ---
 
 ## 2. Bit layouts
 
-Three distinct byte layouts appear in this repository. They are **not**
-interchangeable.
+Four distinct byte layouts appear in this repository — one NeoGPU
+internal, three from upstream BitNet. They are **not** interchangeable.
 
-### 2.1 Side-by-side
+### 2.1 The three per-row layouts
 
 | | NeoGPU internal | upstream BitNet, ARM | upstream BitNet, x86 |
 |---|---|---|---|
-| Where | `hs_ml_ternary_neon.c`, `hs_mlt_lmhead_encode` | `quantize_i2_s`, ARM branch | `quantize_i2_s`, x86 branch |
+| Where | `hs_ml_ternary_neon.c`, `hs_mlt_lmhead_encode`, `tools/convert_bitnet_to_gguf.py` | `quantize_i2_s`, `__ARM_NEON` branch | `quantize_i2_s`, `__AVX__` branch with `ACT_PARALLEL` |
 | Block size | none — one flat row | 64 weights | 128 weights |
 | Bytes per block | — | 16 | 32 |
 | Weights sharing a byte | 4 **consecutive** | 4, spaced 16 apart | 4, spaced 32 apart |
 | Field order | **low bits first** | **high bits first** | **high bits first** |
-| `bits[1:0]` | weight 4b+3 | weight 16b+3 | weight 32b+3 |
-| `bits[3:2]` | weight 4b+2 | weight 16b+2 | weight 32b+2 |
-| `bits[5:4]` | weight 4b+1 | weight 16b+1 | weight 32b+1 |
-| `bits[7:6]` | weight 4b+0 | weight 16b+0 | weight 32b+0 |
+| `bits[1:0]` | weight 4b+0 | weight 48+b | weight 96+b |
+| `bits[3:2]` | weight 4b+1 | weight 32+b | weight 64+b |
+| `bits[5:4]` | weight 4b+2 | weight 16+b | weight 32+b |
+| `bits[7:6]` | weight 4b+3 | weight b | weight b |
 | Code mapping | 0=−1, 1=0, 2=+1 | same | same |
 
-Here `b` is the byte index within the block.
+For the NeoGPU column, `b` is the byte index within the row. For the
+upstream columns, `b` is the byte index within the block, so the block's
+first byte is `b = 0` and holds weights 0, 16 and 32 (ARM) or 0, 32 and
+64 (x86) in its three high fields.
 
-The NeoGPU column is the format the LUT kernel and the 8-plane encoder
-produce and consume. Both upstream columns come from the same function
-in the vendored reference implementation
+The two upstream columns come from the same function in the vendored
+reference implementation
 (`experimental/BitNet/src/ggml-bitnet-mad.cpp`), but the function
-compiles to **two different layouts** depending on the target:
+compiles to **different layouts** depending on the target:
 
 ```c
 #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)
@@ -105,32 +111,84 @@ compiles to **two different layouts** depending on the target:
 
 with the packing loop then using `group_idx = j / 32` (x86) or
 `group_idx = j / 16` (ARM). Both branches write the most significant
-field first. **A GGML file containing I2_S tensors carries a different
-byte order depending on the machine that produced it.**
+field first.
 
 The ARM layout is the one this project targets, and it is the layout
 already used by the repository's own reference decoders
 (`tests/redteam_i2s_neon.c`, `tests/i2s_native_probe.c`).
 
-### 2.2 They are measurably incompatible
+### 2.2 The fourth layout: four rows per byte
 
-Packing a row of random ternary weights with the upstream ARM rule and
-then decoding it with the NeoGPU rule recovers **0.3333** of the
-original weights — exactly the 1/3 you would expect from three-valued
-codes by chance. The upstream x86 layout read with the NeoGPU rule gives
-0.3437. Each layout read with its own rule gives 1.0000.
+Upstream's x86 build has a *second* branch that is not a per-row layout
+at all. When `ACT_PARALLEL` is not defined, `quantize_i2_s` takes the
+`quantize_i2_s_1x4` path, which interleaves **four rows** into every
+byte, column-major within a group of four rows:
 
-Over a 640-byte row the three byte streams differ in 620 (ARM vs x86),
-635 (ARM vs NeoGPU) and 633 (x86 vs NeoGPU) bytes.
+```c
+uint8_t packed = (uint8_t)((q0 << 6) | (q1 << 4) | (q2 << 2) | (q3 << 0));
+```
 
-So the NeoGPU rule extracts **no information at all** from upstream-layout
-bytes. The two must not be mixed.
+`q0`..`q3` are column `col` of rows `r0`..`r3`, and the byte index is
+`rg * n_per_row + col`. So within one byte:
+
+| field | holds |
+|-------|-------|
+| `bits[7:6]` | row 4*rg+0, column col |
+| `bits[5:4]` | row 4*rg+1, column col |
+| `bits[3:2]` | row 4*rg+2, column col |
+| `bits[1:0]` | row 4*rg+3, column col |
+
+The bytes of one row are therefore strided by `n_per_row`, not
+contiguous. A decoder written for a per-row layout cannot read this one
+at all.
+
+Which of the two x86 branches is compiled in depends on
+`ACT_PARALLEL`. The vendored tree defines it — `include/gemm-config.h`
+begins with `#define ACT_PARALLEL` — so the vendored build on x86 uses
+the `j / 32` layout, and on ARM the `j / 16` layout.
+
+### 2.3 They are measurably incompatible
+
+Reading bytes produced by one layout with another's decoder recovers no
+information:
+
+| bytes produced by | read with | agreement | weights recovered at the right index |
+|--------------------|-----------|-----------|--------------------------------------|
+| upstream ARM | upstream ARM | 1.0000 | - |
+| upstream x86 | upstream x86 | 1.0000 | - |
+| NeoGPU | NeoGPU | 1.0000 | - |
+| upstream ARM | NeoGPU | 0.3332 | 0 of 2560 |
+| upstream 1x4 | NeoGPU | 0.3332 | 0 of 2560 |
+| upstream x86 | NeoGPU | 0.3436 | 40 of 2560 |
+
+Chance for three-valued codes is 0.3333.
+
+The x86 row is not quite at chance, and the reason is worth recording.
+The upstream x86 layout has a 32-weight stride against the NeoGPU
+layout's 4, and the two grids coincide on two weights out of every
+128-block. So 2/128 = 1.5625% of the weights are recovered exactly and
+the rest only coincidentally, which predicts
+0.015625 + 0.984375/3 = 0.34375 — what is measured. The ARM and 1x4
+layouts have no such coincidence and land on chance exactly.
+
+The "recovered at the right index" column is measured by perturbation:
+set one weight's code to 2 and every other code to 0, then find which
+decoded index became 2.
+
+The byte streams differ too. Over 2000 random rows of 640 bytes:
+upstream ARM vs upstream x86 differ in 96.3% of bytes, ARM vs NeoGPU in
+98.8%, and x86 vs NeoGPU in 98.6%.
+
+So the NeoGPU rule extracts essentially **no information** from
+upstream-layout bytes: in the one case where any weight survives, it is
+one in 64, surrounded by noise. The two must not be mixed.
 
 `tests/redteam_ternary_formats.c` reproduces these figures, and asserts
-that each layout is self-consistent while every cross-layout pairing
-sits at chance.
+that each layout is self-consistent, that every cross-layout pairing
+sits at chance apart from the x86 coincidence above, and that the x86
+coincidence is exactly two weights per 128-block.
 
-### 2.3 What the loader actually does
+### 2.4 What the loader actually does
 
 `load_i2s_raw()` in `src/hs_ml_loader_ternary.c` reads the raw tensor
 bytes with a single `fread` and returns them unmodified, with the
@@ -209,9 +267,6 @@ measured 1.500000, confirming the bound.
 checks that the source still contains the four encoder lines they depend
 on, so the numbers cannot go stale.
 
-After encoding, the F16 lm_head is freed — the planes replace it — and
-`use_trit_lmhead` is set.
-
 ### 3.3 The two stages
 
 `session_logits_trit()` in `src/hs_ml_infer.c` splits the work by how
@@ -233,9 +288,15 @@ value, with `row_scale` applied again.
 **Output contract** — `logits[v]` is the exact value for the 200
 candidates and `−1e30` for every other vocabulary entry.
 
-Stage 1's approximation is good to 0.0185 in the normalised row, and
-Stage 2 can only change a candidate's logit by at most that much, which
-is why the candidate set is chosen on the Stage 1 value and not refined.
+Stage 2 can change a candidate's logit by at most the residual left
+after Stage 1, that is 0.0185 in the normalised row, or 0.0185 ×
+`row_scale` in absolute terms. A vocabulary entry outside the candidate
+set is therefore not refined at all, and its logit stays at the Stage 1
+value — which is why the candidate set has to be chosen so that no
+excluded entry could overtake an included one. `tests/redteam_lmhead_trit.c`
+checks exactly that against a real model: it requires the top 42 of the
+exact F16 logits to all appear within the 200 trit candidates, and
+requires the top-1 to match exactly.
 
 The ternary lm_head path is **opt-in**: `hs_mlt_load_gguf()` loads the
 lm_head as F16, and `hs_mlt_lmhead_encode()` must be called separately
@@ -256,14 +317,16 @@ replaces, while doing four planes of arithmetic per weight.
 
 ---
 
-## 4. Open question: the layout of `ggml-model-i2_s.gguf`
+## 4. Which layout does a given model file use?
 
 `hs_mlt_load_gguf()` reads I2_S tensors as raw bytes and feeds them to
-the NeoGPU-layout decoder with no reordering. If the model's bytes are in
-the upstream layout, every projection weight is wrong — and, per §2.2,
-wrong in a way that looks like noise rather than an obvious failure.
+the NeoGPU-layout decoder with no reordering. If a model's bytes are in
+one of the upstream layouts, every projection weight is wrong — and, per
+§2.3, wrong in a way that looks like noise rather than an obvious
+failure.
 
-The repository contains two reference decoders that disagree:
+The repository contains reference decoders for two of the layouts, and
+they disagree:
 
 - `tests/redteam_i2s_neon.c` and `tests/i2s_native_probe.c` decode the
   **upstream ARM** layout (`group_idx = j / 16`, `group_pos = j % 16`,
@@ -271,24 +334,63 @@ The repository contains two reference decoders that disagree:
 - `tests/redteam_ternary_v3.c` decodes the **NeoGPU** layout
   (`(byte >> (2*s)) & 3` for weight `4b + s`).
 
-What is not known is which one produced the model file. Two facts make
-this harder than it looks:
+### 4.1 Two different producers, two different layouts
 
-1. Upstream's own converter (`experimental/BitNet/utils/convert-hf-to-gguf-bitnet.py`)
-   emits **only** TL1, TL2, F16 and F32 tensors. It never emits I2_S.
-   So the file was not produced by the vendored converter, and its
-   producer is unidentified.
-2. Even if it was produced by upstream code, which of the two upstream
-   layouts it carries depends on whether the producing machine had AVX or
-   NEON.
+**This repository's own converter** — `tools/convert_bitnet_to_gguf.py` —
+writes GGML type 36 tensors in the **NeoGPU** layout with the canonical
+code mapping. Its header says so, and its packing code
+(`codes[:, b::4] << (b * 2)`, mapping −1→0, 0→1, +1→2) matches. Its
+output is named `models/bitnet-2b4t-i2s.gguf` by default. A file
+produced this way is read correctly by the current loader.
 
-Resolving this needs the model file itself. The plan is to probe it: a
-program that measures the agreement rate between the two bit-fields of
-the same byte and the same field across adjacent bytes, since in the
-upstream ARM layout the four codes of a byte are 16 weights apart while
-in the NeoGPU layout they are consecutive. Running the real model under
-each decode and keeping whichever produces coherent text settles it
-outright.
+**Upstream BitNet's tooling** produces I2_S GGUFs through the C++
+quantizer — `experimental/BitNet/utils/convert-helper-bitnet.py` and
+`experimental/BitNet/utils/quantize_embeddings.py` both
+invoke the `llama-quantize` binary with the type argument `"I2_S"`. That
+quantizer is `quantize_i2_s` in
+`experimental/BitNet/src/ggml-bitnet-mad.cpp`, whose layout is one of
+the three in §2.1 and §2.2 depending on how it was built.
+(`experimental/BitNet/utils/convert-hf-to-gguf-bitnet.py` is not one
+of these: its `ftype_map`
+offers only f32, f16, tl1 and tl2.)
+
+Upstream's own inference script defaults to a model file named
+`models/bitnet_b1_58-3B/ggml-model-i2_s.gguf`, and its embedding
+quantizer writes `ggml-model-i2_s-embed-*.gguf`. **`ggml-model-i2_s.gguf`
+is upstream's naming convention, not this repository's.**
+
+The model the Pi-side tests use is
+`/home/ztflynn/001/neogpu/models/ggml-model-i2_s.gguf` — upstream's
+name. So it is unlikely to have come from this repository's converter,
+and is likely to be in one of upstream's layouts rather than NeoGPU's.
+
+### 4.2 Settling it
+
+Given the file, the layouts are separable by inspection, because they
+place weights into bytes differently:
+
+- In the NeoGPU layout the four codes of a byte are four **consecutive**
+  weights, and the byte stream advances by 4 weights per byte.
+- In the upstream ARM and x86 layouts the four codes of a byte are
+  **strided** (16 or 32 apart), and the codes of one weight are spread
+  across 4 or 8 different bytes.
+- In the 1x4 layout the codes of a byte belong to four **different
+  rows**.
+
+The failure signatures differ, which helps narrow it down. If the file
+were in the upstream ARM or 1x4 layout, every weight would decode to
+noise. If it were in the upstream x86 layout, one weight in 64 would be
+exactly right and the rest would be noise — a subtly wrong model rather
+than an obviously broken one.
+
+The decisive test is behavioural rather than statistical: run the real
+model under each decode and keep the one that produces coherent text.
+`tests/i2s_native_probe.c` already implements the ARM-layout decode for
+exactly this purpose, and `tests/redteam_i2s_neon.c` cross-checks the
+NEON and scalar decoders against each other.
+
+What is not yet known is which layout that particular file carries.
+That needs the file itself.
 
 ---
 
@@ -298,10 +400,12 @@ outright.
 |------|-------|
 | Decode LUT and the fused 4-plane kernel | `src/hs_ml_ternary_neon.c` |
 | Single-plane projection kernel | `src/hs_ml_ternary_neon.c` (`hs_ml_ternary_f32_proj`) |
-| 8-plane encoder, I2_S raw loader | `src/hs_ml_loader_ternary.c` |
-| Two-stage lm_head driver, plane weights | `src/hs_ml_infer.c` (`session_logits_trit`, `lmh_plane_w`) |
+| 8-plane encoder, I2_S raw loader, divergent F32 packer | `src/hs_ml_loader_ternary.c` |
+| Two-stage lm_head driver, plane weights, divergent random generator | `src/hs_ml_infer.c` (`session_logits_trit`, `lmh_plane_w`, `alloc_ternary`) |
 | Plane buffers, `LMH_CANDIDATES`, `use_trit_lmhead` | `include/hs_ml_infer.h` |
-| Upstream I2_S quantiser (both layouts) | `experimental/BitNet/src/ggml-bitnet-mad.cpp` |
-| Upstream converter (no I2_S output) | `experimental/BitNet/utils/convert-hf-to-gguf-bitnet.py` |
+| This repository's GGUF converter (NeoGPU layout) | `tools/convert_bitnet_to_gguf.py` |
+| Upstream I2_S quantiser (all three layouts) | `experimental/BitNet/src/ggml-bitnet-mad.cpp` |
+| Upstream I2_S producers | `experimental/BitNet/utils/convert-helper-bitnet.py`, `experimental/BitNet/utils/quantize_embeddings.py` |
 | Upstream-layout reference decoders | `tests/redteam_i2s_neon.c`, `tests/i2s_native_probe.c` |
 | NeoGPU-layout reference decoder | `tests/redteam_ternary_v3.c` |
+| Real-model lm_head checks (top-42 recall, top-1 match) | `tests/redteam_lmhead_trit.c` |
