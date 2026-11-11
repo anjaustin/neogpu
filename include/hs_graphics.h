@@ -70,8 +70,20 @@ typedef struct {
      * DRM framebuffer (created once per buffer, see hs_graphics_fb_for_bo). */
     struct gbm_bo* scanout_bo;
     struct gbm_bo* pending_bo;
+    /* vsync off: the newest frame presented while a flip was in flight, kept
+     * for the next present that finds the slot free. With it, three buffers
+     * are locked; call hs_graphics_flush_present() before swapping the
+     * surface yourself. */
+    struct gbm_bo* held_bo;
+    EGLSyncKHR     held_sync;         /* GPU completion of held_bo's rendering */
+    /* EGL_KHR_fence_sync; NULL when unsupported (frames then count as unfinished). */
+    PFNEGLCREATESYNCKHRPROC     egl_create_sync;
+    PFNEGLDESTROYSYNCKHRPROC    egl_destroy_sync;
+    PFNEGLCLIENTWAITSYNCKHRPROC egl_client_wait_sync;
     u64            frames_presented;  /* flips (and the takeover) that completed */
-    u64            frames_dropped;    /* vsync off: frame skipped, flip still in flight */
+    u64            frames_dropped;    /* vsync off: replaced by a newer frame before it could be shown */
+    u32            last_flip_sequence; /* vblank counter of the last completed flip */
+    u64            refreshes_repeated; /* refreshes between consecutive flips that kept the old frame */
     u32            present_errors;
     int            last_present_errno;
     const char*    present_error;     /* why presentation is off, or NULL */
@@ -310,6 +322,15 @@ static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height)
     if (!eglMakeCurrent(gfx->egl_display, gfx->egl_surface, gfx->egl_surface, gfx->egl_context)) {
         goto fail;
     }
+
+    const char* display_extensions = eglQueryString(gfx->egl_display, EGL_EXTENSIONS);
+    if (display_extensions && strstr(display_extensions, "EGL_KHR_fence_sync")) {
+        gfx->egl_create_sync = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
+        gfx->egl_destroy_sync = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+        gfx->egl_client_wait_sync = (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
+        if (!gfx->egl_create_sync || !gfx->egl_destroy_sync || !gfx->egl_client_wait_sync)
+            gfx->egl_create_sync = NULL;
+    }
     
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -402,8 +423,12 @@ static inline uint32_t hs_graphics_fb_for_bo(HSGraphics* gfx, struct gbm_bo* bo)
 
 static inline void hs_graphics_flip_done(int fd, unsigned int sequence, unsigned int sec,
                                          unsigned int usec, void* data) {
-    (void)fd; (void)sequence; (void)sec; (void)usec;
-    ((HSGraphics*)data)->flip_pending = false;
+    (void)fd; (void)sec; (void)usec;
+    HSGraphics* gfx = (HSGraphics*)data;
+    if (gfx->last_flip_sequence && sequence - gfx->last_flip_sequence > 1)
+        gfx->refreshes_repeated += sequence - gfx->last_flip_sequence - 1;
+    gfx->last_flip_sequence = sequence;
+    gfx->flip_pending = false;
 }
 
 /* Service DRM events until the queued flip completes or timeout_ms passes
@@ -437,6 +462,47 @@ static inline void hs_graphics_retire_flip(HSGraphics* gfx) {
     gfx->scanout_bo = gfx->pending_bo;
     gfx->pending_bo = NULL;
     gfx->frames_presented++;
+}
+
+/* GPU completion fence for the frame just swapped; EGL_NO_SYNC_KHR without
+ * EGL_KHR_fence_sync. */
+static inline EGLSyncKHR hs_graphics_fence(HSGraphics* gfx) {
+    if (!gfx->egl_create_sync) return EGL_NO_SYNC_KHR;
+    return gfx->egl_create_sync(gfx->egl_display, EGL_SYNC_FENCE_KHR, NULL);
+}
+
+static inline bool hs_graphics_fence_done(HSGraphics* gfx, EGLSyncKHR sync) {
+    if (sync == EGL_NO_SYNC_KHR) return false;
+    return gfx->egl_client_wait_sync(gfx->egl_display, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 0) ==
+           EGL_CONDITION_SATISFIED_KHR;
+}
+
+static inline void hs_graphics_fence_destroy(HSGraphics* gfx, EGLSyncKHR sync) {
+    if (sync != EGL_NO_SYNC_KHR) gfx->egl_destroy_sync(gfx->egl_display, sync);
+}
+
+/* The held frame is replaced without being shown. */
+static inline void hs_graphics_drop_held(HSGraphics* gfx) {
+    if (!gfx->held_bo) return;
+    gbm_surface_release_buffer(gfx->gbm_surface, gfx->held_bo);
+    hs_graphics_fence_destroy(gfx, gfx->held_sync);
+    gfx->held_bo = NULL;
+    gfx->held_sync = EGL_NO_SYNC_KHR;
+    gfx->frames_dropped++;
+}
+
+static inline void hs_graphics_present_failed(HSGraphics* gfx, const char* why);
+
+/* Queue a flip to bo (the flip slot must be free). Releases bo on failure. */
+static inline void hs_graphics_queue_flip(HSGraphics* gfx, struct gbm_bo* bo) {
+    uint32_t fb = hs_graphics_fb_for_bo(gfx, bo);
+    if (!fb || drmModePageFlip(gfx->drm_fd, gfx->display_crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT, gfx) != 0) {
+        hs_graphics_present_failed(gfx, fb ? "drmModePageFlip failed" : "drmModeAddFB failed");
+        gbm_surface_release_buffer(gfx->gbm_surface, bo);
+        return;
+    }
+    gfx->pending_bo = bo;
+    gfx->flip_pending = true;
 }
 
 static inline void hs_graphics_present_failed(HSGraphics* gfx, const char* why) {
@@ -495,11 +561,33 @@ static inline void hs_graphics_takeover(HSGraphics* gfx) {
     gfx->frames_presented++;
 }
 
+/* Wait for a flip in flight and show a held frame (vsync off), so that only
+ * the scanned-out buffer stays locked. Blocks up to about two refreshes.
+ * Call it before swapping this surface with eglSwapBuffers yourself: Mesa's
+ * GBM surfaces have four buffers and a raw swap needs two free ones. */
+static inline void hs_graphics_flush_present(HSGraphics* gfx) {
+    if (!gfx->initialized) return;
+    if (gfx->flip_pending && hs_graphics_wait_flip(gfx, 100)) hs_graphics_retire_flip(gfx);
+    if (!gfx->held_bo) return;
+    struct gbm_bo* bo = gfx->held_bo;
+    hs_graphics_fence_destroy(gfx, gfx->held_sync);
+    gfx->held_bo = NULL;
+    gfx->held_sync = EGL_NO_SYNC_KHR;
+    if (gfx->crtc_active && !gfx->flip_pending) {
+        hs_graphics_queue_flip(gfx, bo);
+        if (gfx->flip_pending && hs_graphics_wait_flip(gfx, 100)) hs_graphics_retire_flip(gfx);
+    } else {
+        gbm_surface_release_buffer(gfx->gbm_surface, bo);
+        gfx->frames_dropped++;
+    }
+}
+
 static inline void hs_graphics_finish(HSGraphics* gfx) {
     if (!gfx->initialized) return;
 
-    /* Let a queued flip land before its buffer is destroyed. */
-    if (gfx->flip_pending && hs_graphics_wait_flip(gfx, 100)) hs_graphics_retire_flip(gfx);
+    /* Let a queued flip land before its buffer is destroyed, and show a
+     * frame still held for the flip slot. */
+    hs_graphics_flush_present(gfx);
     gfx->closing = true; /* framebuffers are released by close() below */
     if (gfx->pending_bo) gbm_surface_release_buffer(gfx->gbm_surface, gfx->pending_bo);
     if (gfx->scanout_bo) gbm_surface_release_buffer(gfx->gbm_surface, gfx->scanout_bo);
@@ -608,10 +696,17 @@ static inline void hs_graphics_clear(HSGraphics* gfx, float r, float g, float b,
 /* Present the frame just rendered.
  *
  * Every frame is put on screen with a page flip of its own buffer:
- *   vsync off (default) - the flip is queued and the call returns at once, so
- *               rendering runs at full speed. If the previous flip has not
- *               completed yet, this frame is not shown (frames_dropped) rather
- *               than shown torn or waited for.
+ *   vsync off (default) - the call never waits, so rendering runs at full
+ *               speed. A flip lands only once the GPU has finished its frame,
+ *               so the frame flipped is the newest one the GPU has finished
+ *               (or, if none has, the older candidate): flipping a frame still
+ *               rendering behind frames that will be dropped would miss the
+ *               next refresh and repeat the old image. While a flip is in
+ *               flight the newest frame is held and flipped at the next
+ *               present that finds the slot free; a held frame replaced by a
+ *               newer one is not shown (frames_dropped). A held frame keeps a
+ *               third buffer locked: call hs_graphics_flush_present() before
+ *               calling eglSwapBuffers on this surface yourself.
  *   vsync on  - the call returns after the flip completes (one frame per
  *               vblank; the scanned-out buffer is never rendered into).
  * Without take_display (offscreen use) the frame is only swapped. */
@@ -640,21 +735,39 @@ static inline void hs_graphics_present(HSGraphics* gfx) {
         hs_graphics_present_failed(gfx, "gbm_surface_lock_front_buffer failed");
         return;
     }
+    if (gfx->vsync) {
+        hs_graphics_drop_held(gfx); /* left from vsync off */
+        if (gfx->flip_pending) { /* the 100 ms wait above timed out */
+            gbm_surface_release_buffer(gfx->gbm_surface, bo);
+            gfx->frames_dropped++;
+            return;
+        }
+        hs_graphics_queue_flip(gfx, bo);
+        if (gfx->flip_pending && hs_graphics_wait_flip(gfx, 100)) hs_graphics_retire_flip(gfx);
+        return;
+    }
+
+    EGLSyncKHR sync = hs_graphics_fence(gfx);
     if (gfx->flip_pending) {
-        /* vsync off and the previous flip is still in flight. */
-        gbm_surface_release_buffer(gfx->gbm_surface, bo);
-        gfx->frames_dropped++;
+        /* Hold the newest frame for the next free flip slot. */
+        hs_graphics_drop_held(gfx);
+        gfx->held_bo = bo;
+        gfx->held_sync = sync;
         return;
     }
-    uint32_t fb = hs_graphics_fb_for_bo(gfx, bo);
-    if (!fb || drmModePageFlip(gfx->drm_fd, gfx->display_crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT, gfx) != 0) {
-        hs_graphics_present_failed(gfx, fb ? "drmModePageFlip failed" : "drmModeAddFB failed");
-        gbm_surface_release_buffer(gfx->gbm_surface, bo);
+    if (gfx->held_bo && !hs_graphics_fence_done(gfx, sync)) {
+        /* This frame is still rendering: flip the older held one, which
+         * finishes first, and hold this one. */
+        struct gbm_bo* show = gfx->held_bo;
+        hs_graphics_fence_destroy(gfx, gfx->held_sync);
+        gfx->held_bo = bo;
+        gfx->held_sync = sync;
+        hs_graphics_queue_flip(gfx, show);
         return;
     }
-    gfx->pending_bo = bo;
-    gfx->flip_pending = true;
-    if (gfx->vsync && hs_graphics_wait_flip(gfx, 100)) hs_graphics_retire_flip(gfx);
+    hs_graphics_drop_held(gfx);
+    hs_graphics_fence_destroy(gfx, sync);
+    hs_graphics_queue_flip(gfx, bo);
 }
 
 /* Compatibility name for hs_graphics_present(). A bare eglSwapBuffers would
@@ -687,6 +800,7 @@ static inline void hs_graphics_finish(HSGraphics* gfx) {
 static inline void hs_graphics_swap_buffers(HSGraphics* gfx) {}
 static inline void hs_graphics_clear(HSGraphics* gfx, float r, float g, float b, float a) {}
 static inline void hs_graphics_present(HSGraphics* gfx) {}
+static inline void hs_graphics_flush_present(HSGraphics* gfx) {}
 static inline bool hs_graphics_texture_disposed(HSGraphics* gfx, u8 slot) { return false; }
 static inline void hs_graphics_dispose_texture(HSGraphics* gfx, u8 slot) {}
 static inline GLuint hs_graphics_get_gl_texture(HSGraphics* gfx, u8 slot) { return 0; }

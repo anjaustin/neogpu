@@ -61,6 +61,7 @@ tests/*.o
 # Presentation verification (explicit names; never globs)
 /tests/scanout_probe
 /tests/test_present_flip
+/tests/test_present_pacing
 /tests/test_text_render
 /tests/test_headless_scalar
 /bench_legacy

@@ -538,3 +538,9 @@ bool hs_backend_gles_capture_ok(const HSBackend* backend) {
     const HSGLESBackend* b = (const HSGLESBackend*)backend->ctx;
     return b->capture_ok && !b->capture_path[0];
 }
+
+void hs_backend_gles_flush_present(HSBackend* backend) {
+    if (!backend || backend->ops != &g_ops || !backend->ctx) return;
+    HSGLESBackend* b = (HSGLESBackend*)backend->ctx;
+    if (b->gfx_ok) hs_graphics_flush_present(&b->gfx);
+}

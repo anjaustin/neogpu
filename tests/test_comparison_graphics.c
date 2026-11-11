@@ -98,12 +98,19 @@ static void setup_raw(void) {
         glBufferData(GL_ARRAY_BUFFER, buffer->length, buffer->data, GL_STATIC_DRAW);
     }
 }
+static bool last_native;
 static void draw(bool native) {
+    bool switched_from_native = last_native && !native;
+    last_native = native;
     if (native) {
         hs_gpu_begin_frame(&gpu);
         REQUIRE(hs_fabric_compose(&fabric, &gpu.render, black));
         hs_gpu_end_frame(&gpu);
     } else {
+        /* The direct path swaps the backend's surface itself: first let the
+         * backend show a frame it holds for the flip slot (only on a switch
+         * from the NeoGPU path, which happens in untimed warm-up frames). */
+        if (switched_from_native) hs_backend_gles_flush_present(gpu.backend);
         glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
         glUseProgram(program);
         glEnableVertexAttribArray(pos_loc);

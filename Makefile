@@ -207,15 +207,19 @@ tests/scanout_probe: tests/scanout_probe.c
 tests/test_present_flip: tests/test_present_flip.c include/hs_graphics.h
 	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
 
+tests/test_present_pacing: tests/test_present_pacing.c include/hs_graphics.h
+	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
+
 tests/test_text_render: tests/test_text_render.c src/hs_text.o include/hs_graphics.h
 	$(CC) $(CFLAGS) $< src/hs_text.o $(LDFLAGS) -o $@
 
 .PHONY: present-hardware
-present-hardware: tests/scanout_probe tests/test_present_flip tests/test_text_render
+present-hardware: tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/test_text_render
 	python3 -E tests/test_present_hardware.py
 	./tests/test_present_flip 60 1 0 idle
 	./tests/test_present_flip 60 1 0 mismatch
 	./tests/test_present_flip 1 1 0 initfail
+	./tests/test_present_pacing 600
 	./tests/test_text_render
 
 tests/test_evdev: tests/test_evdev.c src/hs_input_stream.o
@@ -272,7 +276,7 @@ clean:
 	rm -f tests/test_architecture_sanitize tests/test_architecture_latency_sanitize tests/test_architecture_tsan tests/test_architecture_latency_tsan
 	rm -f tests/test_p0 tests/test_p0_sanitize tests/test_p0_tsan tests/test_headless_sanitize tests/test_headless_tsan tests/*.d tools/*.d *.d
 	rm -f tests/test_evdev
-	rm -f tests/scanout_probe tests/test_present_flip tests/panel_mode_probe tests/test_text_render
+	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/panel_mode_probe tests/test_text_render
 	rm -f bench_legacy tests/test_headless_scalar
 	rm -f tests/test_tool_sanitize tests/test_tool_tsan
 	rm -f $(HS_OBJ) $(HS_DEPS) $(HS_TARGET) tests/*.o tests/test_01_clear tests/test_02_triangle tests/test_03_instancing tests/test_04_blending tests/test_05_cube3d tests/test_06_raycast tests/test_07_message_triangle tests/test_08_raycast_orbit neogpu_tool neogpu_pong neogpu_pong_ai neogpu_capture_demo neogpu_procgame

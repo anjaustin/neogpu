@@ -15,5 +15,9 @@ HSBackend hs_backend_gles_create(void);
 bool hs_backend_gles_capture_next(HSBackend* backend, const char* path);
 /* True once the requested capture has been written successfully. */
 bool hs_backend_gles_capture_ok(const HSBackend* backend);
+/* hs_graphics_flush_present() on the backend's display: show a frame held for
+ * the flip slot and wait for a flip in flight. Call it before swapping the
+ * backend's EGL surface with eglSwapBuffers yourself. */
+void hs_backend_gles_flush_present(HSBackend* backend);
 
 #endif
