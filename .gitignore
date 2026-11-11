@@ -57,3 +57,29 @@ tests/*.o
 /tmp/
 /tmp
 /build/
+
+# Editor / scratch backups
+*.bak
+*~
+*.orig
+
+# Built executables (explicit names; NOT globs, so test/tool *.c sources are
+# never matched -- see AGENTS.md "do not use a pattern that matches both
+# binaries and source"). Add new built binaries here by name.
+/neogpu_procgame
+tests/bench_cpu_gpu_comm
+tests/bench_stable
+tests/bench_v3d_micro
+tests/bench_zero_copy
+tests/check_kernel_scalar
+tests/check_normed
+tests/check_scale
+tests/layer_trace
+tests/profile_step
+tests/profile_step_trit
+tests/redteam_lmhead_trit
+tests/redteam_mt11
+tests/redteam_ternary_v3
+tools/neogpu_bitnet_chat
+tools/neogpu_pix
+tools/neogpu_viz
