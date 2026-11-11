@@ -15,8 +15,13 @@ typedef struct {
     u32    vbo_sizes[16];
     GLint pos_loc;
     GLint color_loc;
-    GLint offset_loc;  /* per-instance vec2 offset; constant (0,0) for plain draws */
-    u8    offset_state; /* HS_GLES_OFFSET_*: what a_offset is known to source */
+    /* Instanced draws with per-instance offsets use their own program, so
+     * plain draws keep a two-attribute shader (an extra constant attribute
+     * costs every draw that rebinds its vertex buffer). */
+    GLuint inst_program;
+    GLint inst_pos_loc;
+    GLint inst_color_loc;
+    GLint offset_loc;  /* a_offset in inst_program */
 
     HSFont font;       /* loaded at init; OP_DRAW_TEXT is a no-op without it */
     bool   font_ok;
@@ -103,6 +108,15 @@ static bool gles_init(void* ctx, HSGpu* gpu) {
     static const char* vs =
         "attribute vec2 a_position;\n"
         "attribute vec3 a_color;\n"
+        "varying vec3 v_color;\n"
+        "void main(){\n"
+        "  gl_Position = vec4(a_position,0.0,1.0);\n"
+        "  v_color = a_color;\n"
+        "}\n";
+
+    static const char* vs_instanced =
+        "attribute vec2 a_position;\n"
+        "attribute vec3 a_color;\n"
         "attribute vec2 a_offset;\n"
         "varying vec3 v_color;\n"
         "void main(){\n"
@@ -122,7 +136,12 @@ static bool gles_init(void* ctx, HSGpu* gpu) {
 
     b->pos_loc = glGetAttribLocation(b->program, "a_position");
     b->color_loc = glGetAttribLocation(b->program, "a_color");
-    b->offset_loc = glGetAttribLocation(b->program, "a_offset");
+
+    b->inst_program = hs_create_program(vs_instanced, fs);
+    if (!b->inst_program) return false;
+    b->inst_pos_loc = glGetAttribLocation(b->inst_program, "a_position");
+    b->inst_color_loc = glGetAttribLocation(b->inst_program, "a_color");
+    b->offset_loc = glGetAttribLocation(b->inst_program, "a_offset");
 
     float verts[] = {
         /* x, y, r, g, b */
@@ -202,6 +221,7 @@ static void gles_shutdown(void* ctx, HSGpu* gpu) {
         if (b->vbos[i]) glDeleteBuffers(1, &b->vbos[i]);
     }
     if (b->program) glDeleteProgram(b->program);
+    if (b->inst_program) glDeleteProgram(b->inst_program);
     if (b->tex_program) glDeleteProgram(b->tex_program);
     if (b->font_ok) hs_font_unload(&b->font);
     if (b->gfx_ok) hs_graphics_finish(&b->gfx);
@@ -271,26 +291,10 @@ static bool gles_capture_ppm(HSGLESBackend* b, const char* path) {
     return ok;
 }
 
-/* a_offset state is only re-specified when it changes: consecutive plain
- * draws share the constant (0,0). Anything outside the draw case (text,
- * texture quads, code between frames) may use the same attribute location,
- * so the state is forgotten around it, and an instanced array is first
- * returned to divisor 0/disabled so it cannot leak into that code. */
-enum { HS_GLES_OFFSET_UNKNOWN = 0, HS_GLES_OFFSET_ZERO, HS_GLES_OFFSET_INSTANCED };
-
-static void gles_offset_forget(HSGLESBackend* b) {
-    if (b->offset_state == HS_GLES_OFFSET_INSTANCED) {
-        glVertexAttribDivisor((GLuint)b->offset_loc, 0);
-        glDisableVertexAttribArray((GLuint)b->offset_loc);
-    }
-    b->offset_state = HS_GLES_OFFSET_UNKNOWN;
-}
-
 static void gles_execute(void* ctx, const HSFrameContext* frame) {
     HSGLESBackend* b = (HSGLESBackend*)ctx;
     if (!b->gfx_ok || !frame || !frame->render) return;
     b->text_line = 0;
-    /* offset_state is UNKNOWN here: zeroed at creation, forgotten at frame end. */
 
     for (u32 i = 0; i < frame->render->count; i++) {
         const HSRenderCmd* c = &frame->render->cmds[i];
@@ -403,42 +407,40 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
                 if (frame->gpu) {
                     cpu_buf = hs_gpu_get_buffer((HSGpu*)frame->gpu, buf_idx);
                 }
-                GLsizei vertices = 3;
-                GLuint vbo = gles_get_vbo_for_buffer(b, cpu_buf, buf_idx, &vertices);
-                glUseProgram(b->program);
-                glBindBuffer(GL_ARRAY_BUFFER, vbo);
-                glEnableVertexAttribArray(b->pos_loc);
-                glVertexAttribPointer(b->pos_loc, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
-                glEnableVertexAttribArray(b->color_loc);
-                glVertexAttribPointer(b->color_loc, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(2 * sizeof(float)));
-
                 /* Per-instance offsets come from the instance bank (2 floats
-                 * per instance) when it holds one for every instance;
-                 * otherwise every instance is drawn at offset (0,0). */
+                 * per instance) when it holds one for every instance; then
+                 * inst_program draws them. Otherwise every instance is drawn
+                 * at offset (0,0) by the plain program. */
                 GLuint instance_vbo = 0;
-                if (instanced && frame->gpu && b->offset_loc >= 0) {
+                if (instanced && frame->gpu && b->inst_program && b->offset_loc >= 0) {
                     u8 inst_idx = c->b & 0xF;
                     HSBuffer* inst = hs_gpu_get_buffer((HSGpu*)frame->gpu, inst_idx);
                     if (inst && inst->data && (u64)inst->length >= (u64)instances * HS_GLES_INSTANCE_BYTES)
                         instance_vbo = gles_upload_bank(b, inst, inst_idx);
                 }
-                if (b->offset_loc >= 0) {
-                    if (instance_vbo) {
-                        glBindBuffer(GL_ARRAY_BUFFER, instance_vbo);
-                        glEnableVertexAttribArray((GLuint)b->offset_loc);
-                        glVertexAttribPointer((GLuint)b->offset_loc, 2, GL_FLOAT, GL_FALSE, HS_GLES_INSTANCE_BYTES, (void*)0);
-                        glVertexAttribDivisor((GLuint)b->offset_loc, 1);
-                        b->offset_state = HS_GLES_OFFSET_INSTANCED;
-                    } else if (b->offset_state != HS_GLES_OFFSET_ZERO) {
-                        if (b->offset_state == HS_GLES_OFFSET_INSTANCED)
-                            glVertexAttribDivisor((GLuint)b->offset_loc, 0);
-                        glDisableVertexAttribArray((GLuint)b->offset_loc);
-                        glVertexAttrib2f((GLuint)b->offset_loc, 0.0f, 0.0f);
-                        b->offset_state = HS_GLES_OFFSET_ZERO;
-                    }
+                GLint pos_loc = instance_vbo ? b->inst_pos_loc : b->pos_loc;
+                GLint color_loc = instance_vbo ? b->inst_color_loc : b->color_loc;
+                GLsizei vertices = 3;
+                GLuint vbo = gles_get_vbo_for_buffer(b, cpu_buf, buf_idx, &vertices);
+                glUseProgram(instance_vbo ? b->inst_program : b->program);
+                glBindBuffer(GL_ARRAY_BUFFER, vbo);
+                glEnableVertexAttribArray(pos_loc);
+                glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+                glEnableVertexAttribArray(color_loc);
+                glVertexAttribPointer(color_loc, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(2 * sizeof(float)));
+                if (instance_vbo) {
+                    glBindBuffer(GL_ARRAY_BUFFER, instance_vbo);
+                    glEnableVertexAttribArray((GLuint)b->offset_loc);
+                    glVertexAttribPointer((GLuint)b->offset_loc, 2, GL_FLOAT, GL_FALSE, HS_GLES_INSTANCE_BYTES, (void*)0);
+                    glVertexAttribDivisor((GLuint)b->offset_loc, 1);
                 }
                 if (instanced) glDrawArraysInstanced(GL_TRIANGLES, 0, vertices, (GLsizei)instances);
                 else glDrawArrays(GL_TRIANGLES, 0, vertices);
+                if (instance_vbo) {
+                    /* Leave no per-instance array for other programs. */
+                    glVertexAttribDivisor((GLuint)b->offset_loc, 0);
+                    glDisableVertexAttribArray((GLuint)b->offset_loc);
+                }
                 break;
             }
 
@@ -464,7 +466,6 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
                 float x = -1.0f + 8.0f * px;
                 float y = 1.0f - 8.0f * py - (float)b->text_line * line;
                 b->text_line++;
-                if (b->offset_loc >= 0) gles_offset_forget(b);
                 /* The text renderer enables alpha blending; keep the frame's own blend state. */
                 GLboolean blend_on = glIsEnabled(GL_BLEND);
                 GLint src = GL_ONE, dst = GL_ZERO;
@@ -479,7 +480,6 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
                 u8 slot = c->a & 0x0F;
                 GLuint tex = hs_graphics_get_gl_texture(&b->gfx, slot);
                 if (!tex) tex = hs_graphics_get_gl_texture(&b->gfx, 0);
-                if (b->offset_loc >= 0) gles_offset_forget(b);
 
                 glUseProgram(b->tex_program);
                 glActiveTexture(GL_TEXTURE0);
@@ -498,7 +498,6 @@ static void gles_execute(void* ctx, const HSFrameContext* frame) {
         }
     }
 
-    if (b->offset_loc >= 0) gles_offset_forget(b);
     if (b->capture_path[0]) {
         b->capture_ok = gles_capture_ppm(b, b->capture_path);
         b->capture_path[0] = 0;
