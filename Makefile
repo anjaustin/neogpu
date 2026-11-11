@@ -16,7 +16,7 @@ HS_OBJ = $(HS_SRC:.c=.o)
 HS_DEPS = $(HS_OBJ:.o=.d)
 HS_TARGET = neogpu_demo
 
-TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast test_07_message_triangle
+TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast test_07_message_triangle test_08_raycast_orbit
 
 .PHONY: build clean run all test run-test build-tests version
 
@@ -61,7 +61,7 @@ neogpu_procgame: tools/neogpu_procgame.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(HS_OBJ) $(HS_DEPS) $(HS_TARGET) tests/*.o tests/test_01_clear tests/test_02_triangle tests/test_03_instancing tests/test_04_blending tests/test_05_cube3d tests/test_06_raycast tests/test_07_message_triangle neogpu_tool neogpu_pong
+	rm -f $(HS_OBJ) $(HS_DEPS) $(HS_TARGET) tests/*.o tests/test_01_clear tests/test_02_triangle tests/test_03_instancing tests/test_04_blending tests/test_05_cube3d tests/test_06_raycast tests/test_07_message_triangle tests/test_08_raycast_orbit neogpu_tool neogpu_pong
 
 run: $(HS_TARGET)
 	./$(HS_TARGET)
@@ -88,6 +88,10 @@ build-tests: $(HS_OBJ)
 	$(STRIP) tests/test_06_raycast
 	$(CC) $(CFLAGS) -c tests/test_07_message_triangle.c -o tests/test_07_message_triangle.o
 	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_07_message_triangle.o $(LDFLAGS) -o tests/test_07_message_triangle
+	$(STRIP) tests/test_07_message_triangle
+	$(CC) $(CFLAGS) -c tests/test_08_raycast_orbit.c -o tests/test_08_raycast_orbit.o
+	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_08_raycast_orbit.o $(LDFLAGS) -o tests/test_08_raycast_orbit
+	$(STRIP) tests/test_08_raycast_orbit
 	$(STRIP) tests/test_07_message_triangle
 
 run-test:
