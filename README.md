@@ -90,8 +90,10 @@ Other verified measurements:
   `test_08_raycast_orbit` **110 FPS**.
 
 Frame rates are uncapped by default: present never waits for the display, so
-they measure what the system can render. The panel shows the newest completed
-page flip at each refresh (60 Hz on the DSI panel) and drops the rest;
+they measure what the system can render. At each refresh (60 Hz on the DSI
+panel) the panel shows the newest frame the GPU has finished, and the rest are
+dropped; `tests/test_present_pacing` checks that a GPU-heavy uncapped frame
+rate still puts a new frame on screen at every refresh;
 `make present-hardware` verifies with an external CRTC probe that presented
 frames really are scanned out. Set `HSGraphics.vsync = true` to pace rendering
 to the display instead.

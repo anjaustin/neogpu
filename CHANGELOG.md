@@ -19,6 +19,20 @@ days. Release headings use the date recorded at the time.
   `tests/scanout_probe`. Rendering stays uncapped by default (frames the panel
   cannot show are dropped, never waited for or torn); `vsync = true` paces to
   the display. Render rates are unchanged: 446 FPS (`test_06`), 110 FPS (`test_08`).
+- **Uncapped rendering stuttered on GPU-heavy scenes.** A flip lands only once
+  the GPU has finished its frame, and the frame flipped was the one just
+  submitted, still rendering behind frames about to be dropped; at ~2 frames
+  per refresh it missed the refresh and the old image repeated
+  (`test_08_raycast_orbit`: a new frame on only 65% of refreshes at 110 FPS).
+  When frames take a quarter refresh or more, present now holds the newest
+  frame while a flip is in flight and then flips the newest finished one
+  (checked with an EGL fence, at most once per refresh): 0 repeated refreshes,
+  render rate unchanged. Faster frames finish in time and keep the old
+  drop-while-in-flight path, so GLES lifecycle CPU cost is unchanged. A held frame keeps a third buffer locked: call the new
+  `hs_graphics_flush_present()` / `hs_backend_gles_flush_present()` before
+  swapping the surface with `eglSwapBuffers` yourself. `finish()` now shows a
+  held last frame instead of dropping it. Checked by `tests/test_present_pacing`
+  (`make present-hardware`).
 - Display takeover now finds a CRTC through `possible_crtcs` when none is
   active, refuses a display whose mode does not match the surface instead of
   failing with `EINVAL` silently, checks `AddFB`/`SetCrtc` results, and a failed
