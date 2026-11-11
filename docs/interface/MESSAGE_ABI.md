@@ -129,8 +129,9 @@ In the table below, "Immediate" means the opcode uses `payload_idx` as its argum
   - Header: `payload_idx = original opcode`, `flags = status`:
     `HS_ACK_OK` (0), `HS_ACK_UNHANDLED` (1, the node does not handle the
     opcode), `HS_ACK_INVALID` (2, the message failed schema validation or
-    decoding; nothing was applied). Nodes validate every message against its
-    opcode schema whether or not `validate_on_send` is enabled.
+    decoding; nothing was applied). Every message from outside the runtime is
+    checked against its opcode schema at routing whether or not
+    `validate_on_send` is enabled (see Validation).
 - `OP_RESULT` (Payload, 0..64B)
   - Header: `cid = request cid`, `from = node producing the result`
   - Payload: opcode-specific small result blob
@@ -252,3 +253,28 @@ rectangle is in top-left-origin pixels and is trimmed to the target.
 - Payload length rules: `none`, `fixed`, or `string/range`.
 - Payload index range checks for payload-bearing ops.
 - Null termination for string payload ops (`OP_DRAW_TEXT`, `OP_ERROR`, `OP_TRACE`).
+
+Where it is applied:
+
+- **At routing, once per message.** The step thread checks each message with
+  the inline `hs_message_conforms()` (same verdicts as
+  `hs_validate_message()`) before it reaches a node inbox, is recorded into
+  the render list, or is captured. A refused message is never delivered; if it
+  asked for an ack (`HS_MSGF_ACK`) the sender gets `HS_ACK_INVALID`
+  immediately, and `HSSystem.rejected_invalid` is incremented. This covers
+  every node, including the system node and the frame/fence opcodes.
+- **Trusted sends skip it.** Messages the runtime builds itself (`hs_gpu_*`
+  helpers with fixed layouts, node acks) are sent with `hs_send_trusted()`.
+  The trusted mark is stored in the queue slot and rewritten on every enqueue;
+  it is not part of `Message`, so callers cannot set it. `hs_send`,
+  `hs_send_with_payload`, `hs_try_send`, `hs_gpu_send_with_payload`, IPC and
+  capture replay are always untrusted. Sanitizer builds define
+  `HS_VERIFY_TRUSTED`, which aborts if a trusted message fails the check.
+- **Replay** checks every message; a non-conforming one is refused and replay
+  continues, unless `validate_on_send` is set or its destination is not
+  registered, in which case replay fails.
+- **`validate_on_send`** additionally checks trusted messages and makes
+  refusals report `HS_ERR_VALIDATE` with the reason from
+  `hs_validate_message()`.
+- Nodes still return `HS_ACK_INVALID` when a conforming payload fails to
+  decode.

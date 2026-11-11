@@ -27,9 +27,18 @@ days. Release headings use the date recorded at the time.
   channel draining; on RT one IPC request froze all IPC. Budgets must be >= 1.
 - The MPMC submit ring spun forever at the u32 position wrap (sign lost in an
   `intptr_t` difference).
-- Malformed messages were acknowledged as success. Nodes now validate every
-  message against its opcode schema and NACK with `HS_ACK_INVALID`; input
-  opcodes, which had no schema entry, are accepted under validation.
+- Malformed messages were acknowledged as success. Every message from outside
+  the runtime is now checked against its opcode schema once, at routing, and
+  refused with `HS_ACK_INVALID` before any node, render recording or capture
+  sees it; input opcodes, which had no schema entry, are accepted under
+  validation. Messages the runtime builds itself use `hs_send_trusted()` and
+  skip the check (sanitizer builds verify them). See `MESSAGE_ABI.md`.
+- `hs_gpu_stencil` / `hs_gpu_stencil_func` sent 8 bytes for a 4-byte schema;
+  once messages were validated they were always refused, so stencil state set
+  through them was never applied.
+- The system node printed `OP_TRACE`/`OP_ERROR` strings unchecked (an
+  unterminated string was read past its end); they are now refused at routing
+  and printed length-bounded.
 - IPC: a late result of a timed-out request could answer the next request
   (server-assigned correlation ids); transient `accept()` errors no longer end
   the service; no-address TCP binds loopback; the Unix socket is 0600 from
@@ -84,6 +93,12 @@ days. Release headings use the date recorded at the time.
   executor's frame total is 465.5 -> 467.6 us, the difference being the
   page flip that now shows every frame; the legacy message path is +1.3% at
   1 draw per scene and -3% at 64 draws (per-message schema check).
+- The legacy-path loss is gone: messages are validated once at routing instead
+  of in every node, and the blocking send's wait loop is out of line. Against
+  the frozen build in the same run, 64 draws per scene went 0.975 -> 1.032
+  (pre-audit 0.999); 1 draw is unchanged. Lifecycle submit is lower in all
+  seven scenes (alternate 396.9 -> 389.3 us); 1-thread message throughput
+  11.9 -> 13.6 M msg/s.
 
 ### Added
 - `make present-hardware` (part of `make test-hardware`): presentation and
