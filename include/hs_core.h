@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <string.h>
 #include "hs_neonCompat.h" /* <arm_neon.h> on aarch64 */
 
@@ -121,6 +122,8 @@ typedef struct {
     atomic_uint seq;
     Message msg;
     u32 payload_len;
+    bool trusted;     /* sent with hs_send_trusted(); set on every enqueue. Kept in
+                       * the first cache line, which every message touches. */
     u8 payload[HS_PAYLOAD_SIZE];
 } __attribute__((aligned(64))) HSSubmitSlot;
 
@@ -143,8 +146,14 @@ _Static_assert(sizeof(HSAtomicCacheLine) == 64, "HSAtomicCacheLine is one cache 
 typedef struct {
     Message msg;
     u32 payload_len;
+    bool trusted;     /* sent with hs_send_trusted(); set on every push. Kept in
+                       * the first cache line, which every message touches. */
     u8 payload[HS_PAYLOAD_SIZE];
 } __attribute__((aligned(64))) HSSpscSlot;
+
+_Static_assert(offsetof(HSSpscSlot, trusted) < 64 && offsetof(HSSubmitSlot, trusted) < 64,
+               "the trusted flag shares the message's cache line");
+_Static_assert(sizeof(HSSpscSlot) == 128 && sizeof(HSSubmitSlot) == 128, "slot size unchanged");
 
 typedef struct {
     HSAtomicCacheLine head;
@@ -208,7 +217,7 @@ struct HSSystem {
     u32         log_head;
     u32         log_capacity;
     bool        recording;
-    bool        validate_on_send; /* runtime opt-in validation in hs_send */
+    bool        validate_on_send; /* gate trusted sends too; report refusals as HS_ERR_VALIDATE */
     atomic_bool block_on_full;    /* if true, hs_send waits instead of failing */
     HSRenderList* render_list;
     Payload*    payloads;
@@ -224,6 +233,7 @@ struct HSSystem {
     u32 dropped_queue_full;
     u32 dropped_system_nonrt;
     u32 dropped_result;
+    u32 rejected_invalid; /* untrusted messages refused by the routing schema gate */
 
     /* Capture policy */
     u32 record_mask; /* bitmask of (1u << HSChannel) */
@@ -296,6 +306,16 @@ void hs_register(HSSystem* sys, Node* node);
 bool hs_send(HSSystem* sys, Message* msg);
 /* Bounded admission for external services: never waits for queue space. */
 bool hs_try_send(HSSystem* sys, Message* msg, const void* payload, u32 len);
+/* Schema gate. Every message is checked once, when the step thread routes it
+ * and before any node sees it: a message that fails hs_message_conforms() is
+ * refused (HS_ERR_VALIDATE when validate_on_send is set, otherwise an
+ * HS_ACK_INVALID ack if one was requested) and never reaches a node. Replay
+ * applies the same gate. hs_send_trusted() is for messages the runtime builds
+ * itself (hs_gpu_* helpers, node acks): they conform by construction, so the
+ * gate is skipped for them unless validate_on_send is set. Builds with
+ * HS_VERIFY_TRUSTED (the sanitizer builds) abort if one does not conform.
+ * Blocks like hs_send_with_payload when the system blocks on full queues. */
+bool hs_send_trusted(HSSystem* sys, Message* msg, const void* payload, u32 len);
 u32  hs_step(HSSystem* sys);
 
 /* Wake threads blocked in hs_send when block_on_full is enabled. */

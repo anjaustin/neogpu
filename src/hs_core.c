@@ -47,6 +47,7 @@ typedef enum {
 } HSErrorStage;
 
 static HSChannel hs_default_channel_for_op(OpCode op);
+static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u32 len, bool trusted);
 
 #define HS_RING_MASK(size) ((size) - 1u)
 
@@ -273,7 +274,7 @@ static void hs_render_record(HSSystem* sys, const Message* msg) {
     (void)hs_render_push(sys->render_list, &cmd);
 }
 
-static bool hs_submit_enqueue(HSSystem* sys, HSChannel ch, const Message* msg, const void* payload, u32 payload_len) {
+static bool hs_submit_enqueue(HSSystem* sys, HSChannel ch, const Message* msg, const void* payload, u32 payload_len, bool trusted) {
     if (!sys || !msg) return false;
 
     /* fast reject invalid destination/op */
@@ -296,6 +297,7 @@ static bool hs_submit_enqueue(HSSystem* sys, HSChannel ch, const Message* msg, c
                 /* claimed */
                 slot->msg = *msg;
                 slot->payload_len = len;
+                slot->trusted = trusted;
                 if (len && payload) memcpy(slot->payload, payload, len);
                 atomic_store_explicit(&slot->seq, pos + 1, memory_order_release);
                 atomic_fetch_add_explicit(&sys->mpsc_ok[(u32)ch], 1, memory_order_relaxed);
@@ -311,8 +313,8 @@ static bool hs_submit_enqueue(HSSystem* sys, HSChannel ch, const Message* msg, c
     }
 }
 
-static bool hs_submit_dequeue(HSSystem* sys, HSChannel ch, Message* out_msg, u8 out_payload[HS_PAYLOAD_SIZE], u32* out_payload_len) {
-    if (!sys || !out_msg || !out_payload_len) return false;
+static bool hs_submit_dequeue(HSSystem* sys, HSChannel ch, Message* out_msg, u8 out_payload[HS_PAYLOAD_SIZE], u32* out_payload_len, bool* out_trusted) {
+    if (!sys || !out_msg || !out_payload_len || !out_trusted) return false;
 
     HSSubmitQueue* q = &sys->submit[(u32)ch];
     u32 pos = atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
@@ -326,6 +328,7 @@ static bool hs_submit_dequeue(HSSystem* sys, HSChannel ch, Message* out_msg, u8 
                     memory_order_relaxed, memory_order_relaxed)) {
                 *out_msg = slot->msg;
                 *out_payload_len = slot->payload_len;
+                *out_trusted = slot->trusted;
                 if (out_payload && slot->payload_len) {
                     memcpy(out_payload, slot->payload, slot->payload_len);
                 }
@@ -341,7 +344,7 @@ static bool hs_submit_dequeue(HSSystem* sys, HSChannel ch, Message* out_msg, u8 
     }
 }
 
-static bool hs_spsc_push(HSSpscQueue* q, const Message* msg, const void* payload, u32 payload_len) {
+static bool hs_spsc_push(HSSpscQueue* q, const Message* msg, const void* payload, u32 payload_len, bool trusted) {
     if (!q || !msg) return false;
     u32 len = payload_len;
     if (len > HS_PAYLOAD_SIZE) len = HS_PAYLOAD_SIZE;
@@ -353,6 +356,7 @@ static bool hs_spsc_push(HSSpscQueue* q, const Message* msg, const void* payload
     HSSpscSlot* s = &q->slots[hs_ring_index(tail, HS_SPSC_SIZE)];
     s->msg = *msg;
     s->payload_len = len;
+    s->trusted = trusted;
     if (len && payload) memcpy(s->payload, payload, len);
     atomic_store_explicit(&q->tail.v, tail + 1, memory_order_release);
     return true;
@@ -392,7 +396,37 @@ static void hs_record_message(HSSystem* sys, const Message* msg) {
     sys->log[sys->log_head++] = *msg;
 }
 
-static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload, u32 payload_len) {
+/* A message refused by the schema gate. With validate_on_send the sender asked
+ * for diagnostics (HS_ERR_VALIDATE with the reason). Otherwise a registered
+ * destination answers HS_ACK_INVALID if an ack was requested, exactly as the
+ * node would have; an unregistered one is a routing error. */
+__attribute__((noinline, cold))
+static void hs_reject_message(HSSystem* sys, const Message* msg, u8 stage) {
+    if (sys->validate_on_send) {
+        const char* err = NULL;
+        (void)hs_validate_message(sys, msg, &err);
+        hs_report_error_ex(sys, msg, HS_ERR_VALIDATE, stage, err ? err : "validate failed");
+        return;
+    }
+    if (!sys->node_map[msg->to]) {
+        hs_report_error_ex(sys, msg, HS_ERR_ROUTE, stage, "invalid destination node");
+        return;
+    }
+    sys->rejected_invalid++;
+    if ((msg->flags & HS_MSGF_ACK) == 0) return;
+    Message ack = {
+        .to = NODE_SYSTEM,
+        .from = msg->to,
+        .op = OP_ACK,
+        .flags = HS_ACK_INVALID,
+        .cid = msg->cid,
+        .payload_idx = (u16)msg->op,
+        .channel = CHAN_RT,
+    };
+    (void)hs_send_enqueue(sys, &ack, NULL, 0, true);
+}
+
+static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload, u32 payload_len, bool trusted) {
     /* Called by the step thread only. */
     if (!sys || !msg) return false;
 
@@ -411,13 +445,19 @@ static bool hs_route_immediate(HSSystem* sys, Message* msg, const void* payload,
         msg->payload_len = copy_len;
     }
 
-    if (sys->validate_on_send) {
-        const char* err = NULL;
-        if (!hs_validate_message(sys, msg, &err)) {
-            hs_report_error_ex(sys, msg, HS_ERR_VALIDATE, HS_ERR_STAGE_SEND, err ? err : "validate failed");
+    if (!trusted || sys->validate_on_send) {
+        if (!hs_message_conforms(sys, msg)) {
+            hs_reject_message(sys, msg, HS_ERR_STAGE_SEND);
             return false;
         }
     }
+#ifdef HS_VERIFY_TRUSTED
+    else if (!hs_message_conforms(sys, msg)) {
+        fprintf(stderr, "hs_send_trusted: op %u to %u len %u does not conform\n",
+                (unsigned)msg->op, (unsigned)msg->to, (unsigned)msg->payload_len);
+        abort();
+    }
+#endif
 
     bool record_this = false;
     {
@@ -678,7 +718,7 @@ bool hs_toolbus_wait(HSSystem* sys, u32 after_seq, u32 cid, u8 result_op, u8* ou
     }
 }
 
-static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u32 len) {
+static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u32 len, bool trusted) {
     if (!sys || !msg) return false;
 
     /* Enforce channel semantics for critical system ops (producer mistakes should not downgrade QoS). */
@@ -713,12 +753,12 @@ static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u3
     }
 
     if (g_tls_in_step == sys) {
-        return hs_route_immediate(sys, msg, payload, len);
+        return hs_route_immediate(sys, msg, payload, len, trusted);
     }
 
     int pid = hs_get_producer_id(sys);
     if (pid >= 0) {
-        if (hs_spsc_push(&sys->producers[(u32)ch][pid], msg, payload, len)) {
+        if (hs_spsc_push(&sys->producers[(u32)ch][pid], msg, payload, len, trusted)) {
             hs_record_spsc_ok(sys, ch, pid);
             return true;
         }
@@ -731,7 +771,7 @@ static bool hs_send_enqueue(HSSystem* sys, Message* msg, const void* payload, u3
         /* fall through to MPSC */
     }
 
-    return hs_submit_enqueue(sys, ch, msg, payload, len);
+    return hs_submit_enqueue(sys, ch, msg, payload, len, trusted);
 }
 
 static HSChannel hs_default_channel_for_op(OpCode op) {
@@ -1000,6 +1040,7 @@ void hs_init(HSSystem* sys, Message* log_buffer, u32 log_capacity, Payload* payl
     sys->dropped_queue_full = 0;
     sys->dropped_system_nonrt = 0;
     sys->dropped_result = 0;
+    sys->rejected_invalid = 0;
 
     /* Capture defaults: record render channel only. */
     sys->record_mask = hs_channel_bit(CHAN_RENDER);
@@ -1215,31 +1256,41 @@ bool hs_capture_read_file(HSCapture* cap, const char* path, Message* msg_buf, Pa
 
 bool hs_try_send(HSSystem* sys, Message* msg, const void* payload, u32 len) {
     if (!sys || !msg || len > HS_PAYLOAD_SIZE || (len && !payload)) return false;
-    return hs_send_enqueue(sys, msg, payload, len);
+    return hs_send_enqueue(sys, msg, payload, len, false);
 }
 
-bool hs_send(HSSystem* sys, Message* msg) {
-    if (!sys || !msg) return false;
+/* Queue full: wait for space if this channel blocks, then retry. Kept out of
+ * line so the common case (first enqueue succeeds) needs no loop set-up. */
+__attribute__((noinline, cold))
+static bool hs_send_wait(HSSystem* sys, Message* msg, const void* data, u32 len, bool trusted) {
     for (;;) {
-        if (hs_send_enqueue(sys, msg, NULL, 0)) return true;
         if (g_tls_in_step == sys) return false; /* consumer cannot wait on itself */
         HSChannel ch = (HSChannel)msg->channel;
         bool block = (ch != CHAN_TELEM) && (sys->block_on_full || (ch < CHAN_COUNT && sys->block_on_full_chan[(u32)ch]));
         if (!block) return false;
         hs_backpressure_wait(sys);
+        if (hs_send_enqueue(sys, msg, data, len, trusted)) return true;
     }
 }
 
-bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len) {
+static inline __attribute__((always_inline))
+bool hs_send_blocking(HSSystem* sys, Message* msg, const void* data, u32 len, bool trusted) {
     if (!sys || !msg) return false;
-    for (;;) {
-        if (hs_send_enqueue(sys, msg, data, len)) return true;
-        if (g_tls_in_step == sys) return false;
-        HSChannel ch = (HSChannel)msg->channel;
-        bool block = (ch != CHAN_TELEM) && (sys->block_on_full || (ch < CHAN_COUNT && sys->block_on_full_chan[(u32)ch]));
-        if (!block) return false;
-        hs_backpressure_wait(sys);
-    }
+    if (__builtin_expect(hs_send_enqueue(sys, msg, data, len, trusted), 1)) return true;
+    return hs_send_wait(sys, msg, data, len, trusted);
+}
+
+bool hs_send(HSSystem* sys, Message* msg) {
+    return hs_send_blocking(sys, msg, NULL, 0, false);
+}
+
+bool hs_send_with_payload(HSSystem* sys, Message* msg, const void* data, u32 len) {
+    return hs_send_blocking(sys, msg, data, len, false);
+}
+
+bool hs_send_trusted(HSSystem* sys, Message* msg, const void* data, u32 len) {
+    if (len > HS_PAYLOAD_SIZE || (len && !data)) return false;
+    return hs_send_blocking(sys, msg, data, len, true);
 }
 
 static inline void hs_submit_note_depth_step(HSSystem* sys, HSChannel ch) {
@@ -1286,7 +1337,7 @@ u32 hs_step(HSSystem* sys) {
 
                 for (u32 i = 0; i < n; i++) {
                     HSSpscSlot* s = &q->slots[hs_ring_index(head + i, HS_SPSC_SIZE)];
-                    (void)hs_route_immediate(sys, &s->msg, s->payload_len ? s->payload : NULL, s->payload_len);
+                    (void)hs_route_immediate(sys, &s->msg, s->payload_len ? s->payload : NULL, s->payload_len, s->trusted);
                 }
 
                 atomic_store_explicit(&q->head.v, head + n, memory_order_release);
@@ -1300,8 +1351,9 @@ u32 hs_step(HSSystem* sys) {
             Message m;
             u8 payload[HS_PAYLOAD_SIZE];
             u32 payload_len = 0;
-            if (!hs_submit_dequeue(sys, ch, &m, payload, &payload_len)) break;
-            (void)hs_route_immediate(sys, &m, payload_len ? payload : NULL, payload_len);
+            bool trusted = false;
+            if (!hs_submit_dequeue(sys, ch, &m, payload, &payload_len, &trusted)) break;
+            (void)hs_route_immediate(sys, &m, payload_len ? payload : NULL, payload_len, trusted);
             used++;
             processed++;
         }
@@ -1319,7 +1371,7 @@ u32 hs_step(HSSystem* sys) {
         while (!mq_empty(&node->outbox)) {
             Message msg;
             mq_pop(&node->outbox, &msg);
-            (void)hs_route_immediate(sys, &msg, NULL, 0);
+            (void)hs_route_immediate(sys, &msg, NULL, 0, true); /* node-built results */
         }
     }
     
@@ -1385,13 +1437,15 @@ static bool hs_replay_source(HSSystem* sys, Message* msgs, u32 count,
         }
         msg.tick = sys->tick;
 
-        if (sys->validate_on_send) {
-            const char* err = NULL;
-            if (!hs_validate_message(sys, &msg, &err)) {
-                hs_report_error_ex(sys, &msg, HS_ERR_VALIDATE, HS_ERR_STAGE_REPLAY, err ? err : "validate failed");
+        /* Captures are external input: the routing schema gate applies. */
+        if (!hs_message_conforms(sys, &msg)) {
+            if (sys->validate_on_send || !sys->node_map[msg.to]) {
+                hs_reject_message(sys, &msg, HS_ERR_STAGE_REPLAY);
                 hs_unlock(sys);
                 return false;
             }
+            hs_reject_message(sys, &msg, HS_ERR_STAGE_REPLAY);
+            continue;
         }
         
         bool found = false;
@@ -1432,6 +1486,7 @@ void hs_clear(HSSystem* sys) {
     sys->dropped_queue_full = 0;
     sys->dropped_system_nonrt = 0;
     sys->dropped_result = 0;
+    sys->rejected_invalid = 0;
 
     /* Reset producer lanes and submit queues (no concurrent producers allowed). */
     atomic_store_explicit(&sys->producer_count, 0, memory_order_relaxed);

@@ -41,20 +41,14 @@ static SystemState* hs_system_state(Node* node) {
     return node ? (SystemState*)node->state : NULL;
 }
 
-/* Schema gate shared by every ack-emitting node: a message whose payload does
- * not match its opcode's spec (length, index, string termination) is rejected
- * before any state changes, and acknowledged as HS_ACK_INVALID. This holds
- * whether or not the sender enabled validate_on_send. */
+/* Every message a node pops has passed the schema gate in routing (see
+ * hs_send_trusted in hs_core.h): opcode, destination, payload length, index and
+ * string termination conform to the opcode's spec. Nodes still reject payloads
+ * their decoders refuse (bad_payload below) with HS_ACK_INVALID. */
 static inline bool hs_f32_bits_finite(f32 value) {
     u32 bits;
     memcpy(&bits, &value, sizeof(bits));
     return (bits & 0x7F800000u) != 0x7F800000u;
-}
-
-static bool node_message_valid(Node* node, const Message* msg) {
-    HSSystem* sys = hs_node_system(node);
-    if (!sys) return msg->payload_len == 0;
-    return hs_message_conforms(sys, msg);
 }
 
 static void emit_ack(Node* node, const Message* req, u8 status) {
@@ -72,7 +66,7 @@ static void emit_ack(Node* node, const Message* req, u8 status) {
         .payload_idx = (u16)req->op,
         .payload_len = 0,
     };
-    (void)hs_send(sys, &ack);
+    (void)hs_send_trusted(sys, &ack, NULL, 0);
 }
 
 static void emit_result(Node* node, const Message* req, u8 result_op, const void* payload, u32 payload_len) {
@@ -145,9 +139,7 @@ int shader_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
-        const u8 original_op = msg.op;
-        bool bad_payload = !node_message_valid(node, &msg);
-        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
+        bool bad_payload = false;
         switch (msg.op) {
             case OP_SET_SHADER:
                 state->current_shader = msg.payload_idx;
@@ -291,7 +283,6 @@ int shader_node_process(Node* node) {
                 break;
         }
         if (bad_payload) {
-            msg.op = original_op;
             emit_ack(node, &msg, HS_ACK_INVALID);
         } else {
             emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);
@@ -323,9 +314,7 @@ int buffer_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
-        const u8 original_op = msg.op;
-        bool bad_payload = !node_message_valid(node, &msg);
-        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
+        bool bad_payload = false;
         switch (msg.op) {
             case OP_LOAD_BUFFER:
                 state->buffer_handles[msg.payload_idx & 0xF] = msg.payload_idx;
@@ -362,7 +351,6 @@ int buffer_node_process(Node* node) {
                 break;
         }
         if (bad_payload) {
-            msg.op = original_op;
             emit_ack(node, &msg, HS_ACK_INVALID);
         } else {
             emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);
@@ -394,9 +382,7 @@ int texture_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
-        const u8 original_op = msg.op;
-        bool bad_payload = !node_message_valid(node, &msg);
-        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
+        bool bad_payload = false;
         switch (msg.op) {
             case OP_LOAD_TEXTURE:
                 state->texture_handles[msg.payload_idx & 0xF] = msg.payload_idx;
@@ -446,7 +432,6 @@ int texture_node_process(Node* node) {
                 break;
         }
         if (bad_payload) {
-            msg.op = original_op;
             emit_ack(node, &msg, HS_ACK_INVALID);
         } else {
             emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);
@@ -485,9 +470,7 @@ int output_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
-        const u8 original_op = msg.op;
-        bool bad_payload = !node_message_valid(node, &msg);
-        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
+        bool bad_payload = false;
         switch (msg.op) {
             case OP_CLEAR: {
                 void* data = get_payload(node, msg.payload_idx);
@@ -521,7 +504,6 @@ int output_node_process(Node* node) {
                 break;
         }
         if (bad_payload) {
-            msg.op = original_op;
             emit_ack(node, &msg, HS_ACK_INVALID);
         } else {
             emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);
@@ -553,9 +535,7 @@ int sound_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
-        const u8 original_op = msg.op;
-        bool bad_payload = !node_message_valid(node, &msg);
-        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
+        bool bad_payload = false;
         switch (msg.op) {
             case OP_SET_CHANNEL: {
                 void* data = get_payload(node, msg.payload_idx);
@@ -576,7 +556,6 @@ int sound_node_process(Node* node) {
                 break;
         }
         if (bad_payload) {
-            msg.op = original_op;
             emit_ack(node, &msg, HS_ACK_INVALID);
         } else {
             emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);
@@ -673,13 +652,13 @@ int system_node_process(Node* node) {
 
             case OP_ERROR: {
                 void* data = get_payload(node, msg.payload_idx);
-                if (data) fprintf(stderr, "[ERROR] %s\n", (char*)data);
+                if (data) fprintf(stderr, "[ERROR] %.*s\n", (int)msg.payload_len, (char*)data);
                 break;
             }
 
             case OP_TRACE: {
                 void* data = get_payload(node, msg.payload_idx);
-                if (data) printf("[TRACE] %s\n", (char*)data);
+                if (data) printf("[TRACE] %.*s\n", (int)msg.payload_len, (char*)data);
                 break;
             }
 
@@ -832,9 +811,7 @@ int input_node_process(Node* node) {
 
     while (mq_pop(&node->inbox, &msg)) {
         u8 handled = 1;
-        const u8 original_op = msg.op;
-        bool bad_payload = !node_message_valid(node, &msg);
-        if (bad_payload) msg.op = OP_COUNT; /* skip every handler below */
+        bool bad_payload = false;
         switch (msg.op) {
             case OP_INPUT_KEY: {
                 void* data = get_payload(node, msg.payload_idx);
@@ -890,7 +867,6 @@ int input_node_process(Node* node) {
                 break;
         }
         if (bad_payload) {
-            msg.op = original_op;
             emit_ack(node, &msg, HS_ACK_INVALID);
         } else {
             emit_ack(node, &msg, handled ? HS_ACK_OK : HS_ACK_UNHANDLED);

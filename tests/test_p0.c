@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -489,7 +490,7 @@ static void test_budget_floor(void) {
     CHECK(gpu.system.chan_budget[CHAN_RT] == 64);
 }
 
-/* Nodes use the inline hs_message_conforms(); it must give exactly the
+/* Routing uses the inline hs_message_conforms(); it must give exactly the
  * verdict of hs_validate_message() for every opcode, destination, length,
  * payload index and string terminator. */
 static void test_conforms_matches_validate(void) {
@@ -521,6 +522,238 @@ static void test_conforms_matches_validate(void) {
     CHECK(mismatches == 0);
     CHECK(accepted > 0 && rejected > 0);
     CHECK(!hs_message_conforms(NULL, &(Message){0}) && !hs_message_conforms(sys, NULL));
+}
+
+/* The schema gate sits in routing: nodes no longer check, so every message
+ * a node pops must conform. Each GPU node's process function is wrapped to
+ * check its whole inbox before the node runs. */
+static NodeProcessFn gate_inner[256];
+static u32 gate_seen, gate_nonconforming;
+
+static int gate_check(Node* node) {
+    const MessageQueue* q = &node->inbox;
+    for (u32 k = 0; k < q->count; k++) {
+        gate_seen++;
+        gate_nonconforming += !hs_message_conforms(node->sys, &q->msgs[(q->head + k) % HS_QUEUE_SIZE]);
+    }
+    return gate_inner[node->id](node);
+}
+
+static void gate_install(void) {
+    Node* nodes[] = {&gpu.shader_node, &gpu.buffer_node, &gpu.texture_node,
+                     &gpu.output_node, &gpu.sound_node, &gpu.system_node};
+    for (u32 i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+        gate_inner[nodes[i]->id] = nodes[i]->process_fn;
+        nodes[i]->process_fn = gate_check;
+    }
+    gate_seen = gate_nonconforming = 0;
+}
+
+static u32 gate_rng = 0x2545F491u;
+static u32 gate_rand(void) {
+    gate_rng = gate_rng * 1664525u + 1013904223u;
+    return gate_rng >> 8;
+}
+
+static void test_gate_at_routing(void) {
+    /* 1. Random messages through every untrusted entry point. Ops that
+     * reconfigure the system, end frames or print are left out. */
+    fresh_gpu();
+    gate_install();
+    const u8 to_nodes[] = {NODE_SHADER, NODE_BUFFER, NODE_TEXTURE, NODE_OUTPUT, NODE_SOUND, NODE_SYSTEM};
+    u32 sent = 0;
+    for (u32 i = 0; i < 20000; i++) {
+        u8 op;
+        do {
+            op = (u8)(gate_rand() % (OP_COUNT + 2));
+        } while (op == OP_STOP || op == OP_SET_CHAN_BUDGET || op == OP_SET_BLOCK_POLICY ||
+                 op == OP_SET_RECORD_MASK || op == OP_FRAME_BEGIN || op == OP_FRAME_END ||
+                 op == OP_PRESENT || op == OP_FENCE || op == OP_ERROR || op == OP_TRACE ||
+                 op == OP_ERROR_EX);
+        u32 r = gate_rand();
+        Message m = {.to = (r & 15) ? to_nodes[r % 6] : (u8)(r >> 4), .from = NODE_CPU, .op = op,
+                     .flags = (u8)((gate_rand() & 3) ? (gate_rand() & 0x7F) : HS_MSGF_ACK),
+                     .cid = i + 1000};
+        u8 bytes[HS_PAYLOAD_SIZE];
+        for (u32 b = 0; b < sizeof(bytes); b++) bytes[b] = (u8)gate_rand();
+        u32 len = gate_rand() % (HS_PAYLOAD_SIZE + 1);
+        if (len && (gate_rand() & 1)) bytes[len - 1] = 0;
+        bool ok;
+        switch (i % 3) {
+            case 0: /* references the payload ring directly */
+                m.payload_idx = (u16)(gate_rand() % (gpu.system.payload_capacity + 2));
+                m.payload_len = (gate_rand() & 1) ? len : gate_rand() % 4;
+                if (m.payload_len && m.payload_idx < gpu.system.payload_capacity && m.payload_len <= HS_PAYLOAD_SIZE)
+                    memcpy(gpu.system.payloads[m.payload_idx].data, bytes, m.payload_len);
+                ok = hs_send(&gpu.system, &m);
+                break;
+            case 1: ok = hs_send_with_payload(&gpu.system, &m, bytes, len); break;
+            default: ok = hs_try_send(&gpu.system, &m, bytes, len); break;
+        }
+        sent += ok;
+        if ((i & 31) == 31) hs_step(&gpu.system);
+    }
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    CHECK(sent > 19000);
+    CHECK(gate_nonconforming == 0);
+    CHECK(gate_seen > 1000 && gpu.system.rejected_invalid > 1000);
+    printf("Routing gate fuzz: %u sent, %u reached nodes, %u refused\n",
+           sent, gate_seen, gpu.system.rejected_invalid);
+
+    /* 2. Every hs_gpu_* helper sends trusted, conforming messages (HS_VERIFY_TRUSTED
+     * builds abort otherwise). */
+    fresh_gpu();
+    gate_install();
+    char long_text[300];
+    memset(long_text, 'a', sizeof(long_text) - 1);
+    long_text[sizeof(long_text) - 1] = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        gpu.system.validate_on_send = pass == 1; /* gate trusted sends too */
+        hs_gpu_set_shader(&gpu, 1);
+        hs_gpu_set_param(&gpu, 2, v4_make(1, 2, 3, 4));
+        hs_gpu_set_global(&gpu, 1, m4_identity());
+        hs_gpu_set_camera(&gpu, m4_identity());
+        hs_gpu_cull(&gpu, 1);
+        hs_gpu_blend(&gpu, 1, 2);
+        hs_gpu_alpha(&gpu, true);
+        hs_gpu_depth(&gpu, true);
+        hs_gpu_color_mask(&gpu, 0xF);
+        hs_gpu_clip(&gpu, 1, 2, 3, 4);
+        hs_gpu_stencil(&gpu, 1, 3, 4, 1);
+        hs_gpu_stencil_func(&gpu, 5, 6, 0x7F, 0x3F);
+        hs_gpu_depth_compare(&gpu, 1, true);
+        hs_gpu_load_buffer(&gpu, 0);
+        hs_gpu_draw(&gpu, 0);
+        hs_gpu_draw_instance(&gpu, 0, 1, 3);
+        hs_gpu_draw_text(&gpu, "gate");
+        hs_gpu_draw_text(&gpu, "");
+        hs_gpu_draw_text(&gpu, long_text);
+        hs_gpu_load_texture(&gpu, 0);
+        hs_gpu_set_target(&gpu, 0, 0);
+        hs_gpu_show_texture(&gpu, 0);
+        hs_gpu_texture_filter(&gpu, 0, true);
+        hs_gpu_texture_wrap(&gpu, 0, true);
+        hs_gpu_clear(&gpu, v4_make(0, 0, 0, 1));
+        hs_gpu_clear_ds(&gpu, 1.0f, 0);
+        hs_gpu_set_channel(&gpu, 0, 1);
+        hs_gpu_trace(&gpu, "routing gate: helper trace");
+        hs_gpu_frame_begin(&gpu);
+        hs_gpu_frame_end(&gpu);
+        hs_gpu_present(&gpu);
+        CHECK(hs_gpu_fence(&gpu, CHAN_RENDER, 77));
+        hs_gpu_stop(&gpu);
+        hs_step(&gpu.system);
+        hs_step(&gpu.system);
+    }
+    gpu.system.validate_on_send = false;
+    CHECK(gate_nonconforming == 0 && gate_seen >= 2 * 28);
+    CHECK(gpu.system.rejected_invalid == 0 && gpu.system.dropped_error_ex == 0);
+    SystemState* st = &gpu.system_state_data;
+    CHECK(st->error_count == 0);
+    /* Both stencil helpers sent 8 bytes for a 4-byte schema, so the node
+     * gate refused them and they never applied. */
+    CHECK(gpu.shader_state.stencil_op == 1 && gpu.shader_state.stencil_fail == 3 &&
+          gpu.shader_state.stencil_pass == 4 && gpu.shader_state.stencil_front == 1);
+    CHECK(gpu.shader_state.stencil_compare == 5 && gpu.shader_state.stencil_ref == 6 &&
+          gpu.shader_state.stencil_read_mask == 0x7F && gpu.shader_state.stencil_write_mask == 0x3F);
+
+    /* 3. The trusted mark lives in the queue slot and is rewritten on every
+     * enqueue: fill the producer lane and the submit ring with trusted
+     * messages, then reuse every slot for malformed untrusted ones. */
+    fresh_gpu();
+    gate_install();
+    const u32 slots = HS_SPSC_SIZE + HS_SUBMIT_SIZE;
+    u32 queued = 0;
+    for (u32 i = 0; i < slots; i++) {
+        Message ok_msg = {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_SET_SHADER, .payload_idx = (u16)(i & 0xFF)};
+        queued += hs_send_trusted(&gpu.system, &ok_msg, NULL, 0);
+    }
+    CHECK(queued == slots);
+    CHECK(atomic_load(&gpu.system.mpsc_ok[CHAN_RENDER]) == HS_SUBMIT_SIZE);
+    hs_step(&gpu.system);
+    queued = 0;
+    for (u32 i = 0; i < slots; i++) {
+        Message bad = {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_SET_SHADER, .payload_len = 1};
+        queued += hs_send(&gpu.system, &bad);
+    }
+    CHECK(queued == slots);
+    hs_step(&gpu.system);
+    CHECK(gate_nonconforming == 0 && gpu.system.rejected_invalid == slots);
+
+#ifndef HS_VERIFY_TRUSTED
+    /* Trusted sends really skip the gate (that is the saving): a
+     * non-conforming trusted message reaches the node, through the producer
+     * lane and through the submit ring. HS_VERIFY_TRUSTED builds abort (6). */
+    fresh_gpu();
+    gate_install();
+    queued = 0;
+    for (u32 i = 0; i < HS_SPSC_SIZE + 1; i++) {
+        Message bad = {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_SET_SHADER, .payload_len = 1};
+        queued += hs_send_trusted(&gpu.system, &bad, NULL, 0);
+    }
+    CHECK(queued == HS_SPSC_SIZE + 1 && atomic_load(&gpu.system.mpsc_ok[CHAN_RENDER]) == 1);
+    hs_step(&gpu.system);
+    CHECK(gate_nonconforming == HS_SPSC_SIZE + 1 && gpu.system.rejected_invalid == 0);
+#endif
+
+    /* 4. The system node used to print OP_TRACE/OP_ERROR strings without any
+     * check: an unterminated string is now refused before it is read. */
+    fresh_gpu();
+    gate_install();
+    st = &gpu.system_state_data;
+    const u8 unterminated[5] = {'h', 'e', 'l', 'l', 'o'};
+    Message trace = {.to = NODE_SYSTEM, .from = NODE_CPU, .op = OP_TRACE, .flags = HS_MSGF_ACK, .cid = 21};
+    CHECK(hs_send_with_payload(&gpu.system, &trace, unterminated, sizeof(unterminated)));
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    CHECK(gpu.system.rejected_invalid == 1 && gate_nonconforming == 0);
+    CHECK(st->last_ack_cid == 21 && st->last_ack_status == HS_ACK_INVALID && st->last_ack_op == OP_TRACE);
+
+    /* 5. Replay applies the gate: a malformed message in a capture is
+     * refused (HS_ACK_INVALID) and the rest replays; with validate_on_send
+     * the replay fails instead. */
+    fresh_gpu();
+    gate_install();
+    st = &gpu.system_state_data;
+    ShaderState* shader = &gpu.shader_state;
+    Message msgs[3] = {
+        {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_SET_SHADER, .flags = HS_MSGF_ACK, .cid = 31,
+         .payload_idx = 5, .channel = CHAN_RENDER},
+        {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_CLIP, .flags = HS_MSGF_ACK, .cid = 32,
+         .channel = CHAN_RENDER},
+        {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_SET_SHADER, .flags = HS_MSGF_ACK, .cid = 33,
+         .payload_idx = 6, .channel = CHAN_RENDER},
+    };
+    static Payload capture_payloads[3];
+    HSCapture cap;
+    hs_capture_init(&cap, msgs, capture_payloads, 3);
+    cap.count = 3;
+    u32 acks = st->ack_count;
+    CHECK(hs_capture_replay(&gpu.system, &cap));
+    CHECK(gpu.system.rejected_invalid == 1 && gate_nonconforming == 0 && shader->current_shader == 6);
+    hs_step(&gpu.system);
+    hs_step(&gpu.system);
+    CHECK(st->ack_count == acks + 3 && st->last_ack_cid == 33 && st->last_ack_status == HS_ACK_OK);
+    gpu.system.validate_on_send = true;
+    CHECK(!hs_capture_replay(&gpu.system, &cap));
+    gpu.system.validate_on_send = false;
+
+#ifdef HS_VERIFY_TRUSTED
+    /* 6. A trusted send that does not conform is a runtime bug: abort. */
+    fflush(NULL);
+    pid_t child = fork();
+    if (child == 0) {
+        if (!freopen("/dev/null", "w", stderr)) _exit(3);
+        Message bad = {.to = NODE_SHADER, .from = NODE_CPU, .op = OP_SET_SHADER, .payload_len = 1};
+        (void)hs_send_trusted(&gpu.system, &bad, NULL, 0);
+        hs_step(&gpu.system);
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(child > 0 && waitpid(child, &status, 0) == child);
+    CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+#endif
 }
 
 static void test_invalid_messages_nacked(void) {
@@ -788,6 +1021,7 @@ int main(void) {
     test_submit_ring_wrap();
     test_budget_floor();
     test_conforms_matches_validate();
+    test_gate_at_routing();
     test_invalid_messages_nacked();
     test_storage_names_and_files();
     test_font_glyph_codes();

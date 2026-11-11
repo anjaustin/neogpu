@@ -161,7 +161,7 @@ check-scalar:
 tests/test_p0: tests/test_p0.c $(filter-out src/main.o,$(HS_OBJ))
 	$(CC) $(CFLAGS) tests/test_p0.c $(filter-out src/main.o,$(HS_OBJ)) $(LDFLAGS) -o $@
 
-SAN_FLAGS = -O1 -g -fno-omit-frame-pointer -Iinclude -I/usr/include/libdrm
+SAN_FLAGS = -O1 -g -fno-omit-frame-pointer -DHS_VERIFY_TRUSTED -Iinclude -I/usr/include/libdrm
 LIB_SRC = $(filter-out src/main.c,$(HS_SRC))
 
 sanitize: $(HS_TARGET) gpu-participants-asan gles-state-asan
