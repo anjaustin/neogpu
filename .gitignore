@@ -79,6 +79,7 @@ tests/layer_trace
 tests/profile_step
 tests/profile_step_trit
 tests/redteam_lmhead_trit
+tests/redteam_lmhead_i8_bounds
 tests/redteam_mt11
 tests/redteam_ternary_v3
 tools/neogpu_bitnet_chat

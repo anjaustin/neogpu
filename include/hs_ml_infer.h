@@ -183,9 +183,20 @@ void hs_ml_lmhead_stage1(float *out, const float *in,
                           u32 N, u32 K);
 
 /*
- * Fused 4-plane lm_head Stage 1 kernel — int8 activation path (fastest).
+ * Fused 4-plane lm_head Stage 1 kernel — int8 activation compatibility path.
+ *
  * Pre-quantize hidden to int8 (act_scale = 127/max(|h|)), then call this.
- * Uses vmull_s8 integer multiply — 3.4× faster than F16 baseline.
+ *
+ * This is NOT a separate kernel and is not the fast path. It dequantizes
+ * the int8 activation vector to float32 and delegates to
+ * hs_ml_lmhead_stage1(); it contains no NEON integer arithmetic of its own.
+ * Use hs_ml_lmhead_stage1() directly unless you already hold int8
+ * activations.
+ *
+ * in_i8 must hold K elements — one per hidden dimension, the same length
+ * the float kernel consumes. K must not exceed 4096, the dequantization
+ * scratch capacity; a larger K is rejected and out[] is zeroed.
+ *
  * out[n] = (1/act_scale) * row_scale[n] * sum_{k=0..3} (1/3)^k * dot_i8(in_i8, Pk[n])
  */
 void hs_ml_lmhead_stage1_i8(float *out, const int8_t *in_i8, float act_scale,

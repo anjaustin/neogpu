@@ -21,6 +21,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<KHR/khrplatform.h>`, which ships in `libgl-dev` — not in `libegl-dev`
   or `libgles-dev`. Every external header the build needs was mapped to its
   package and the CI dependency list corrected.
+- **Buffer overrun in `hs_ml_lmhead_stage1_i8()`** (`src/hs_ml_ternary_neon.c`).
+  The int8 activation dequantization loop was bounded by `K * 4` instead of
+  `K`, where `K` is the number of hidden dimensions. With the BitNet b1.58
+  2B-4T hidden size (`K = 2560`) that read 10240 bytes from a caller's
+  2560-byte activation buffer, and wrote 10240 floats into the function's
+  own 4096-float static scratch buffer — a 24 KB overrun that landed on
+  adjacent globals. Confirmed with AddressSanitizer against the real
+  source: `heap-buffer-overflow` on the read, `global-buffer-overflow` on
+  the write. The loop bound is now `K`, the scratch buffer is local rather
+  than shared static, and a `K` beyond the 4096-element capacity is
+  rejected with a diagnostic instead of overrunning memory.
+  Regression test: `tests/redteam_lmhead_i8_bounds.c`, also reachable as
+  `make test-i8-bounds` and run in CI.
+
+### Changed
+- **`hs_ml_lmhead_stage1_i8()` documentation corrected**
+  (`include/hs_ml_infer.h`). The header described the function as "int8
+  activation path (fastest) ... Uses vmull_s8 integer multiply — 3.4×
+  faster than F16 baseline". That described a retired implementation: the
+  function contains no NEON integer arithmetic at all and simply
+  dequantizes to float32 and delegates to `hs_ml_lmhead_stage1()`. The
+  float LUT kernel is the fast path. The formula in the comment was and
+  remains correct; the performance claim was not.
 
 ## [0.2.0] - 2026-11-11
 

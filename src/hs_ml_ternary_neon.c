@@ -25,6 +25,7 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <pthread.h>
 
@@ -320,19 +321,42 @@ void hs_ml_lmhead_stage1(float *out, const float *in,
 
 /* ============================================================
  * Public API — int8 Stage 1 (kept for ABI compatibility, delegates to float)
- * The int8 path is no longer the preferred path; use hs_ml_lmhead_stage1.
- * This stub dequantizes in_i8 back to float and calls the LUT kernel.
+ *
+ * The int8 path is no longer a separate kernel. This entry point
+ * dequantizes the int8 activation vector to float32 and calls the float
+ * LUT kernel. It contains no NEON integer arithmetic of its own; the
+ * float LUT kernel is the fast path.
+ *
+ * The activation vector is K elements long — the same length the float
+ * kernel consumes. It was previously dequantized with a K*4 bound, which
+ * read four times past the caller's buffer and wrote four times past this
+ * function's own scratch buffer, corrupting adjacent globals. See
+ * tests/redteam_lmhead_i8_bounds.c.
  * ============================================================ */
+
+/* Capacity of the dequantization scratch buffer, in float32 elements.
+ * The float kernel consumes K elements, so K must not exceed this. */
+#define LMH_I8_SCRATCH_FLOATS 4096u
 
 void hs_ml_lmhead_stage1_i8(float *out, const int8_t *in_i8, float act_scale,
                               const uint8_t *P0, const uint8_t *P1,
                               const uint8_t *P2, const uint8_t *P3,
                               const uint16_t *row_scale,
                               uint32_t N, uint32_t K) {
-    /* Dequantize to float, then use LUT path */
-    static float scratch[4096];   /* H=2560, stack-safe */
+    if (K > LMH_I8_SCRATCH_FLOATS) {
+        /* Refuse rather than write outside the scratch buffer. */
+        fprintf(stderr, "hs_ml_lmhead_stage1_i8: K=%u exceeds scratch capacity %u\n",
+                K, LMH_I8_SCRATCH_FLOATS);
+        for (uint32_t n = 0; n < N; n++) out[n] = 0.0f;
+        return;
+    }
+
+    /* Dequantize to float, then use LUT path.
+     * Local rather than static: a shared static buffer would race between
+     * concurrent callers. */
+    float scratch[LMH_I8_SCRATCH_FLOATS];
     float inv = 1.0f / act_scale;
-    for (uint32_t i = 0; i < K * 4; i++)
+    for (uint32_t i = 0; i < K; i++)
         scratch[i] = (float)in_i8[i] * inv;
     hs_ml_lmhead_stage1(out, scratch, P0, P1, P2, P3, row_scale, N, K);
 }

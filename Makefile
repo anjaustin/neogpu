@@ -45,7 +45,7 @@ HS_TARGET = neogpu_demo
 
 TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast test_07_message_triangle test_08_raycast_orbit
 
-.PHONY: build clean run all test run-test build-tests version ml
+.PHONY: build clean run all test run-test build-tests version ml test-i8-bounds
 
 all: build build-tests
 
@@ -123,6 +123,7 @@ tool: neogpu_tool
 clean:
 	rm -f $(HS_OBJ) $(HS_DEPS) $(HS_TARGET) tests/*.o tests/test_01_clear tests/test_02_triangle tests/test_03_instancing tests/test_04_blending tests/test_05_cube3d tests/test_06_raycast tests/test_07_message_triangle tests/test_08_raycast_orbit neogpu_tool neogpu_pong neogpu_pong_ai neogpu_pong_llm neogpu_capture_demo neogpu_procgame
 	rm -f tests/test_01 tests/test_02 tests/test_03 tests/test_04 tests/test_05 tests/test_06 tests/test_07 tests/test_08
+	rm -f tests/redteam_lmhead_i8_bounds tests/hs_ml_ternary_neon_asan.o
 	rm -rf $(ML_BUILD_DIR) $(ML_TARGET)
 
 run: $(HS_TARGET)
@@ -155,6 +156,14 @@ build-tests: $(HS_OBJ)
 	$(CC) $(SRC_DIR)/hs_core.o $(SRC_DIR)/hs_nodes.o $(SRC_DIR)/hs_gpu.o $(SRC_DIR)/hs_async.o $(SRC_DIR)/hs_backend_gles.o tests/test_08_raycast_orbit.o $(LDFLAGS) -o tests/test_08_raycast_orbit
 	$(STRIP) tests/test_08_raycast_orbit
 	$(STRIP) tests/test_07_message_triangle
+
+# Memory-safety regression for the int8 lm_head compatibility entry point.
+# Built with AddressSanitizer so an out-of-bounds access is reported instead
+# of silently corrupting memory. Needs a sanitizer-capable compiler.
+test-i8-bounds:
+	$(CC) $(CFLAGS) -fsanitize=address -g -c $(SRC_DIR)/hs_ml_ternary_neon.c -o tests/hs_ml_ternary_neon_asan.o
+	$(CC) $(CFLAGS) -fsanitize=address -g tests/redteam_lmhead_i8_bounds.c tests/hs_ml_ternary_neon_asan.o $(LDFLAGS) -o tests/redteam_lmhead_i8_bounds
+	./tests/redteam_lmhead_i8_bounds
 
 run-test:
 	@if [ -z "$(N)" ]; then \
