@@ -11,14 +11,22 @@ VERSION := $(shell cat VERSION 2>/dev/null || echo "0.0.0")
 SRC_DIR = src
 OBJ_DIR = src
 
-HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/hs_backend_gles.c $(SRC_DIR)/hs_ipc.c $(SRC_DIR)/hs_ml.c $(SRC_DIR)/hs_ml_ternary_mt.c $(SRC_DIR)/hs_ml_loader.c $(SRC_DIR)/hs_text.c $(SRC_DIR)/main.c
+# --- Core: graphics + runtime substrate ONLY (no ML). This is the project's
+#     focus and builds with zero inference dependencies. ---
+HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/hs_backend_gles.c $(SRC_DIR)/hs_ipc.c $(SRC_DIR)/hs_text.c $(SRC_DIR)/main.c
+
+# --- Optional experimental ML/inference (BitNet). Opt in with `make ml`, which
+#     rebuilds with -DHS_ENABLE_ML and links these objects. Not part of the
+#     default build. See docs/ML_API.md. ---
+ML_SRC = $(SRC_DIR)/hs_ml.c $(SRC_DIR)/hs_ml_loader.c $(SRC_DIR)/hs_ml_ternary_mt.c
+
 HS_OBJ = $(HS_SRC:.c=.o)
 HS_DEPS = $(HS_OBJ:.o=.d)
 HS_TARGET = neogpu_demo
 
 TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast test_07_message_triangle test_08_raycast_orbit
 
-.PHONY: build clean run all test run-test build-tests version
+.PHONY: build clean run all test run-test build-tests version ml
 
 all: build build-tests
 
@@ -26,6 +34,14 @@ version:
 	@echo "NeoGPU v$(VERSION)"
 
 build: $(HS_TARGET)
+
+# Opt-in experimental ML/inference build: core + ML, with HS_ENABLE_ML defined
+# so hs_ipc.c compiles in its ML tool-bus ops. Rebuilds from clean to avoid
+# mixing objects compiled with/without the flag.
+ml:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(CFLAGS) -DHS_ENABLE_ML" \
+	        HS_SRC="$(HS_SRC) $(ML_SRC)" build
 
 -include $(HS_DEPS)
 

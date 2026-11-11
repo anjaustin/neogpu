@@ -1,6 +1,8 @@
 #include "hs_ipc.h"
 #include "hs_nodes.h"
-#include "hs_ml.h"
+#ifdef HS_ENABLE_ML
+#include "hs_ml.h"   /* optional: ML tool-bus ops, enabled via `make ml` */
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -57,10 +59,12 @@ typedef struct {
     /* result bytes follow */
 } __attribute__((packed)) HSIpcResp;
 
+#ifdef HS_ENABLE_ML
 /* P0-3: Thread-safe global ML state with mutex protection */
 static HSMLSystem g_ml_system;
 static bool g_ml_initialized = false;
 static pthread_mutex_t g_ml_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 /*
  * P0-1: Path validation for IPC file operations.
@@ -111,6 +115,7 @@ static bool hs_ipc_path_is_safe(const char* path, u32 len) {
     return true;
 }
 
+#ifdef HS_ENABLE_ML
 static int hs_ipc_handle_ml_op(u8 op, const u8* payload, u32 payload_len, u8* out, u32* out_len) {
     if (!out || !out_len) return -1;
 
@@ -256,6 +261,7 @@ static int hs_ipc_handle_ml_op(u8 op, const u8* payload, u32 payload_len, u8* ou
 
     return 0;
 }
+#endif /* HS_ENABLE_ML */
 
 static bool hs_ipc_op_allowed(u8 op) {
     switch ((OpCode)op) {
@@ -376,6 +382,7 @@ static int hs_ipc_handle_req(HSIpcServer* srv, int cfd, const HSIpcHdr* hdr) {
         return 0;
     }
     
+#ifdef HS_ENABLE_ML
     /* Handle ML ops directly without going through toolbus */
     switch ((OpCode)req->op) {
         case OP_ML_LOAD:
@@ -410,6 +417,7 @@ static int hs_ipc_handle_req(HSIpcServer* srv, int cfd, const HSIpcHdr* hdr) {
         default:
             break;  /* Continue with normal toolbus handling */
     }
+#endif /* HS_ENABLE_ML */
     
     HSSystem* sys = srv->sys;
     if (!sys) {
