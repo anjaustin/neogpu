@@ -26,6 +26,7 @@ Wire-level contracts. These describe what actually travels between components.
 | [interface/CAPTURE_FORMAT.md](interface/CAPTURE_FORMAT.md) | `HSCAP1` capture file format |
 | [interface/INPUT_STREAM.md](interface/INPUT_STREAM.md) | Input streaming system: lock-free SPSC queue, evdev, hotplug |
 | [interface/ML_API.md](interface/ML_API.md) | Experimental ML inference API |
+| [interface/TERNARY_WEIGHT_FORMATS.md](interface/TERNARY_WEIGHT_FORMATS.md) | Ternary weight byte layouts, code mapping, and the two-stage lm_head format |
 
 ## Research
 

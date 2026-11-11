@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`docs/interface/TERNARY_WEIGHT_FORMATS.md`** — byte-level reference for
+  the ternary weight formats: the code mapping, the three bit layouts in
+  play, and the two-stage ternary lm_head. The three layouts are the
+  NeoGPU internal one (4 consecutive weights per byte, low bits first),
+  upstream BitNet's ARM build (64-weight blocks, 16 bytes, high bits
+  first) and upstream BitNet's x86 build (128-weight blocks, 32 bytes,
+  high bits first). Upstream's `quantize_i2_s` compiles to two *different*
+  layouts depending on the target, which was not previously recorded
+  anywhere in this repository.
+
+  The document also records the 8-plane lm_head format as what it is — a
+  base-3 expansion, where each plane is one ternary digit of the weight
+  and the residual is multiplied by 3 between planes — rather than the
+  "8 bits as four ternary digits" framing, which conflates the byte width
+  of one plane with the number of planes.
+
+  New test `tests/redteam_ternary_formats.c` (`make test-ternary-formats`,
+  run in CI) reproduces the document's figures: the production LUT
+  kernel's decode against a scalar reference, the compatibility of the
+  three layouts, the reconstruction accuracy of the base-3 expansion, and
+  the source lines the document depends on, so the numbers cannot go
+  stale.
+
 ### Fixed
 - **Build fails on current Debian/Ubuntu (including the CI runner)**. The
   build did not compile at `src/hs_async.c`: `include/hs_graphics.h` includes
@@ -36,6 +60,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `make test-i8-bounds` and run in CI.
 
 ### Changed
+- **Misleading performance figures removed from `src/hs_ml_ternary_neon.c`.**
+  The file's header comment listed three measurements side by side as if
+  they were comparable:
+  `96ms / 6.78 GOPS` (LUT), `51ms / 3.20 GOPS` (int8), `175ms / 0.93 GOPS`
+  (F16). Multiplying GOPS by wall-clock shows they are not: the lines
+  account for 650.9M, 163.2M and 162.8M operations respectively, so the
+  LUT line was never a 2.1x speedup over the others — it accounted for
+  four times the work. The repository also uses two different GOPS
+  conventions (1 op per MAC in `tests/bench_proj.c`, 2 ops per MAC in
+  `tests/profile_step.c`) and the figures did not say which was used; the
+  LUT line's 650.9M matches `2*V*H` to within 0.9%, yet the kernel
+  performs `4*V*H` MACs, so the published GOPS describes work the kernel
+  does not do under either convention. The int8 figure is now marked
+  retired: `hs_ml_lmhead_stage1_i8()` has no int8 kernel behind it any
+  more, so the number cannot be reproduced. The comment also records that
+  no benchmark in the repository times `hs_ml_lmhead_stage1()`.
 - **`hs_ml_lmhead_stage1_i8()` documentation corrected**
   (`include/hs_ml_infer.h`). The header described the function as "int8
   activation path (fastest) ... Uses vmull_s8 integer multiply — 3.4×
@@ -44,6 +84,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dequantizes to float32 and delegates to `hs_ml_lmhead_stage1()`. The
   float LUT kernel is the fast path. The formula in the comment was and
   remains correct; the performance claim was not.
+
+### Known issues
+- **`f32_to_ternary_packed()` uses the wrong code mapping.**
+  `src/hs_ml_loader_ternary.c` packs F32-model weights as `00 = 0`,
+  `01 = +1`, `10 = -1`, but the LUT kernel that reads them back decodes
+  `code - 1`, i.e. `0 = -1`, `1 = 0`, `2 = +1`. Executing both functions
+  from the repository source against a test row shows all 8 weights
+  decoding to the wrong value — signs inverted, and every zero becoming
+  -1. Only models whose tensors are stored as `GGML_TYPE_F32` are
+  affected; I2_S models bypass this function, and no test in the
+  repository exercises the F32 path. `tests/redteam_ternary_formats.c`
+  reports the divergence. Documented in
+  `docs/interface/TERNARY_WEIGHT_FORMATS.md` section 1.1; the fix is
+  pending.
 
 ## [0.2.0] - 2026-11-11
 

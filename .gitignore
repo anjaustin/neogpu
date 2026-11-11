@@ -82,6 +82,7 @@ tests/redteam_lmhead_trit
 tests/redteam_lmhead_i8_bounds
 tests/redteam_mt11
 tests/redteam_ternary_v3
+tests/redteam_ternary_formats
 tools/neogpu_bitnet_chat
 tools/neogpu_pix
 tools/neogpu_viz

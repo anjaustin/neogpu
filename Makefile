@@ -45,7 +45,7 @@ HS_TARGET = neogpu_demo
 
 TESTS = test_01_clear test_02_triangle test_03_instancing test_04_blending test_05_cube3d test_06_raycast test_07_message_triangle test_08_raycast_orbit
 
-.PHONY: build clean run all test run-test build-tests version ml test-i8-bounds
+.PHONY: build clean run all test run-test build-tests version ml test-i8-bounds test-ternary-formats
 
 all: build build-tests
 
@@ -124,6 +124,7 @@ clean:
 	rm -f $(HS_OBJ) $(HS_DEPS) $(HS_TARGET) tests/*.o tests/test_01_clear tests/test_02_triangle tests/test_03_instancing tests/test_04_blending tests/test_05_cube3d tests/test_06_raycast tests/test_07_message_triangle tests/test_08_raycast_orbit neogpu_tool neogpu_pong neogpu_pong_ai neogpu_pong_llm neogpu_capture_demo neogpu_procgame
 	rm -f tests/test_01 tests/test_02 tests/test_03 tests/test_04 tests/test_05 tests/test_06 tests/test_07 tests/test_08
 	rm -f tests/redteam_lmhead_i8_bounds tests/hs_ml_ternary_neon_asan.o
+	rm -f tests/redteam_ternary_formats tests/hs_ml_ternary_neon_formats.o
 	rm -rf $(ML_BUILD_DIR) $(ML_TARGET)
 
 run: $(HS_TARGET)
@@ -164,6 +165,17 @@ test-i8-bounds:
 	$(CC) $(CFLAGS) -fsanitize=address -g -c $(SRC_DIR)/hs_ml_ternary_neon.c -o tests/hs_ml_ternary_neon_asan.o
 	$(CC) $(CFLAGS) -fsanitize=address -g tests/redteam_lmhead_i8_bounds.c tests/hs_ml_ternary_neon_asan.o $(LDFLAGS) -o tests/redteam_lmhead_i8_bounds
 	./tests/redteam_lmhead_i8_bounds
+
+# Layout and format checks for the ternary weight formats. Pins the claims
+# made in docs/interface/TERNARY_WEIGHT_FORMATS.md: the production LUT
+# kernel's decode, the three bit layouts, the 8-plane base-3 expansion,
+# and the source lines the documentation depends on.
+# Links only libm and libpthread -- it is a CPU-only test and does not
+# need the graphics libraries.
+test-ternary-formats:
+	$(CC) $(CFLAGS) -c $(SRC_DIR)/hs_ml_ternary_neon.c -o tests/hs_ml_ternary_neon_formats.o
+	$(CC) $(CFLAGS) tests/redteam_ternary_formats.c tests/hs_ml_ternary_neon_formats.o -lm -lpthread -o tests/redteam_ternary_formats
+	./tests/redteam_ternary_formats
 
 run-test:
 	@if [ -z "$(N)" ]; then \

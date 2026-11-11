@@ -15,9 +15,51 @@
  *   lut[byte] = {float(-1/0/+1), float(-1/0/+1), float(-1/0/+1), float(-1/0/+1)}
  *   Inner loop: vld1q_f32(lut[w[bi]]) + vld1q_f32(in+bi*4) + vfmaq_f32
  *   4KB table fits in L1 cache. No scalar decode arithmetic.
- *   Measured: 96ms / 6.78 GOPS (4-thread, full vocab)
- *   vs int8 path:  51ms / 3.20 GOPS (has 1.5% quantization error)
- *   vs F16 NEON: 175ms / 0.93 GOPS
+ *
+ * PERFORMANCE
+ *   The figures this file used to list side by side were not comparable
+ *   to each other. Multiplying GOPS by wall-clock gives the work each
+ *   line accounted for:
+ *
+ *     LUT 4-plane    96 ms x 6.78 GOPS = 650.9M ops
+ *     int8 path      51 ms x 3.20 GOPS = 163.2M ops   (1/4 of the LUT line)
+ *     F16 NEON      175 ms x 0.93 GOPS = 162.8M ops   (1/4 of the LUT line)
+ *
+ *   So "6.78 vs 3.20 GOPS" was never a 2.1x speedup: the LUT line
+ *   accounts for four times the work. Whatever the original three
+ *   measurements covered, they were not the same computation, so the
+ *   lines cannot be read as a speed comparison.
+ *
+ *   The int8 figure is RETIRED. hs_ml_lmhead_stage1_i8() no longer has an
+ *   int8 kernel behind it: it dequantizes the activation to float32 and
+ *   calls this same LUT kernel. There is no separate implementation left
+ *   to measure, so the number cannot be reproduced.
+ *
+ *   The GOPS unit is ambiguous as well, because this repository uses two
+ *   conventions:
+ *     tests/bench_proj.c     1 op per MAC
+ *     tests/profile_step.c   2 ops per MAC (2*N*K)
+ *   The figures above do not record which was used. The LUT line's 650.9M
+ *   ops matches 2*V*H = 656.7M -- the profile_step.c count for a single
+ *   F16 lm_head pass -- to within 0.9%, but this kernel performs 4*V*H
+ *   MACs, so the published GOPS does not describe the work it actually
+ *   does under either convention. Recompute before quoting it.
+ *
+ *   No benchmark in this repository TIMES this kernel. The lm_head
+ *   timings that do exist are tests/profile_step.c (F16 lm_head only, not
+ *   the ternary path) and tests/redteam_lmhead_trit.c (F16 vs trit-spline;
+ *   both need the model file). The decode itself is checked by
+ *   tests/redteam_ternary_formats.c, which compares this kernel's output
+ *   against a scalar reference -- but that measures correctness, not
+ *   speed.
+ *
+ *   For scale, from the source's own shapes: Stage 1 reads four packed
+ *   ternary planes over the whole vocabulary -- 4 * V * (H/4) bytes =
+ *   V * H bytes. At V = 128256, H = 2560 that is 328.3 MB, so the 96 ms
+ *   figure, taken at its stated full-vocabulary scope, is 3.42 GB/s of
+ *   weight traffic.
+ *
+ *   Weight format: docs/interface/TERNARY_WEIGHT_FORMATS.md
  *
  * Two public functions:
  *   hs_ml_ternary_f32_proj  -- single plane, N rows (projection layers)
