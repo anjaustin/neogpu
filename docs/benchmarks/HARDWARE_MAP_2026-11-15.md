@@ -232,8 +232,8 @@ through shared memory, skipping the 22–75 µs submit path?
 | | measured | runs |
 |---|---|---|
 | **A**: GPU stores, CPU watches the word | The CPU sees **only the final value, at job end**. `tmuwt` does not make a store visible; the stores stay in the GPU's caches until the kernel cleans them after the job | 3 × 100 ticks |
-| **B**: GPU polls a word the CPU then writes | The GPU **never sees** the write: 2 M polls over 191 ms at ~96 ns per poll, which is cache-hit speed | 8 |
-| **E**: eviction sweep of F KiB between polls | **F ≤ 192 KiB: never seen** (each job polled ~0.74 s after the write). F = 256 / 512 KiB: seen, latency 222 / 216 µs | 2 clean runs, 0 resets |
+| **B**: GPU polls a word the CPU then writes | The GPU **never sees** the write: 2 M polls over 192 ms at ~96 ns per poll, which is cache-hit speed. Re-run with the write 30 ms after dispatch, safely past start-up: still never seen | 8 + 8, resets counted: 0 |
+| **E**: eviction sweep of F KiB between polls | **F ≤ 192 KiB: never seen** (each job polled ~0.74 s after the write). F = 256 / 512 KiB: seen. Latency 222 / 216 µs in one run, 292 / 263 µs in the other | 2 runs; resets counted per row (0) in the second, by dmesg around the first |
 | **E**: sweep of up to 512 KiB after each store | Still only the final value reaches the CPU | 9 sizes |
 | **C**: one job running longer and longer | 1000 ms ran to completion. A 1500 ms job was **reset at 1012 ms, and all its writes were lost** | 1 series |
 | **O**: TMU op code in the `tmuc` config byte (bits 7:4), each op as poll and as store-then-op, with and without `ldtmu` | see below | 2 rounds |
@@ -248,8 +248,10 @@ TMU op results:
 What this means:
 - **Within a job, the GPU's caches are not coherent with the CPU in either
   direction.** A plain shared-memory mailbox cannot work.
-- Eviction gives CPU→GPU coherence only at ~220 µs per message, worse than
-  launching a job.
+- Eviction gives CPU→GPU coherence only at 216–292 µs per message, worse
+  than launching a job. That is 4 samples. Each includes the job's
+  teardown, because the CPU sees the ack only at job end, and depends on
+  where the write lands in a ~390 µs sweep.
 - Nothing measured gives GPU→CPU visibility before job end, except the
   undecoded op 1, which then hangs.
 - Any persistent program must also end within ~1 s.

@@ -274,6 +274,25 @@ static int dispatch(uint32_t code_gpu, uint32_t unif_off) {
 }
 static void wbarrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
 
+/* GPU resets so far, from dmesg; -1 if it cannot be read (no sudo) */
+static int resets(void) {
+    FILE* f = popen("sudo -n dmesg 2>/dev/null | grep -c 'Resetting GPU for hang'", "r");
+    int n = -1;
+    if (f) {
+        if (fscanf(f, "%d", &n) != 1) n = -1;
+        pclose(f);
+    }
+    return n;
+}
+/* "+n", or "unknown" when either count could not be read: never report
+ * 0 resets that were not counted */
+static const char* reset_delta(int r0, int r1) {
+    static char b[32];
+    if (r0 < 0 || r1 < 0) return "unknown (dmesg unreadable)";
+    snprintf(b, sizeof(b), "%d", r1 - r0);
+    return b;
+}
+
 #define SPIN_1MS 37500u
 
 static void section_tick(uint32_t tick_gpu, uint32_t cfg) {
@@ -335,7 +354,7 @@ static void section_poll(uint32_t poll_gpu, uint32_t cfg, int runs) {
     if (cfg)
         printf("\n## B: polls with tmuc 0x%08x (op %u) before each load\n", cfg, (cfg >> 4) & 15);
     else
-        printf("\n## B: GPU polls one word; the CPU writes it after the GPU has been polling for ~1 ms\n");
+        printf("\n## B: GPU polls one word; the CPU writes it 30 ms after dispatch (past start-up)\n");
     volatile uint32_t* mbox = (volatile uint32_t*)(data.map + 4096);
     volatile uint32_t* ack = (volatile uint32_t*)(data.map + 8192);
     const uint32_t max_polls = 2000000;
@@ -349,10 +368,13 @@ static void section_poll(uint32_t poll_gpu, uint32_t cfg, int runs) {
         u[1] = data.gpu + 8192;
         u[2] = max_polls;
         u[3] = cfg;
+        int r0 = resets();
         uint64_t t0 = now_ns();
         int e = dispatch(poll_gpu, 256);
         if (e) die("dispatch", e);
-        while (now_ns() - t0 < 1000000) {
+        /* write after 30 ms: past the ~10-12 ms first-job start-up measured
+         * in a process, so the GPU is already polling when the write lands */
+        while (now_ns() - t0 < 30000000ull) {
         }
         uint64_t tw = now_ns();
         *mbox = 1;
@@ -365,11 +387,16 @@ static void section_poll(uint32_t poll_gpu, uint32_t cfg, int runs) {
             }
         e = hs_v3d_bo_wait(&dev, &data, 5000000000ull);
         uint64_t td = now_ns();
+        const char* rd = reset_delta(r0, resets());
+        if (ack[0] == 0xFFFFFFFFu) {
+            printf("run %d: NO ACK: the job never wrote its result (reset?); GPU resets: %s\n", run, rd);
+            continue;
+        }
         uint32_t polls = max_polls - ack[1];
         printf("run %d: GPU read %u%s; polls used %u; CPU write -> CPU sees ack %s%.1f us; dispatch -> done %.3f ms; "
-               "polls/us while polling %.2f%s\n",
+               "polls/us averaged from dispatch (start-up included) %.2f; GPU resets: %s%s\n",
                run, ack[0], ack[0] == 1 ? " (saw the CPU's write)" : " (never saw it)", polls, ta ? "" : "never; ",
-               ta ? (ta - tw) / 1e3 : 0.0, (td - t0) / 1e6, polls / ((double)(ta ? ta - t0 : td - t0) / 1e3),
+               ta ? (ta - tw) / 1e3 : 0.0, (td - t0) / 1e6, polls / ((double)(ta ? ta - t0 : td - t0) / 1e3), rd,
                e ? " (WAIT_BO error)" : "");
     }
 }
@@ -380,7 +407,7 @@ static void section_evict(uint32_t poll_ev, uint32_t tick_ev) {
     volatile uint32_t* ack = (volatile uint32_t*)(data.map + 8192);
     volatile uint32_t* word = (volatile uint32_t*)data.map;
     printf("\n## E: eviction sweeps of F KiB (other memory) between polls / after each store\n");
-    printf("%8s | %-44s | %s\n", "F KiB", "poll: saw CPU write? latency, polls", "tick: values seen mid-job (of 20)");
+    printf("%8s | %-44s | %-34s | %s\n", "F KiB", "poll: saw CPU write? latency, polls", "tick: values seen mid-job (of 20)", "GPU resets");
     for (size_t i = 0; i < sizeof(KB) / sizeof(KB[0]); i++) {
         uint32_t lines = KB[i] * 1024 / 64;
         /* poll */
@@ -398,6 +425,7 @@ static void section_evict(uint32_t poll_ev, uint32_t tick_ev) {
         u[2] = budget;
         u[3] = data.gpu + (1u << 20);
         u[4] = lines;
+        int r0 = resets();
         uint64_t t0 = now_ns();
         int e = dispatch(poll_ev, 768);
         if (e) die("dispatch", e);
@@ -413,8 +441,11 @@ static void section_evict(uint32_t poll_ev, uint32_t tick_ev) {
             }
         hs_v3d_bo_wait(&dev, &data, 10000000000ull);
         char pr[64];
-        snprintf(pr, sizeof(pr), "%s %.1f us, %u of %u polls", ack[0] == 1 ? "yes" : "NO ", ta ? (ta - tw) / 1e3 : 0.0,
-                 budget - ack[1], budget);
+        if (ack[0] == 0xFFFFFFFFu)
+            snprintf(pr, sizeof(pr), "NO ACK: job never finished (reset?)");
+        else
+            snprintf(pr, sizeof(pr), "%s %.1f us, %u of %u polls", ack[0] == 1 ? "yes" : "NO ",
+                     ta ? (ta - tw) / 1e3 : 0.0, budget - ack[1], budget);
         /* tick: 20 ticks of ~1 ms */
         *word = 0;
         wbarrier();
@@ -437,19 +468,10 @@ static void section_evict(uint32_t poll_ev, uint32_t tick_ev) {
             }
         }
         hs_v3d_bo_wait(&dev, &data, 10000000000ull);
-        printf("%8u | %-44s | %d\n", KB[i], pr, distinct);
+        printf("%8u | %-44s | %-34d | resets %s\n", KB[i], pr, distinct, reset_delta(r0, resets()));
     }
 }
 
-static int resets(void) {
-    FILE* f = popen("sudo -n dmesg 2>/dev/null | grep -c 'Resetting GPU for hang'", "r");
-    int n = -1;
-    if (f) {
-        if (fscanf(f, "%d", &n) != 1) n = -1;
-        pclose(f);
-    }
-    return n;
-}
 
 static void section_life(uint32_t tick_gpu) {
     printf("\n## C: one job running for longer and longer (the tick program, ~1 ms per tick)\n");
@@ -468,9 +490,8 @@ static void section_life(uint32_t tick_gpu) {
         if (e) die("dispatch", e);
         e = hs_v3d_bo_wait(&dev, &data, 20000000000ull);
         double ms = (double)(now_ns() - t0) / 1e6;
-        int r1 = resets();
-        printf("%u ticks: job ended after %.1f ms, final tick %u of %u, GPU resets during the job: %d%s\n", TICKS[i], ms,
-               *word, TICKS[i], r1 - r0, e ? " (WAIT_BO error)" : "");
+        printf("%u ticks: job ended after %.1f ms, final tick %u of %u, GPU resets during the job: %s%s\n", TICKS[i], ms,
+               *word, TICKS[i], reset_delta(r0, resets()), e ? " (WAIT_BO error)" : "");
         if (*word != TICKS[i]) {
             printf("   the job was cut short; longer runs skipped\n");
             break;
@@ -507,7 +528,7 @@ int main(int argc, char** argv) {
         int r0 = resets();
         section_poll(poll_cfg_gpu, cfg, 3);
         section_tick(tick_cfg_gpu, cfg);
-        printf("   GPU resets during op %u: %d\n", OPS[i], resets() - r0);
+        printf("   GPU resets during op %u: %s\n", OPS[i], reset_delta(r0, resets()));
     }
     if (strchr(which, 'E')) section_evict(poll_ev_gpu, tick_ev_gpu);
     if (strchr(which, 'C')) section_life(tick_gpu);

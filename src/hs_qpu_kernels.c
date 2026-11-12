@@ -19,6 +19,18 @@ int hs_qpu_kernel_store_one(hs_qpu_prog* p) {
     return hs_qpu_prog_finish(p);
 }
 
+int hs_qpu_gather_uniforms(uint32_t u[4], uint32_t elements, int batches, int k, uint32_t idx_gpu,
+                           uint32_t table_gpu, uint32_t out_gpu) {
+    if ((batches != 1 && batches != 8) || (k != 1 && k != 2 && k != 4 && k != 8)) return HS_QPU_E_OPERAND;
+    uint32_t per = 16u * (uint32_t)batches * (uint32_t)k;
+    if (elements == 0 || elements % per || ((idx_gpu | table_gpu | out_gpu) & 3)) return HS_QPU_E_OPERAND;
+    u[0] = elements / per;
+    u[1] = idx_gpu;
+    u[2] = table_gpu;
+    u[3] = out_gpu;
+    return 0;
+}
+
 int hs_qpu_kernel_gather(hs_qpu_prog* p, int batches, int k) {
     if ((batches != 1 && batches != 8) || (k != 1 && k != 2 && k != 4 && k != 8)) return HS_QPU_E_OPERAND;
     /* rf0 passes, rf1 idx address, rf2 table, rf3 out; rf4 stride, rf5 batch,
@@ -53,6 +65,17 @@ int hs_qpu_kernel_gather(hs_qpu_prog* p, int batches, int k) {
     emit(p, hs_qpu_a(HS_QPU_A_MOV, R(0), I(k), X));
     emit(p, hs_qpu_m(hs_qpu_alu_nop(), HS_QPU_M_UMUL24, R(0), R(0), I(batches - 1)));
     emit(p, hs_qpu_a(HS_QPU_A_SHL, RF(6), R(0), I(6))); /* skip the other batches' runs: 64k(batches-1) */
+    /* guard: passes == 0 jumps to the end. The loop tests its counter after
+     * the body, so 0 would otherwise wrap to 2^32 passes and run past the
+     * buffers until the kernel reset the GPU (red team, 2026-11-16). */
+    hs_qpu_alu g = hs_qpu_a(HS_QPU_A_MOV, X, RF(0), X);
+    g.af = HS_QPU_PF_PUSHZ;
+    emit(p, g);
+    int done = hs_qpu_label_new(p);
+    hs_qpu_branch(p, HS_QPU_B_A0, done, 0, 0);
+    nop(p);
+    nop(p);
+    nop(p);
     int l = hs_qpu_label_new(p);
     hs_qpu_label_bind(p, l);
     /* k index loads; the last carries the thrsw rule 1 needs */
@@ -86,6 +109,7 @@ int hs_qpu_kernel_gather(hs_qpu_prog* p, int batches, int k) {
     nop(p);
     nop(p);
     nop(p);
+    hs_qpu_label_bind(p, done);
     emit(p, hs_qpu_a(HS_QPU_A_TMUWT, X, X, X)); /* rule 2 */
     hs_qpu_emit_end(p);
     return hs_qpu_prog_finish(p);

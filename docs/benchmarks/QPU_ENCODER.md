@@ -227,25 +227,40 @@ using kernel UAPI headers only:
 - load a program;
 - dispatch a compute job.
 
-The dispatch accepts 1..8 batches: the measured layout, one 16-lane batch
-per QPU.
+The dispatch accepts only 1 or 8 batches. That is the measured
+configuration: workgroup counts 1, workgroup size 16, 16 per supergroup,
+CFG4 = batches − 1.
 
 `src/hs_qpu_kernels.c` holds the programs NeoGPU ships, built with hs_qpu:
-- `hs_qpu_kernel_gather`: 1 or 8 batches, with 1, 2, 4 or 8 loads in flight;
+- `hs_qpu_kernel_gather`: 1 or 8 batches, with 1, 2, 4 or 8 loads in flight.
+  An in-kernel guard ends it at once when passes = 0. `hs_qpu_gather_uniforms`
+  fills its uniforms, and refuses element counts that are 0 or not a whole
+  pass, as well as unaligned addresses.
 - `hs_qpu_kernel_store_one`.
 
 The oracle check compares these shipped builders word for word, so what ships
 is what was verified.
 
 `tests/test_v3d_compute` (in `make test-hardware`; needs the render group,
-not root) runs the whole chain on the GPU: 22 checks, every output word
+not root) runs the whole chain on the GPU: 25 checks, every output word
 compared with the CPU, 0 GPU hangs.
 - store_one: dispatched, completed, and its write is visible to the CPU.
 - 16 gathers: random and sequential indices, 1 and 8 batches, 1–8 loads in
   flight, each over 1 M elements from a 4 MiB table. 0 words wrong in every
-  one.
-- Refused: 9 batches (unmeasured), a dispatch without BOs, and misaligned or
-  overflowing program loads.
+  one. Output is pre-filled with a sentinel that equals no table value
+  (checked), so an unwritten word cannot pass.
+- passes = 0 ends at once (0.14 ms) and writes nothing.
+- Refused: element counts that are 0 or not a whole pass; misaligned
+  addresses; every batch count except 1 and 8; a dispatch without BOs;
+  misaligned or overflowing program loads.
+
+`tests/test_v3d_runtime` (also in `make test-hardware`; 12 checks, clean
+under ASan and UBSan) covers the runtime's error paths and resources:
+- the display node and missing or non-DRM nodes are refused;
+- 200 open/close cycles and 400 BO cycles leak no fd or mapping;
+- double free and double close are harmless;
+- sizes 0 and above 4 GiB are refused;
+- a BO beyond the GPU's 4 GiB address space fails cleanly (-ENOSPC).
 
 The test's timings are not a benchmark. Before the layout fix below, the slow
 8-batch 4-in-flight sequential case showed up there too: 3.78 ms, against
@@ -312,11 +327,60 @@ variant 5, same harness:
 - A layout where each batch owns one large contiguous chunk is much worse
   (66 ms at k=1, 4× reads): with chunks 2 MiB apart, 8 QPUs × 3 streams
   conflict in the L2T's sets.
-- The first run of a newly loaded program costs ~10 ms extra.
+- The first job a process dispatches costs ~10–12 ms extra: the fmov
+  experiment measured 12.1 ms, then 0.15 ms for the next job. Later newly
+  loaded programs do not pay it; in test_v3d_compute each gather is a fresh
+  program and takes 2–5 ms.
 - The perfmon counter named "cache hit" counts memory transactions; the AXI
   byte counters (40, 41) are the reliable measure of traffic.
 - This kernel's `(tidx >> 2) & 15` batch index is not 0..B−1 for 2 or 4
   batches, which is why hs_v3d accepts only the measured 1 and 8.
+- "Whole 256-byte lines at k ≥ 4" assumes idx and out are 256-byte aligned.
+  BO addresses are page-aligned; an offset into a BO is the caller's to
+  align.
+
+## Red team 2, 2026-11-16
+
+A second independent review covered the runtime, the shipped kernels, the
+tests and the probes. It reported 10 findings, several demonstrated. All
+are fixed and verified on the GPU with 0 resets.
+
+Correctness:
+- **passes = 0** wrapped the loop counter: a ~1 s hang, with stores far past
+  `out`. There is now an in-kernel guard, and its oracle twin is updated
+  (8/8 identical).
+- **Element counts that are not a whole pass** silently skipped the
+  remainder. `hs_qpu_gather_uniforms` now refuses them.
+- **hs_v3d accepted 2–7 batches,** contrary to its docs. It now accepts only
+  1 or 8, and all 15 other counts from 0 to 16 are tested refused.
+
+Tests that could pass while broken:
+- out[] was zero-filled while `hash32(0) == 0`, so an unwritten word could
+  pass. A sentinel fill is now used, checked against every table value.
+- A failed BO creation crashed instead of failing.
+- hwprobe_qpu checked only the last of 5 trials; every trial is now
+  checked.
+
+Measurement:
+- `hwprobe_mailbox` printed 0 resets when dmesg was unreadable. It now says
+  "unknown". Section E counts its resets per row, and a missing ack is
+  reported as such.
+- Section B wrote 1 ms after dispatch, inside the first-job start-up. It now
+  writes after 30 ms; the result is unchanged (never seen, 8 runs).
+
+Docs:
+- The single "~220 µs" eviction latency is now 216–292 µs over 4 samples.
+- The "~10 ms per newly loaded program" claim is corrected (first job per
+  process).
+- The alignment assumption is stated.
+
+Small fixes:
+- the CFG3 supergroup field is masked to 4 bits (same packed value,
+  0xF010);
+- 64-bit load bounds math;
+- `HWPROBE_FLAGKB` is parsed without 32-bit wrap;
+- gather_anom: trials ≥ 1, batches must be 1 or 8, table-fill bounds,
+  passes = 0 refused.
 
 ## Red team, 2026-11-15
 

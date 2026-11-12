@@ -217,6 +217,8 @@ int main(int argc, char** argv) {
         unsigned N, toff, ioff, ooff;
         if (sscanf(line, "%d %d %u %x %x %x %d %d %d %d", &B, &k, &N, &toff, &ioff, &ooff, &mode, &var, &trials, &skew) < 8) continue;
         if (trials > 15) trials = 15;
+        if (trials < 1) trials = 1;
+        if (B != 1 && B != 8) { printf("skip: B must be 1 or 8 (the batch index is wrong otherwise)\n"); continue; }
         unsigned per = 16u * (unsigned)B * (unsigned)k;
         unsigned passes = N / per;
         N = passes * per;
@@ -229,6 +231,11 @@ int main(int argc, char** argv) {
         uint32_t NF = var == 4 ? N + 8u * (uint32_t)skew * per : N; /* skewed batches run past N */
         if (var == 4 && ((size_t)ioff + NF * 4ull > dsize || (size_t)ooff + NF * 4ull > dsize || ioff + NF * 4ull > ooff)) { printf("skip skew range\n"); continue; }
         uint32_t tent = mode == 0 ? TE : NF;
+        if (passes == 0) { printf("skip: N below one pass (%u elements)\n", per); continue; }
+        if ((size_t)toff + (size_t)tent * 4 > dsize || (toff < ioff && (size_t)toff + (size_t)tent * 4 > ioff)) {
+            printf("skip table fill range\n");
+            continue;
+        }
         /* (re)fill table and idx */
         for (uint32_t i = 0; i < tent; i++) tb[i] = hash32(i);
         uint64_t rs = 0x9E3779B97F4A7C15ull;
@@ -252,7 +259,7 @@ int main(int argc, char** argv) {
         uint64_t v[32], vs[15][32];
         int ok = 1;
         for (int t = 0; t < trials; t++) {
-            memset(ot, 0, (size_t)NF * 4);
+            memset(ot, 0xEE, (size_t)NF * 4); /* sentinel: hash32(0) == 0, so 0 would hide an unwritten word */
             uint32_t pm = pm_new();
             hs_v3d_dispatch_desc d = {cg, unif.gpu, (uint32_t)B, handles, 3, pm};
             uint64_t t0 = now_ns();
@@ -291,7 +298,7 @@ int main(int argc, char** argv) {
             ioctl(dev.fd, DRM_IOCTL_V3D_PERFMON_DESTROY, &de);
             uint32_t bad = 0;
             if (var != 4) for (uint32_t i = 0; i < N; i++) bad += ot[i] != hash32(ix[i]);
-            else for (uint32_t i = 0; i < N; i++) bad += ot[i] != 0 && ot[i] != hash32(ix[i]); /* partial coverage */
+            else for (uint32_t i = 0; i < N; i++) bad += ot[i] != 0xEEEEEEEEu && ot[i] != hash32(ix[i]); /* partial coverage */
             ok &= bad == 0;
         }
         double sorted[15];

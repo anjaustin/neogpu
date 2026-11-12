@@ -118,6 +118,12 @@ def qpu_gather(asm, *, num_qpus, k):
     mov(r0, k)
     nop().umul24(r0, r0, num_qpus - 1)
     shl(rf6, r0, 6)
+    # guard: passes == 0 jumps to the end (the loop tests after its body)
+    mov(null, rf0, cond='pushz')
+    b(R.done, cond='a0')
+    nop()
+    nop()
+    nop()
     with loop as l:
         for i in range(k):
             if i == k - 1:
@@ -146,6 +152,7 @@ def qpu_gather(asm, *, num_qpus, k):
         nop()
         nop()
         nop()
+    L.done
     tmuwt()  # never end with TMU writes in flight (see FINDINGS.md)
     end_seq()
 

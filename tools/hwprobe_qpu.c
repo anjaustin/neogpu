@@ -333,11 +333,13 @@ static void section_dispatch(void) {
     }
     /* time until a GPU write is visible to a CPU spinning on the mapped word */
     /* HWPROBE_FLAGKB: flag offset in the data BO, KiB (default 65536 = 64 MiB) */
-    uint32_t flag_off = (getenv("HWPROBE_FLAGKB") ? (uint32_t)atoi(getenv("HWPROBE_FLAGKB")) : 65536u) << 10;
-    if ((size_t)flag_off + 4 > data.size) {
-        fprintf(stderr, "HWPROBE_FLAGKB: offset %u is outside the %zu-byte data BO\n", flag_off, data.size);
+    uint64_t flag_kb = getenv("HWPROBE_FLAGKB") ? strtoull(getenv("HWPROBE_FLAGKB"), NULL, 10) : 65536u;
+    if ((flag_kb << 10) + 4 > data.size) { /* checked before narrowing: no wrap */
+        fprintf(stderr, "HWPROBE_FLAGKB: %llu KiB is outside the %zu-byte data BO\n", (unsigned long long)flag_kb,
+                data.size);
         exit(1);
     }
+    uint32_t flag_off = (uint32_t)(flag_kb << 10);
     volatile uint32_t* flag = (volatile uint32_t*)(data.map + flag_off);
     *U(16384) = data.gpu + flag_off;
     double vis[N], tot[N];
@@ -588,8 +590,8 @@ static void section_gather_concurrent(void) {
         double cm[5], gm[5], tot[5];
         int ok = 1;
         for (int t = 0; t < 5; t++) {
-            memset(go, 0, (size_t)G_N * 4);
-            memset(co, 0, (size_t)G_N * 4);
+            memset(go, 0xEE, (size_t)G_N * 4); /* sentinel: hash32(0) == 0 */
+            memset(co, 0xEE, (size_t)G_N * 4);
             gwait_t w = {0, now_ns(), nthr == 3 ? 3 : -1};
             pthread_t wt;
             if (gpu) {
@@ -677,12 +679,12 @@ static void section_gather(void) {
             for (int nthr = 1; nthr <= 4; nthr *= 4)
                 for (int pf = 0; pf < 2; pf++) {
                     double ns[5];
-                    for (int t = 0; t < 5; t++) {
-                        memset(co[h], 0, (size_t)G_N * 4);
-                        ns[t] = gather_cpu_mt(ct[h], ci[h], co[h], G_N, nthr, pf);
-                    }
                     int ok = 1;
-                    for (uint32_t i = 0; i < G_N; i++) ok &= co[h][i] == hash32(ci[h][i]);
+                    for (int t = 0; t < 5; t++) { /* every trial checked; sentinel fill (hash32(0) == 0) */
+                        memset(co[h], 0xEE, (size_t)G_N * 4);
+                        ns[t] = gather_cpu_mt(ct[h], ci[h], co[h], G_N, nthr, pf);
+                        for (uint32_t i = 0; i < G_N; i++) ok &= co[h][i] == hash32(ci[h][i]);
+                    }
                     double m = median(ns, 5);
                     char nm[64];
                     snprintf(nm, sizeof(nm), "CPU %d core%s, %s%s", nthr, nthr > 1 ? "s" : "", h ? "huge" : "4K",
@@ -703,12 +705,12 @@ static void section_gather(void) {
                 u[3] = data.gpu + out_off;
                 double ns[5];
                 uint64_t v[NCTR];
-                for (int t = 0; t < 5; t++) {
-                    memset(go, 0, (size_t)G_N * 4);
-                    ns[t] = run(&p, 20480, nq, v);
-                }
                 int ok = 1;
-                for (uint32_t i = 0; i < G_N; i++) ok &= go[i] == hash32(gi[i]);
+                for (int t = 0; t < 5; t++) { /* every trial checked; sentinel fill (hash32(0) == 0) */
+                    memset(go, 0xEE, (size_t)G_N * 4);
+                    ns[t] = run(&p, 20480, nq, v);
+                    for (uint32_t i = 0; i < G_N; i++) ok &= go[i] == hash32(gi[i]);
+                }
                 double m = median(ns, 5);
                 char nm[64];
                 snprintf(nm, sizeof(nm), "GPU %d QPU, %d in flight", nq, k);

@@ -106,20 +106,22 @@ int hs_v3d_bo_wait(hs_v3d* dev, const hs_v3d_bo* bo, uint64_t timeout_ns) {
 }
 
 uint32_t hs_v3d_load(hs_v3d_bo* code, size_t off, const uint64_t* prog, uint32_t n) {
-    if ((off & 7) || n == 0 || off > code->size || (size_t)n * 8 > code->size - off) return 0;
+    if ((off & 7) || n == 0 || off > code->size || (uint64_t)n * 8 > (uint64_t)(code->size - off)) return 0;
     memcpy(code->map + off, prog, (size_t)n * 8);
     return code->gpu + (uint32_t)off;
 }
 
 int hs_v3d_dispatch(hs_v3d* dev, const hs_v3d_dispatch_desc* d) {
-    if (d->batches < 1 || d->batches > 8 || !d->code_gpu || !d->bos || !d->nbos) return -EINVAL;
+    if ((d->batches != 1 && d->batches != 8) || !d->code_gpu || !d->bos || !d->nbos) return -EINVAL;
     const uint32_t wg_size = 16, wgs_per_sg = 16;
     struct drm_v3d_submit_csd s;
     memset(&s, 0, sizeof(s));
     s.cfg[0] = 1u << 16; /* workgroup counts x, y, z: 1 */
     s.cfg[1] = 1u << 16;
     s.cfg[2] = 1u << 16;
-    s.cfg[3] = ((((wgs_per_sg * wg_size + 15) / 16) - 1) << 12) | (wgs_per_sg << 8) | (wg_size & 0xff);
+    /* the supergroup field is 4 bits, 16 encoded as 0 (masked as Mesa does;
+     * the packed value is the measured 0xF010 either way) */
+    s.cfg[3] = ((((wgs_per_sg * wg_size + 15) / 16) - 1) << 12) | ((wgs_per_sg & 0xf) << 8) | (wg_size & 0xff);
     s.cfg[4] = d->batches - 1;
     s.cfg[5] = d->code_gpu;
     s.cfg[6] = d->unif_gpu;

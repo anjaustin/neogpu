@@ -41,16 +41,19 @@ int hs_v3d_bo_wait(hs_v3d* dev, const hs_v3d_bo* bo, uint64_t timeout_ns);
  * Returns the program's GPU address, or 0 if it does not fit. */
 uint32_t hs_v3d_load(hs_v3d_bo* code, size_t off, const uint64_t* prog, uint32_t n);
 
-/* One compute dispatch in the layout every program in this tree uses:
- * `batches` batches of one 16-lane workgroup each. A program reads its batch
- * index as (tidx >> 2) & 15. Only 1..8 batches are accepted, because that is
- * what was measured: 1 and 8, one batch per QPU. `bos` lists every BO the
- * job touches (code, uniforms, data), so the kernel can track them. Returns
- * 0 or -errno. */
+/* One compute dispatch in the configuration every program in this tree was
+ * measured with: workgroup counts 1 x 1 x 1, workgroup size 16, 16
+ * workgroups per supergroup, and CFG4 = batches - 1. That runs `batches`
+ * 16-lane batches. A program reads its batch index as (tidx >> 2) & 15.
+ * Only batches = 1 or 8 is accepted: for 2 or 4 that index is not
+ * 0..batches-1 (measured: wrong output), and the other counts were never
+ * measured. `bos` lists every BO the job touches (code, uniforms, data), so
+ * the kernel can track them. Returns 0 or -errno (-EINVAL for a refused
+ * descriptor). */
 typedef struct {
     uint32_t code_gpu;  /* from hs_v3d_load */
     uint32_t unif_gpu;  /* uniform stream */
-    uint32_t batches;   /* 1..8 */
+    uint32_t batches;   /* 1 or 8 */
     const uint32_t* bos; /* BO handles */
     uint32_t nbos;
     uint32_t perfmon;   /* 0, or a perfmon id */

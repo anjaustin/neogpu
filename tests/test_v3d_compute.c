@@ -24,8 +24,15 @@ static uint64_t now_ns(void) {
 }
 static uint32_t hash32(uint32_t x) { return x * 2654435761u ^ (x >> 7); }
 
-#define TABLE (1u << 20) /* entries: 4 MiB, beyond the GPU's 128 KiB L2T */
+#define TABLE (1u << 20) /* entries: 4 MiB */
 #define N (1u << 20)     /* elements gathered */
+/* out[] is filled with this before every run, so an element the GPU never
+ * writes is caught: it must not equal any expected value (checked below;
+ * 0 would not do, since hash32(0) == 0) */
+#define SENTINEL 0xEEEEEEEEu
+static void fill_out(uint32_t* out) {
+    for (uint32_t i = 0; i < N; i++) out[i] = SENTINEL;
+}
 
 int main(void) {
     hs_v3d dev;
@@ -35,15 +42,21 @@ int main(void) {
         return 1;
     }
     hs_v3d_bo code, unif, data;
-    check(!hs_v3d_bo_new(&dev, &code, 64 << 10) && !hs_v3d_bo_new(&dev, &unif, 4 << 10) &&
-              !hs_v3d_bo_new(&dev, &data, (TABLE + 2 * N) * 4 + 4096),
-          "buffer objects created and mapped");
+    int bo_ok = !hs_v3d_bo_new(&dev, &code, 64 << 10) && !hs_v3d_bo_new(&dev, &unif, 4 << 10) &&
+                !hs_v3d_bo_new(&dev, &data, (TABLE + 2 * N) * 4 + 4096);
+    check(bo_ok, "buffer objects created and mapped");
+    if (!bo_ok) return 1; /* nothing below can run without them */
     const uint32_t handles[3] = {code.handle, unif.handle, data.handle};
     uint32_t* table = (uint32_t*)data.map;
     uint32_t* idx = table + TABLE;
     uint32_t* out = idx + N;
     volatile uint32_t* word = out + N;
-    for (uint32_t i = 0; i < TABLE; i++) table[i] = hash32(i);
+    int sentinel_free = 1;
+    for (uint32_t i = 0; i < TABLE; i++) {
+        table[i] = hash32(i);
+        sentinel_free &= table[i] != SENTINEL;
+    }
+    check(sentinel_free, "the sentinel fill equals no table value, so every unwritten word is caught");
 
     static uint64_t prog[1024];
     hs_qpu_prog p;
@@ -78,11 +91,10 @@ int main(void) {
                 n = hs_qpu_kernel_gather(&p, batches, k);
                 uint32_t gpu = n > 0 ? hs_v3d_load(&code, off, prog, (uint32_t)n) : 0;
                 uint32_t* u = (uint32_t*)unif.map + 16;
-                u[0] = N / (16u * (uint32_t)batches * (uint32_t)k);
-                u[1] = data.gpu + TABLE * 4;
-                u[2] = data.gpu;
-                u[3] = data.gpu + (TABLE + N) * 4;
-                memset(out, 0, N * 4);
+                int ue = hs_qpu_gather_uniforms(u, N, batches, k, data.gpu + TABLE * 4, data.gpu,
+                                                data.gpu + (TABLE + N) * 4);
+                if (ue) gpu = 0;
+                fill_out(out);
                 hs_v3d_dispatch_desc g = {gpu, unif.gpu + 64, (uint32_t)batches, handles, 3, 0};
                 uint64_t t0 = now_ns();
                 e = gpu ? hs_v3d_dispatch(&dev, &g) : -EINVAL;
@@ -97,9 +109,49 @@ int main(void) {
             }
     }
 
-    /* 3. the runtime refuses what was never measured or cannot be right */
+    /* 3. passes = 0: the kernel's guard ends it at once, writing nothing
+     * (without the guard the counter wrapped: a ~1 s hang and writes far
+     * past out[]) */
+    {
+        hs_qpu_prog_init(&p, prog, 1024);
+        n = hs_qpu_kernel_gather(&p, 8, 8);
+        uint32_t gpu = n > 0 ? hs_v3d_load(&code, off, prog, (uint32_t)n) : 0;
+        off += 4096;
+        uint32_t* u = (uint32_t*)unif.map + 32;
+        u[0] = 0;
+        u[1] = data.gpu + TABLE * 4;
+        u[2] = data.gpu;
+        u[3] = data.gpu + (TABLE + N) * 4;
+        fill_out(out);
+        hs_v3d_dispatch_desc z = {gpu, unif.gpu + 128, 8, handles, 3, 0};
+        uint64_t t0 = now_ns();
+        e = gpu ? hs_v3d_dispatch(&dev, &z) : -EINVAL;
+        w = e ? e : hs_v3d_bo_wait(&dev, &data, 2000000000ull);
+        double ms = (double)(now_ns() - t0) / 1e6;
+        uint32_t touched = 0;
+        for (uint32_t i = 0; i < N; i++) touched += out[i] != SENTINEL;
+        char what[128];
+        snprintf(what, sizeof(what), "gather with passes = 0 ends at once (%.2f ms) and writes nothing (%u words touched)",
+                 ms, touched);
+        check(!e && !w && ms < 100.0 && touched == 0, what);
+    }
+    uint32_t ub[4];
+    check(hs_qpu_gather_uniforms(ub, 1500, 8, 8, data.gpu, data.gpu, data.gpu) == HS_QPU_E_OPERAND &&
+              hs_qpu_gather_uniforms(ub, 0, 8, 8, data.gpu, data.gpu, data.gpu) == HS_QPU_E_OPERAND &&
+              hs_qpu_gather_uniforms(ub, 1024, 8, 8, data.gpu + 2, data.gpu, data.gpu) == HS_QPU_E_OPERAND &&
+              hs_qpu_gather_uniforms(ub, 1024, 4, 8, data.gpu, data.gpu, data.gpu) == HS_QPU_E_OPERAND &&
+              hs_qpu_gather_uniforms(ub, 1024, 8, 8, data.gpu, data.gpu, data.gpu) == 0 && ub[0] == 1,
+          "gather uniforms: element counts that are 0 or not a whole pass, misaligned addresses and 4 batches are refused");
+
+    /* 4. the runtime refuses what was never measured or cannot be right */
     hs_v3d_dispatch_desc bad = {store_gpu, unif.gpu, 9, handles, 3, 0};
-    check(hs_v3d_dispatch(&dev, &bad) == -EINVAL, "dispatch with 9 batches (unmeasured) is refused");
+    int refused = 1;
+    for (uint32_t b = 0; b <= 16; b++) {
+        if (b == 1 || b == 8) continue;
+        bad.batches = b;
+        refused &= hs_v3d_dispatch(&dev, &bad) == -EINVAL;
+    }
+    check(refused, "dispatch with any batch count but the measured 1 and 8 is refused (0, 2..7, 9..16)");
     bad.batches = 1;
     bad.nbos = 0;
     check(hs_v3d_dispatch(&dev, &bad) == -EINVAL, "dispatch without BOs is refused");
