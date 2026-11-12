@@ -11,7 +11,13 @@ make hwprobe hwprobe-progs            # probes; QPU programs into build/qpu
 sudo tools/hwprobe_cpu 2              # CPU side
 tools/hwprobe_v3d 2                   # V3D identity, BO costs, CPU<->BO bandwidth
 tools/hwprobe_qpu build/qpu 0         # QPU sections a m d c g G (all by default)
+make qpu-progs                        # NeoGPU-encoded programs -> build/qpu/neo
+tools/hwprobe_qpu build/qpu/neo 0 adgG  # the same sections from NeoGPU's own encoder
 ```
+
+Sections m and c use the reference kernels (summation, memset, scopy), which
+only the oracle assembles. The others run from NeoGPU's own encoder
+([QPU_ENCODER.md](QPU_ENCODER.md)), and its programs are word-identical.
 
 - Set the CPU governor to `performance` for the run, then restore it.
 - Make sure the daily `aide` scan is not running. One run overlapped it, and

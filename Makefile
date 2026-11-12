@@ -20,7 +20,7 @@ SRC_DIR = src
 OBJ_DIR = src
 
 # --- Graphics and runtime substrate ---
-HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_fabric.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/hs_backend_gles.c $(SRC_DIR)/hs_ipc.c $(SRC_DIR)/hs_text.c $(SRC_DIR)/hs_input_stream.c $(SRC_DIR)/main.c
+HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_fabric.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/hs_backend_gles.c $(SRC_DIR)/hs_ipc.c $(SRC_DIR)/hs_text.c $(SRC_DIR)/hs_input_stream.c $(SRC_DIR)/hs_qpu.c $(SRC_DIR)/main.c
 
 HS_OBJ = $(HS_SRC:.c=.o)
 HS_DEPS = $(HS_OBJ:.o=.d)
@@ -37,7 +37,7 @@ version:
 
 build: $(HS_TARGET)
 
-test: $(HS_TARGET) tests/test_p0 neogpu_tool tests/test_fabric tests/test_bedrock_hint tests/test_bedrock_split tests/test_gpu_participants tests/test_gles_state
+test: $(HS_TARGET) tests/test_p0 neogpu_tool tests/test_fabric tests/test_bedrock_hint tests/test_bedrock_split tests/test_gpu_participants tests/test_gles_state tests/test_qpu_encode
 	./$(HS_TARGET) --check
 	./tests/test_p0
 	python3 tests/test_cli.py
@@ -46,6 +46,8 @@ test: $(HS_TARGET) tests/test_p0 neogpu_tool tests/test_fabric tests/test_bedroc
 	./tests/test_bedrock_split
 	./tests/test_gpu_participants
 	./tests/test_gles_state
+	mkdir -p build/qpu/neo
+	./tests/test_qpu_encode build/qpu/neo
 	python3 -E tests/test_gpu_frame_report_checks.py
 	python3 -E tests/test_gles_work_report_checks.py
 	python3 tests/test_bedrock_tools.py
@@ -253,6 +255,21 @@ hwprobe-progs: tools/hwprobe_qpu_progs.py
 	mkdir -p build/qpu
 	VC6_EXAMPLES=$(VC6_EXAMPLES) $(VC6_PY) $< build/qpu
 
+# NeoGPU's own QPU encoder (src/hs_qpu.c, docs/benchmarks/QPU_ENCODER.md).
+#   make qpu-progs          NeoGPU-encoded programs into build/qpu/neo (no
+#                           dependencies); hwprobe_qpu sections a d g G run
+#                           from there: tools/hwprobe_qpu build/qpu/neo 0 adgG
+#   make qpu-encode-check   word-for-word check against the reference
+#                           assembler (needs the hwprobe-progs venv)
+.PHONY: qpu-progs qpu-encode-check
+tests/test_qpu_encode: tests/test_qpu_encode.c src/hs_qpu.o
+	$(CC) $(CFLAGS) $< src/hs_qpu.o -o $@
+qpu-progs: tests/test_qpu_encode
+	mkdir -p build/qpu/neo
+	./tests/test_qpu_encode build/qpu/neo
+qpu-encode-check: qpu-progs hwprobe-progs
+	$(VC6_PY) tools/qpu_oracle_check.py build/qpu/neo build/qpu
+
 .PHONY: pacing-tools
 pacing-tools: tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe
 
@@ -333,7 +350,7 @@ clean:
 	rm -f tests/test_evdev
 	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/panel_mode_probe tests/test_text_render
 	rm -f tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe neogpu_kworker_rt
-	rm -f $(HWPROBES)
+	rm -f $(HWPROBES) tests/test_qpu_encode
 	rm -rf build/qpu
 	rm -f bench_legacy tests/test_headless_scalar
 	rm -f tests/test_tool_sanitize tests/test_tool_tsan
