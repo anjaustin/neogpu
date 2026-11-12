@@ -20,7 +20,7 @@ SRC_DIR = src
 OBJ_DIR = src
 
 # --- Graphics and runtime substrate ---
-HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_fabric.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/hs_backend_gles.c $(SRC_DIR)/hs_ipc.c $(SRC_DIR)/hs_text.c $(SRC_DIR)/hs_input_stream.c $(SRC_DIR)/hs_qpu.c $(SRC_DIR)/main.c
+HS_SRC = $(SRC_DIR)/hs_core.c $(SRC_DIR)/hs_nodes.c $(SRC_DIR)/hs_gpu.c $(SRC_DIR)/hs_fabric.c $(SRC_DIR)/hs_async.c $(SRC_DIR)/hs_backend_gles.c $(SRC_DIR)/hs_ipc.c $(SRC_DIR)/hs_text.c $(SRC_DIR)/hs_input_stream.c $(SRC_DIR)/hs_qpu.c $(SRC_DIR)/hs_qpu_kernels.c $(SRC_DIR)/hs_v3d.c $(SRC_DIR)/main.c
 
 HS_OBJ = $(HS_SRC:.c=.o)
 HS_DEPS = $(HS_OBJ:.o=.d)
@@ -188,7 +188,8 @@ check-sources:
 	done
 
 .PHONY: test-hardware
-test-hardware: build-tests tests/test_evdev
+test-hardware: build-tests tests/test_evdev tests/test_v3d_compute
+	./tests/test_v3d_compute
 	NEOGPU_CAPTURE=tests/p0-clear.ppm ./tests/test_01_clear
 	NEOGPU_CAPTURE=tests/p0-direct-triangle.ppm ./tests/test_02_triangle
 	NEOGPU_CAPTURE=tests/p0-instancing.ppm ./tests/test_03_instancing
@@ -262,8 +263,11 @@ hwprobe-progs: tools/hwprobe_qpu_progs.py
 #   make qpu-encode-check   word-for-word check against the reference
 #                           assembler (needs the hwprobe-progs venv)
 .PHONY: qpu-progs qpu-encode-check
-tests/test_qpu_encode: tests/test_qpu_encode.c src/hs_qpu.o
-	$(CC) $(CFLAGS) $< src/hs_qpu.o -o $@
+tests/test_qpu_encode: tests/test_qpu_encode.c src/hs_qpu.o src/hs_qpu_kernels.o
+	$(CC) $(CFLAGS) $< src/hs_qpu.o src/hs_qpu_kernels.o -o $@
+# NeoGPU's own GPU path end to end on the hardware (render group, no root)
+tests/test_v3d_compute: tests/test_v3d_compute.c src/hs_qpu.o src/hs_qpu_kernels.o src/hs_v3d.o
+	$(CC) $(CFLAGS) $< src/hs_qpu.o src/hs_qpu_kernels.o src/hs_v3d.o -o $@
 qpu-progs: tests/test_qpu_encode
 	mkdir -p build/qpu/neo
 	./tests/test_qpu_encode build/qpu/neo
@@ -350,7 +354,7 @@ clean:
 	rm -f tests/test_evdev
 	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/panel_mode_probe tests/test_text_render
 	rm -f tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe neogpu_kworker_rt
-	rm -f $(HWPROBES) tests/test_qpu_encode
+	rm -f $(HWPROBES) tests/test_qpu_encode tests/test_v3d_compute
 	rm -rf build/qpu
 	rm -f bench_legacy tests/test_headless_scalar
 	rm -f tests/test_tool_sanitize tests/test_tool_tsan

@@ -14,6 +14,7 @@
  * tools/qpu_oracle_check.py compares 1 and 3 with the reference assembler.
  * Exit status is nonzero if any step here fails. */
 #include "hs_qpu.h"
+#include "hs_qpu_kernels.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,55 +83,8 @@ static void prog_alu(hs_qpu_prog* p, int inner) {
     hs_qpu_emit_end(p);
 }
 
-static void prog_gather(hs_qpu_prog* p, int nq, int k) {
-    for (int i = 0; i < 4; i++) ldunifrf(p, i);
-    int shift = nq == 1 ? 0 : 3;
-    if (nq == 1) {
-        emit(p, hs_qpu_a(HS_QPU_A_MOV, RF(5), I(0), X));
-    } else {
-        emit(p, hs_qpu_a(HS_QPU_A_TIDX, R(0), X, X));
-        emit(p, hs_qpu_a(HS_QPU_A_SHR, R(0), R(0), I(2)));
-        emit(p, hs_qpu_a(HS_QPU_A_BAND, RF(5), R(0), I(15)));
-    }
-    emit(p, hs_qpu_a(HS_QPU_A_SHL, R(0), RF(5), I(4)));
-    emit(p, hs_qpu_a(HS_QPU_A_EIDX, R(1), X, X));
-    emit(p, hs_qpu_a(HS_QPU_A_ADD, R(0), R(0), R(1)));
-    emit(p, hs_qpu_a(HS_QPU_A_SHL, R(0), R(0), I(2)));
-    emit(p, hs_qpu_a(HS_QPU_A_ADD, RF(1), RF(1), R(0)));
-    emit(p, hs_qpu_a(HS_QPU_A_ADD, RF(3), RF(3), R(0)));
-    emit(p, hs_qpu_a(HS_QPU_A_MOV, R(0), I(1), X));
-    emit(p, hs_qpu_a(HS_QPU_A_SHL, RF(4), R(0), I(6 + shift)));
-    int l = hs_qpu_label_new(p);
-    hs_qpu_label_bind(p, l);
-    for (int i = 0; i < k; i++) {
-        hs_qpu_alu x = hs_qpu_m(hs_qpu_a(HS_QPU_A_MOV, HS_QPU_TMUA, RF(1), X), HS_QPU_M_ADD, RF(1), RF(1), RF(4));
-        emit(p, i == k - 1 ? hs_qpu_s(x, HS_QPU_SIG_THRSW, X) : x);
-    }
-    nop(p);
-    nop(p);
-    for (int i = 0; i < k; i++) {
-        emit(p, hs_qpu_s(hs_qpu_alu_nop(), HS_QPU_SIG_LDTMU, R(0)));
-        emit(p, hs_qpu_a(HS_QPU_A_SHL, R(0), R(0), I(2)));
-        hs_qpu_alu x = hs_qpu_a(HS_QPU_A_ADD, HS_QPU_TMUA, R(0), RF(2));
-        emit(p, i == k - 1 ? hs_qpu_s(x, HS_QPU_SIG_THRSW, X) : x);
-    }
-    nop(p);
-    nop(p);
-    for (int i = 0; i < k; i++) {
-        emit(p, hs_qpu_s(hs_qpu_alu_nop(), HS_QPU_SIG_LDTMU, R(1)));
-        emit(p, hs_qpu_a(HS_QPU_A_MOV, HS_QPU_TMUD, R(1), X));
-        emit(p, hs_qpu_m(hs_qpu_a(HS_QPU_A_MOV, HS_QPU_TMUA, RF(3), X), HS_QPU_M_ADD, RF(3), RF(3), RF(4)));
-    }
-    hs_qpu_alu s = hs_qpu_a(HS_QPU_A_SUB, RF(0), RF(0), I(1));
-    s.af = HS_QPU_PF_PUSHZ;
-    emit(p, s);
-    hs_qpu_branch(p, HS_QPU_B_NA0, l, 0, 0);
-    nop(p);
-    nop(p);
-    nop(p);
-    emit(p, hs_qpu_a(HS_QPU_A_TMUWT, X, X, X));
-    hs_qpu_emit_end(p);
-}
+/* the shipped kernel (src/hs_qpu_kernels.c) is what the oracle compares */
+static void prog_gather(hs_qpu_prog* p, int nq, int k) { hs_qpu_kernel_gather(p, nq, k); }
 
 enum { LD_THRSW, LD_DELAY, LD_TMUAU };
 static void prog_ldtest(hs_qpu_prog* p, int form) {
@@ -183,7 +137,7 @@ static void build_programs(void) {
     hs_qpu_emit_end(&p);
     save("end", &p);
     hs_qpu_prog_init(&p, buf, 4096);
-    prog_done(&p, 1);
+    hs_qpu_kernel_store_one(&p); /* the shipped kernel is what the oracle compares */
     save("done", &p);
     hs_qpu_prog_init(&p, buf, 4096);
     hs_qpu_prog_rules(&p, 0); /* evidence: ends with its write in flight */

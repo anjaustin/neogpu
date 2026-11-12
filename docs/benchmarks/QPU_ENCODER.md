@@ -215,6 +215,42 @@ on the Pi.
 The 8-QPU, 4-in-flight sequential gather was slow again: 19.7 ms, now 3 of 3
 runs.
 
+## NeoGPU's own GPU path: hs_v3d and the shipped kernels
+
+These two modules complete a GPU path with nothing outside the tree: no Mesa,
+no libdrm, no GLES, no external assembler.
+
+`src/hs_v3d.c` and `include/hs_v3d.h` talk to the kernel v3d driver directly,
+using kernel UAPI headers only:
+- find the v3d render node;
+- create, map, wait on and free buffer objects;
+- load a program;
+- dispatch a compute job.
+
+The dispatch accepts 1..8 batches: the measured layout, one 16-lane batch
+per QPU.
+
+`src/hs_qpu_kernels.c` holds the programs NeoGPU ships, built with hs_qpu:
+- `hs_qpu_kernel_gather`: 1 or 8 batches, with 1, 2, 4 or 8 loads in flight;
+- `hs_qpu_kernel_store_one`.
+
+The oracle check compares these shipped builders word for word, so what ships
+is what was verified.
+
+`tests/test_v3d_compute` (in `make test-hardware`; needs the render group,
+not root) runs the whole chain on the GPU: 22 checks, every output word
+compared with the CPU, 0 GPU hangs.
+- store_one: dispatched, completed, and its write is visible to the CPU.
+- 16 gathers: random and sequential indices, 1 and 8 batches, 1–8 loads in
+  flight, each over 1 M elements from a 4 MiB table. 0 words wrong in every
+  one.
+- Refused: 9 batches (unmeasured), a dispatch without BOs, and misaligned or
+  overflowing program loads.
+
+The test's timings are not a benchmark, but the slow 8-batch 4-in-flight
+sequential case shows up there too: 3.78 ms, against 2.72 ms for 2 in flight
+and 1.84 ms for 8.
+
 ## Red team, 2026-11-15
 
 An independent review found 14 issues; each one was reproduced with a small
