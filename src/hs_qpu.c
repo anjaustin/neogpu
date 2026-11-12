@@ -243,6 +243,9 @@ static int op_enc(const op_desc* d, hs_qpu_reg a, hs_qpu_reg b, raddrs* r, unsig
         /* The pair (fadd, faddnf) shares an opcode, as does (fmin, fmax):
          * the hardware tells them apart by operand order. */
         if (d->kind != K_FTWO) {
+            /* identical inputs have one order only: fine for fadd and fmin,
+             * and fmax(x, x) == fmin(x, x); faddnf would silently become fadd */
+            if (*ma == *mb && d->opcode == ADD_OPS[HS_QPU_A_FADDNF].opcode && d->kind == K_FORD1) return HS_QPU_E_ORDER;
             int ordered_high = F32_UNPACK_NONE * 8 + *ma > F32_UNPACK_NONE * 8 + *mb;
             if ((d->kind == K_FORD0 && ordered_high) || (d->kind == K_FORD1 && !ordered_high)) {
                 unsigned t = *ma;
@@ -277,6 +280,32 @@ static int cond_enc(const hs_qpu_alu* in, unsigned* cond) {
     return 0;
 }
 
+static int is_null(hs_qpu_reg d) { return d == HS_QPU_NOREG || d == HS_QPU_NULL; }
+static int is_tmu_reg(hs_qpu_reg d) {
+    unsigned k = d >> 8, w = d & 0xFF;
+    return k == 2 && ((w >= 10 && w <= 13) || (w >= 32 && w <= 46));
+}
+/* the destinations an instruction writes: add, mul, and a writing signal */
+static int writes(const hs_qpu_alu* in, hs_qpu_reg out[3]) {
+    int n = 0;
+    if (!is_null(in->add.dst)) out[n++] = in->add.dst;
+    if (!is_null(in->mul.dst)) out[n++] = in->mul.dst;
+    if ((in->sig & SIG_WRITERS) && !is_null(in->sig_dst)) out[n++] = in->sig_dst;
+    return n;
+}
+/* one instruction may not write a register twice, nor issue two TMU writes:
+ * the order between them would be undefined */
+static int write_conflicts(const hs_qpu_alu* in) {
+    hs_qpu_reg w[3];
+    int n = writes(in, w), tmu = 0;
+    for (int i = 0; i < n; i++) {
+        tmu += is_tmu_reg(w[i]);
+        for (int j = i + 1; j < n; j++)
+            if (w[i] == w[j]) return HS_QPU_E_WRITE;
+    }
+    return tmu > 1 ? HS_QPU_E_WRITE : 0;
+}
+
 int hs_qpu_pack_alu(const hs_qpu_alu* in, uint64_t* out) {
     if (in->add.op >= HS_QPU_A_COUNT || in->mul.op >= HS_QPU_M_COUNT) return HS_QPU_E_OP;
     raddrs r = {-1, -1, 0};
@@ -285,6 +314,7 @@ int hs_qpu_pack_alu(const hs_qpu_alu* in, uint64_t* out) {
     if ((e = op_enc(&ADD_OPS[in->add.op], in->add.a, in->add.b, &r, &aop, &amux_a, &amux_b))) return e;
     if ((e = op_enc(&MUL_OPS[in->mul.op], in->mul.a, in->mul.b, &r, &mop, &mmux_a, &mmux_b))) return e;
     if ((e = dst_enc(in->add.dst, &ama, &awa)) || (e = dst_enc(in->mul.dst, &mma, &mwa))) return e;
+    if ((e = write_conflicts(in))) return e;
 
     uint32_t sig = in->sig & ~(uint32_t)HS_QPU_SIG_SMIMM;
     if (r.rb_imm) sig |= HS_QPU_SIG_SMIMM;
@@ -330,18 +360,30 @@ void hs_qpu_prog_init(hs_qpu_prog* p, uint64_t* buf, uint32_t cap) {
     p->code = buf;
     p->cap = cap;
     p->rules = 1;
+    p->last_branch = -8;
 }
 void hs_qpu_prog_rules(hs_qpu_prog* p, int on) { p->rules = on; }
 
-static void fail(hs_qpu_prog* p, int e) {
-    if (!p->err) p->err = e;
+static void fail_at(hs_qpu_prog* p, int e, uint32_t at) {
+    if (!p->err) {
+        p->err = e;
+        p->rule_at = at;
+    }
 }
-
-static int is_tmu_addr(hs_qpu_reg d) { return d == HS_QPU_TMUA || d == HS_QPU_TMUAU; }
+/* a rule violation: always recorded; an error now if the rules are on, and
+ * at hs_qpu_prog_finish if they are on by then */
+static void violate(hs_qpu_prog* p, int e, uint32_t at) {
+    if (!p->viol) {
+        p->viol = e;
+        p->viol_at = at;
+    }
+    if (p->rules) fail_at(p, e, at);
+}
 
 /* rule tracking, in program order, for the instruction about to be at p->n */
 static void track(hs_qpu_prog* p, const hs_qpu_alu* in) {
     uint32_t idx = p->n;
+    /* ldtmu reads the oldest outstanding load (before this instruction's writes) */
     if (in->sig & HS_QPU_SIG_LDTMU) {
         int ok = 0;
         if (p->nloads) {
@@ -351,10 +393,7 @@ static void track(hs_qpu_prog* p, const hs_qpu_alu* in) {
             for (uint32_t i = 0; i < p->nthrsw; i++)
                 if (p->thrsw[i] >= l && p->thrsw[i] + 3 <= idx) ok = 1;
         }
-        if (!ok && !p->err) {
-            p->err = HS_QPU_E_RULE_LOAD;
-            p->rule_at = idx;
-        }
+        if (!ok) violate(p, HS_QPU_E_RULE_LOAD, idx);
     }
     if (in->sig & HS_QPU_SIG_THRSW) {
         if (p->nthrsw == 16) {
@@ -363,58 +402,81 @@ static void track(hs_qpu_prog* p, const hs_qpu_alu* in) {
         }
         p->thrsw[p->nthrsw++] = idx;
     }
-    const hs_qpu_reg dsts[2] = {in->add.dst, in->mul.dst};
-    for (int i = 0; i < 2; i++) {
-        if (dsts[i] == HS_QPU_TMUD) {
+    /* at most one TMU write per instruction (hs_qpu_pack_alu), so slot order
+     * cannot matter; a writing signal's destination counts like an ALU's */
+    hs_qpu_reg w[3];
+    int n = writes(in, w);
+    for (int i = 0; i < n; i++) {
+        if (!is_tmu_reg(w[i])) continue;
+        if (w[i] == HS_QPU_TMUD) {
             p->tmud_pending++;
-        } else if (is_tmu_addr(dsts[i])) {
+        } else if (w[i] == HS_QPU_TMUA || w[i] == HS_QPU_TMUAU) {
             if (p->tmud_pending) {
                 p->store_pending = 1;
                 p->tmud_pending = 0;
             } else if (p->nloads < 16) {
                 p->loads[p->nloads++] = idx;
             } else {
-                fail(p, HS_QPU_E_FULL);
+                fail_at(p, HS_QPU_E_FULL, idx);
             }
+        } else {
+            violate(p, HS_QPU_E_RULE_UNCHECKED, idx);
         }
     }
-    if (in->add.op == HS_QPU_A_TMUWT || in->add.op == HS_QPU_A_BARRIERID) p->store_pending = 0;
+    /* what clears a pending store: tmuwt, or the measured barrier form */
+    if (in->add.op == HS_QPU_A_TMUWT ||
+        (in->add.op == HS_QPU_A_BARRIERID && in->add.dst == HS_QPU_SYNCB && (in->sig & HS_QPU_SIG_THRSW)))
+        p->store_pending = 0;
+    /* branch delay slots: no thrsw (conservative) */
+    if ((int32_t)idx - p->last_branch <= 3 && (in->sig & HS_QPU_SIG_THRSW)) fail_at(p, HS_QPU_E_BRANCH, idx);
 }
 
 void hs_qpu_emit(hs_qpu_prog* p, const hs_qpu_alu* in) {
     uint64_t w;
     int e = hs_qpu_pack_alu(in, &w);
     if (e) {
-        if (!p->err) p->rule_at = p->n;
-        fail(p, e);
+        fail_at(p, e, p->n);
         return;
     }
     if (p->n >= p->cap) {
-        fail(p, HS_QPU_E_FULL);
+        fail_at(p, HS_QPU_E_FULL, p->n);
         return;
     }
-    if (p->rules) track(p, in);
+    track(p, in);
     p->code[p->n++] = w;
 }
 
 int hs_qpu_label_new(hs_qpu_prog* p) {
     if (p->nlabels >= HS_QPU_MAX_LABELS) {
-        fail(p, HS_QPU_E_FULL);
+        fail_at(p, HS_QPU_E_FULL, p->n);
         return -1;
     }
     p->label_at[p->nlabels] = -1;
     return (int)p->nlabels++;
 }
 void hs_qpu_label_bind(hs_qpu_prog* p, int label) {
-    if (label < 0 || (uint32_t)label >= p->nlabels) {
-        fail(p, HS_QPU_E_LABEL);
+    /* a label binds once: rebinding would silently move earlier branches */
+    if (label < 0 || (uint32_t)label >= p->nlabels || p->label_at[label] >= 0) {
+        fail_at(p, HS_QPU_E_LABEL, p->n);
         return;
     }
     p->label_at[label] = (int32_t)p->n;
 }
 void hs_qpu_branch(hs_qpu_prog* p, int cond, int label, int ub, int ub_abs) {
+    if (label < 0 || (uint32_t)label >= p->nlabels) {
+        fail_at(p, HS_QPU_E_LABEL, p->n);
+        return;
+    }
+    if (cond < 0 || cond > 7 || cond == 1 || (ub != 0 && ub != 1) || (ub_abs != 0 && ub_abs != 1)) {
+        fail_at(p, HS_QPU_E_COND, p->n);
+        return;
+    }
+    if ((int32_t)p->n - p->last_branch <= 3) { /* a branch in another's delay slots */
+        fail_at(p, HS_QPU_E_BRANCH, p->n);
+        return;
+    }
     if (p->n >= p->cap || p->nfix >= HS_QPU_MAX_FIXUPS) {
-        fail(p, HS_QPU_E_FULL);
+        fail_at(p, HS_QPU_E_FULL, p->n);
         return;
     }
     p->fix[p->nfix].at = p->n;
@@ -423,6 +485,7 @@ void hs_qpu_branch(hs_qpu_prog* p, int cond, int label, int ub, int ub_abs) {
     p->fix[p->nfix].ub = (uint8_t)ub;
     p->fix[p->nfix].ub_abs = (uint8_t)ub_abs;
     p->nfix++;
+    p->last_branch = (int32_t)p->n;
     p->code[p->n++] = 0; /* patched in hs_qpu_prog_finish */
 }
 
@@ -436,23 +499,29 @@ void hs_qpu_emit_end(hs_qpu_prog* p) {
 }
 
 int hs_qpu_prog_finish(hs_qpu_prog* p) {
+    if (!p->err && p->nfix && p->n - (uint32_t)p->last_branch - 1 < 3) /* last branch lacks delay slots */
+        fail_at(p, HS_QPU_E_BRANCH, (uint32_t)p->last_branch);
     for (uint32_t i = 0; i < p->nfix && !p->err; i++) {
         uint32_t l = p->fix[i].label;
         if (l >= p->nlabels || p->label_at[l] < 0) {
-            fail(p, HS_QPU_E_LABEL);
+            fail_at(p, HS_QPU_E_LABEL, p->fix[i].at);
             break;
         }
         int64_t rel = ((int64_t)p->label_at[l] - (int64_t)p->fix[i].at - 4) * 8;
         if (rel < INT32_MIN || rel > INT32_MAX) {
-            fail(p, HS_QPU_E_RANGE);
+            fail_at(p, HS_QPU_E_RANGE, p->fix[i].at);
             break;
         }
         int e = hs_qpu_pack_branch(p->fix[i].cond, (int32_t)rel, p->fix[i].ub, p->fix[i].ub_abs, &p->code[p->fix[i].at]);
-        if (e) fail(p, e);
+        if (e) fail_at(p, e, p->fix[i].at);
     }
-    if (!p->err && p->rules && p->store_pending) {
-        p->err = HS_QPU_E_RULE_END;
-        p->rule_at = p->n;
+    /* rule 2, plus the conservative end checks: nothing left in flight */
+    if (p->store_pending || p->tmud_pending || p->nloads) {
+        if (!p->viol) {
+            p->viol = HS_QPU_E_RULE_END;
+            p->viol_at = p->n;
+        }
     }
+    if (!p->err && p->rules && p->viol) fail_at(p, p->viol, p->viol_at);
     return p->err ? p->err : (int)p->n;
 }

@@ -37,6 +37,17 @@ def known_divergence(neo, ref):
             and (neo >> 21) & 7 == 1 and (ref >> 21) & 7 == 0)
 
 
+# Exceptions that mean the corpus line itself is broken (a printer bug in
+# tests/test_qpu_encode.c), not that the oracle judged the instruction
+# illegal. They fail the check whatever NeoGPU did.
+HARNESS_ERRORS = (SyntaxError, NameError, TypeError, AttributeError)
+
+# NeoGPU refuses faddnf with identical inputs (HS_QPU_E_ORDER, -11): operand
+# order is the only thing that tells faddnf from fadd, and identical inputs
+# have one order, so the oracle silently emits fadd.
+KNOWN_NEO_REJECT = '-11'
+
+
 def oracle(src):
     @qpu
     def p(asm):
@@ -56,7 +67,7 @@ def main():
 
     # 1. instruction corpus
     n_ok = n_rej_both = 0
-    mism, neo_only_rej, oracle_rej, known = [], [], [], []
+    mism, neo_only_rej, oracle_rej, known, known_rej, harness = [], [], [], [], [], []
     with open(os.path.join(neo, 'corpus.txt')) as f:
         for line in f:
             head, src = line.rstrip('\n').split('\t', 1)
@@ -64,12 +75,17 @@ def main():
                 w = oracle(src)
                 assert len(w) == 1
                 w = w[0]
+            except HARNESS_ERRORS as e:
+                harness.append((src, f'{type(e).__name__}: {e}'))
+                continue
             except Exception as e:  # noqa: BLE001
                 w = None
                 err = f'{type(e).__name__}: {e}'
             if head.startswith('REJECT'):
                 if w is None:
                     n_rej_both += 1
+                elif head.split()[1] == KNOWN_NEO_REJECT:
+                    known_rej.append(src)
                 else:
                     neo_only_rej.append((src, head))
             elif w is None:
@@ -82,7 +98,11 @@ def main():
                 mism.append((src, int(head, 16), w))
     print(f'corpus: {n_ok} identical, {len(mism)} different, {len(oracle_rej)} the oracle rejects, '
           f'{n_rej_both} rejected by both, {len(neo_only_rej)} rejected by NeoGPU only, '
-          f'{len(known)} known divergences')
+          f'{len(known) + len(known_rej)} known divergences, {len(harness)} broken corpus lines')
+    for src in known_rej:
+        print(f'  KNOWN DIVERGENCE {src}: NeoGPU refuses faddnf with identical inputs; the oracle emits fadd')
+    for src, err in harness:
+        print(f'  BROKEN CORPUS LINE {src}: {err[:100]}')
     for src, a, r in known:
         print(f'  KNOWN DIVERGENCE {src}: neo {a:016x} ref {r:016x} (oracle sets fmov input modifier abs on '
               f'small immediates; NeoGPU encodes none, as every float op does)')
@@ -92,7 +112,7 @@ def main():
         print(f'  ORACLE REJECTS {src}: {err[:100]}')
     for src, head in neo_only_rej[:30]:
         print(f'  NEO ONLY REJECTS ({head}) {src}')
-    bad += len(mism) + len(oracle_rej)
+    bad += len(mism) + len(oracle_rej) + len(neo_only_rej) + len(harness)
 
     # 2. our programs, as assembled by the oracle in tools/hwprobe_qpu_progs.py
     progs = ['end', 'done', 'done_nowt', 'alu64', 'ld_thrsw', 'ld_delay', 'ld_tmuau'] + \
@@ -122,7 +142,17 @@ def main():
                 if a != r:
                     nbad += 1
                     print(f'  BRANCH DIFF cond={cn} n={n} ub={ub}: neo {a[n]:016x} ref {r[n]:016x}')
-    print(f'branches: {nb - nbad} of {nb} loop programs identical')
+            # forward: branch over its delay slots and n nops to a later label
+            for ub in range(3):
+                tail = '' if ub == 0 else f'.unif_addr(absolute={ub == 2})'
+                src = (f"b(R.fwd, cond='{cn}'){tail}\nnop(); nop(); nop()\nfor _ in range({n}): nop()\n"
+                       f"L.fwd\nnop()")
+                a, r = words(os.path.join(neo, f'brf_{c}_{n}_{ub}.bin')), oracle(src)
+                nb += 1
+                if a != r:
+                    nbad += 1
+                    print(f'  FORWARD BRANCH DIFF cond={cn} n={n} ub={ub}: neo {a[0]:016x} ref {r[0]:016x}')
+    print(f'branches: {nb - nbad} of {nb} programs identical (backward loops and forward jumps)')
     bad += nbad
     print('ALL IDENTICAL' if not bad else f'{bad} MISMATCHES')
     return 1 if bad else 0

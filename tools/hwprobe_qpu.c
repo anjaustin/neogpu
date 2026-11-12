@@ -92,20 +92,40 @@ static void bo_wait(const bo_t* b) {
 static bo_t code, unif, data;
 static uint32_t handles[3];
 typedef struct {
-    const char* name;
+    char name[48];
     uint32_t off; /* within code BO */
     uint32_t n;
 } prog_t;
 static uint32_t code_pos;
+static prog_t loaded[128];
+static unsigned nloaded;
+/* Load a program once (cached by name). The file must be a non-empty whole
+ * number of 64-bit instructions that fits in the code BO; anything else is
+ * fatal, so the GPU never runs a truncated or empty program. */
 static prog_t load(const char* name) {
+    for (unsigned i = 0; i < nloaded; i++)
+        if (!strcmp(loaded[i].name, name)) return loaded[i];
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.bin", progdir, name);
     FILE* f = fopen(path, "rb");
     if (!f) die(path);
-    prog_t p = {name, code_pos, 0};
-    p.n = (uint32_t)fread(code.map + code_pos, 8, (code.size - code_pos) / 8, f);
+    if (fseek(f, 0, SEEK_END)) die(path);
+    long size = ftell(f);
+    rewind(f);
+    if (size <= 0 || size % 8 || (size_t)size > code.size - code_pos || nloaded == 128 ||
+        strlen(name) >= sizeof(loaded[0].name)) {
+        fprintf(stderr, "%s: %ld bytes; need a non-empty multiple of 8 within the %zu bytes left\n", path, size,
+                code.size - code_pos);
+        exit(1);
+    }
+    prog_t p;
+    snprintf(p.name, sizeof(p.name), "%s", name);
+    p.off = code_pos;
+    p.n = (uint32_t)(size / 8);
+    if (fread(code.map + code_pos, 8, p.n, f) != p.n) die(path);
     fclose(f);
     code_pos += (p.n * 8 + 4095) & ~4095u;
+    loaded[nloaded++] = p;
     return p;
 }
 
@@ -314,6 +334,10 @@ static void section_dispatch(void) {
     /* time until a GPU write is visible to a CPU spinning on the mapped word */
     /* HWPROBE_FLAGKB: flag offset in the data BO, KiB (default 65536 = 64 MiB) */
     uint32_t flag_off = (getenv("HWPROBE_FLAGKB") ? (uint32_t)atoi(getenv("HWPROBE_FLAGKB")) : 65536u) << 10;
+    if ((size_t)flag_off + 4 > data.size) {
+        fprintf(stderr, "HWPROBE_FLAGKB: offset %u is outside the %zu-byte data BO\n", flag_off, data.size);
+        exit(1);
+    }
     volatile uint32_t* flag = (volatile uint32_t*)(data.map + flag_off);
     *U(16384) = data.gpu + flag_off;
     double vis[N], tot[N];
@@ -398,8 +422,8 @@ static void section_concurrent(void) {
     u[2] = data.gpu + (uint32_t)(sum_len * 4);
     u[3] = u[4] = 0xFCFCFCFC;
     u[5] = (uint32_t)(4 * (-nu + 3));
-    rd_t rd[4];
-    for (int i = 0; i < 4; i++) {
+    rd_t rd[3];
+    for (int i = 0; i < 3; i++) {
         rd[i].buf = mmap(NULL, 64u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         madvise(rd[i].buf, 64u << 20, MADV_HUGEPAGE);
         memset(rd[i].buf, 1, 64u << 20);
@@ -448,6 +472,7 @@ static void section_concurrent(void) {
         alone[t] = cb;
     }
     printf("3 CPU reader threads, GPU idle: %.2f GB/s\n", median(alone, 5));
+    for (int i = 0; i < 3; i++) munmap(rd[i].buf, 64u << 20);
 }
 
 /* ---------------- gather: out[i] = table[idx[i]] ---------------- */
@@ -516,9 +541,18 @@ static uint32_t hash32(uint32_t x) { return x * 2654435761u ^ (x >> 7); }
 typedef struct {
     double done_ns;
     uint64_t t0;
+    int cpu; /* core for the waiter, or -1 for any core */
 } gwait_t;
+/* Times GPU completion. It must not inherit the main thread's pin to core 0,
+ * which a CPU gather thread also uses: then its wakeup would wait for the
+ * scheduler and the GPU time would include that delay. */
 static void* gpu_waiter(void* a) {
     gwait_t* w = a;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int c = 0; c < 4; c++)
+        if (w->cpu < 0 || w->cpu == c) CPU_SET(c, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
     bo_wait(&data);
     w->done_ns = (double)(now_ns() - w->t0);
     return NULL;
@@ -556,7 +590,7 @@ static void section_gather_concurrent(void) {
         for (int t = 0; t < 5; t++) {
             memset(go, 0, (size_t)G_N * 4);
             memset(co, 0, (size_t)G_N * 4);
-            gwait_t w = {0, now_ns()};
+            gwait_t w = {0, now_ns(), nthr == 3 ? 3 : -1};
             pthread_t wt;
             if (gpu) {
                 submit(&p, 20480, 8, 0);

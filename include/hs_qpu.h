@@ -11,11 +11,18 @@
  * default (docs/benchmarks/HARDWARE_MAP_2026-11-15.md); breaking either hung
  * the GPU:
  *   1. every TMU load that ldtmu reads has a thrsw signal at or after the
- *      load request and at least two instructions before the ldtmu;
- *   2. a program does not end with TMU writes in flight (tmuwt first).
+ *      load request, with at least two instructions between that thrsw and
+ *      the ldtmu;
+ *   2. a program does not end with TMU writes in flight: tmuwt, or the
+ *      measured barrierid(syncb) + thrsw, after the last store.
+ * Conservative additions (not measured to hang, refused until they are): no
+ * unread loads or address-less tmud writes at the end; no TMU texture or
+ * config register writes (outside what the rules model); no thrsw or branch
+ * in a branch delay slot.
  * The check follows instructions in program order (a loop body is checked as
  * written) and assumes one ldtmu per load (the default TMU configuration).
- * Only TMUA/TMUAU general loads and stores are tracked.
+ * Rule state is tracked even while the rules are off; hs_qpu_prog_finish
+ * reports any violation if the rules are on when it runs.
  */
 #ifndef HS_QPU_H
 #define HS_QPU_H
@@ -27,10 +34,12 @@
  * written. Magic registers (TMU, TLB, sync, ...) are write-only. Small
  * immediates are read-only and use the instruction's raddr_b slot. */
 typedef uint16_t hs_qpu_reg;
-#define HS_QPU_R(n) ((hs_qpu_reg)(0x000u | (unsigned)(n)))
-#define HS_QPU_RF(n) ((hs_qpu_reg)(0x100u | (unsigned)(n)))
-#define HS_QPU_MAGIC(w) ((hs_qpu_reg)(0x200u | (unsigned)(w)))
-#define HS_QPU_SMALL(i) ((hs_qpu_reg)(0x300u | (unsigned)(i)))
+/* out-of-range indexes give HS_QPU_BADREG, which every slot rejects */
+#define HS_QPU_BADREG ((hs_qpu_reg)0xFFFEu)
+#define HS_QPU_R(n) ((unsigned)(n) < 6u ? (hs_qpu_reg)(0x000u | (unsigned)(n)) : HS_QPU_BADREG)
+#define HS_QPU_RF(n) ((unsigned)(n) < 64u ? (hs_qpu_reg)(0x100u | (unsigned)(n)) : HS_QPU_BADREG)
+#define HS_QPU_MAGIC(w) ((unsigned)(w) < 64u ? (hs_qpu_reg)(0x200u | (unsigned)(w)) : HS_QPU_BADREG)
+#define HS_QPU_SMALL(i) ((unsigned)(i) < 48u ? (hs_qpu_reg)(0x300u | (unsigned)(i)) : HS_QPU_BADREG)
 #define HS_QPU_NOREG ((hs_qpu_reg)0xFFFFu)
 
 #define HS_QPU_R0 HS_QPU_R(0)
@@ -192,7 +201,11 @@ enum {
     HS_QPU_E_LABEL = -7,    /* branch to an unbound or unknown label */
     HS_QPU_E_RANGE = -8,    /* branch offset out of range */
     HS_QPU_E_RULE_LOAD = -9, /* ldtmu reads a load with no thrsw between (rule 1) */
-    HS_QPU_E_RULE_END = -10, /* program ends with TMU writes in flight (rule 2) */
+    HS_QPU_E_RULE_END = -10, /* program ends with TMU traffic in flight (rule 2) */
+    HS_QPU_E_ORDER = -11,    /* faddnf with identical inputs: operand order cannot tell it from fadd */
+    HS_QPU_E_BRANCH = -12,   /* branch without 3 delay slots, or thrsw/branch in a delay slot */
+    HS_QPU_E_WRITE = -13,    /* two writes to one register, or two TMU writes, in one instruction */
+    HS_QPU_E_RULE_UNCHECKED = -14, /* TMU texture/config write: outside the measured rules */
 };
 
 int hs_qpu_pack_alu(const hs_qpu_alu* in, uint64_t* out);
@@ -221,7 +234,10 @@ typedef struct {
     uint32_t thrsw[16], nthrsw; /* recent thrsw indices */
     uint32_t tmud_pending;      /* TMUD writes since the last TMUA */
     int store_pending;          /* TMU stores not yet waited for */
-    uint32_t rule_at;           /* instruction that broke a rule */
+    int32_t last_branch;        /* index of the last branch, for delay slots */
+    int viol;                   /* first rule violation (tracked even with rules off) */
+    uint32_t viol_at;
+    uint32_t rule_at;           /* instruction that caused p->err */
 } hs_qpu_prog;
 
 void hs_qpu_prog_init(hs_qpu_prog* p, uint64_t* buf, uint32_t cap);

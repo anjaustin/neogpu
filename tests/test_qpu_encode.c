@@ -214,6 +214,155 @@ static void build_programs(void) {
     }
 }
 
+/* one program from a callback; returns hs_qpu_prog_finish's result */
+typedef void (*body_fn)(hs_qpu_prog*);
+static int run_body(body_fn f) {
+    hs_qpu_prog p;
+    hs_qpu_prog_init(&p, buf, 4096);
+    f(&p);
+    return hs_qpu_prog_finish(&p);
+}
+static void store(hs_qpu_prog* p) {
+    emit(p, hs_qpu_a(HS_QPU_A_MOV, HS_QPU_TMUD, R(0), X));
+    emit(p, hs_qpu_a(HS_QPU_A_MOV, HS_QPU_TMUA, RF(0), X));
+}
+static void b_barrier_r0(hs_qpu_prog* p) {
+    store(p);
+    emit(p, hs_qpu_a(HS_QPU_A_BARRIERID, R(0), X, X));
+    hs_qpu_emit_end(p);
+}
+static void b_barrier_syncb_thrsw(hs_qpu_prog* p) {
+    store(p);
+    emit(p, hs_qpu_s(hs_qpu_a(HS_QPU_A_BARRIERID, HS_QPU_SYNCB, X, X), HS_QPU_SIG_THRSW, X));
+    nop(p);
+    nop(p);
+    hs_qpu_emit_end(p);
+}
+static void b_barrier_syncb_nothrsw(hs_qpu_prog* p) {
+    store(p);
+    emit(p, hs_qpu_a(HS_QPU_A_BARRIERID, HS_QPU_SYNCB, X, X));
+    hs_qpu_emit_end(p);
+}
+static void b_store_sigdst(hs_qpu_prog* p) { /* store data arrives through ldunifrf -> tmud */
+    emit(p, hs_qpu_s(hs_qpu_alu_nop(), HS_QPU_SIG_LDUNIFRF, HS_QPU_TMUD));
+    emit(p, hs_qpu_a(HS_QPU_A_MOV, HS_QPU_TMUA, RF(0), X));
+    hs_qpu_emit_end(p);
+}
+static void b_load_sigdst(hs_qpu_prog* p) { /* load address arrives through ldunifrf -> tmua */
+    emit(p, hs_qpu_s(hs_qpu_alu_nop(), HS_QPU_SIG_LDUNIFRF | HS_QPU_SIG_THRSW, HS_QPU_TMUA));
+    nop(p);
+    nop(p);
+    emit(p, hs_qpu_s(hs_qpu_alu_nop(), HS_QPU_SIG_LDTMU, R(0)));
+    hs_qpu_emit_end(p);
+}
+static void b_unread_load(hs_qpu_prog* p) {
+    emit(p, hs_qpu_s(hs_qpu_a(HS_QPU_A_MOV, HS_QPU_TMUA, RF(0), X), HS_QPU_SIG_THRSW, X));
+    hs_qpu_emit_end(p);
+}
+static void b_dangling_tmud(hs_qpu_prog* p) {
+    emit(p, hs_qpu_a(HS_QPU_A_MOV, HS_QPU_TMUD, R(0), X));
+    hs_qpu_emit_end(p);
+}
+static void b_rules_toggled(hs_qpu_prog* p) {
+    hs_qpu_prog_rules(p, 0);
+    store(p);
+    hs_qpu_prog_rules(p, 1);
+    hs_qpu_emit_end(p);
+}
+static void b_texture_write(hs_qpu_prog* p) {
+    emit(p, hs_qpu_a(HS_QPU_A_MOV, HS_QPU_TMUS, R(0), X));
+    hs_qpu_emit_end(p);
+}
+static void b_branch_last(hs_qpu_prog* p) {
+    int l = hs_qpu_label_new(p);
+    hs_qpu_label_bind(p, l);
+    nop(p);
+    hs_qpu_branch(p, HS_QPU_B_ALWAYS, l, 0, 0);
+}
+static void b_thrsw_in_delay(hs_qpu_prog* p) {
+    int l = hs_qpu_label_new(p);
+    hs_qpu_label_bind(p, l);
+    hs_qpu_branch(p, HS_QPU_B_ALWAYS, l, 0, 0);
+    emit(p, hs_qpu_s(hs_qpu_alu_nop(), HS_QPU_SIG_THRSW, X));
+    nop(p);
+    nop(p);
+}
+static void b_branch_in_delay(hs_qpu_prog* p) {
+    int l = hs_qpu_label_new(p);
+    hs_qpu_label_bind(p, l);
+    hs_qpu_branch(p, HS_QPU_B_ALWAYS, l, 0, 0);
+    hs_qpu_branch(p, HS_QPU_B_ALWAYS, l, 0, 0);
+    nop(p);
+    nop(p);
+    nop(p);
+}
+static void b_rebind(hs_qpu_prog* p) {
+    int l = hs_qpu_label_new(p);
+    hs_qpu_label_bind(p, l);
+    nop(p);
+    hs_qpu_label_bind(p, l);
+}
+static void b_bad_label(hs_qpu_prog* p) {
+    hs_qpu_label_new(p);
+    hs_qpu_branch(p, HS_QPU_B_ALWAYS, 65536, 0, 0);
+}
+static void b_bad_cond(hs_qpu_prog* p) {
+    int l = hs_qpu_label_new(p);
+    hs_qpu_label_bind(p, l);
+    hs_qpu_branch(p, 258, l, 0, 0);
+}
+static void b_bad_ub(hs_qpu_prog* p) {
+    int l = hs_qpu_label_new(p);
+    hs_qpu_label_bind(p, l);
+    hs_qpu_branch(p, HS_QPU_B_ALWAYS, l, 256, 0);
+}
+
+/* the red-team findings of 2026-11-15, each as a regression test */
+static void redteam_tests(void) {
+    uint64_t w;
+    hs_qpu_alu x;
+    check(run_body(b_barrier_r0) == HS_QPU_E_RULE_END, "barrierid to r0 does not count as the end barrier");
+    check(run_body(b_barrier_syncb_nothrsw) == HS_QPU_E_RULE_END, "barrierid(syncb) without thrsw does not count");
+    check(run_body(b_barrier_syncb_thrsw) > 0, "the measured barrier form barrierid(syncb) + thrsw clears stores");
+    check(run_body(b_store_sigdst) == HS_QPU_E_RULE_END, "a store whose data comes from a signal is tracked");
+    check(run_body(b_load_sigdst) > 0, "a load whose address comes from a signal is tracked");
+    check(run_body(b_unread_load) == HS_QPU_E_RULE_END, "a load never read before the end is refused");
+    check(run_body(b_dangling_tmud) == HS_QPU_E_RULE_END, "a tmud write with no address before the end is refused");
+    check(run_body(b_rules_toggled) == HS_QPU_E_RULE_END, "a store emitted while rules were off is still caught");
+    check(run_body(b_texture_write) == HS_QPU_E_RULE_UNCHECKED, "TMU texture writes are refused under the rules");
+    check(run_body(b_branch_last) == HS_QPU_E_BRANCH, "a branch without its 3 delay slots is refused");
+    check(run_body(b_thrsw_in_delay) == HS_QPU_E_BRANCH, "thrsw in a branch delay slot is refused");
+    check(run_body(b_branch_in_delay) == HS_QPU_E_BRANCH, "a branch in another branch's delay slots is refused");
+    check(run_body(b_rebind) == HS_QPU_E_LABEL, "a label binds only once");
+    check(run_body(b_bad_label) == HS_QPU_E_LABEL, "branch label out of range is refused, not truncated");
+    check(run_body(b_bad_cond) == HS_QPU_E_COND, "branch condition out of range is refused, not truncated");
+    check(run_body(b_bad_ub) == HS_QPU_E_COND, "branch ub flag out of range is refused, not truncated");
+    x = hs_qpu_m(hs_qpu_a(HS_QPU_A_MOV, HS_QPU_TMUA, RF(1), X), HS_QPU_M_MOV, HS_QPU_TMUD, R(0), X);
+    check(hs_qpu_pack_alu(&x, &w) == HS_QPU_E_WRITE, "two TMU writes in one instruction are refused");
+    x = hs_qpu_m(hs_qpu_a(HS_QPU_A_ADD, R(0), R(1), R(2)), HS_QPU_M_ADD, R(0), R(1), R(2));
+    check(hs_qpu_pack_alu(&x, &w) == HS_QPU_E_WRITE, "both ALUs writing one register is refused");
+    x = hs_qpu_s(hs_qpu_a(HS_QPU_A_ADD, R(0), R(1), R(2)), HS_QPU_SIG_LDTMU, R(0));
+    check(hs_qpu_pack_alu(&x, &w) == HS_QPU_E_WRITE, "a signal writing an ALU's destination is refused");
+    x = hs_qpu_s(hs_qpu_a(HS_QPU_A_MOV, HS_QPU_TMUA, RF(1), X), HS_QPU_SIG_LDTMU, R(0));
+    check(hs_qpu_pack_alu(&x, &w) == 0, "tmua with ldtmu in one instruction is allowed (the reference summation, checked on the GPU)");
+    x = hs_qpu_a(HS_QPU_A_FADDNF, R(0), R(1), R(1));
+    check(hs_qpu_pack_alu(&x, &w) == HS_QPU_E_ORDER, "faddnf with identical inputs is refused, not encoded as fadd");
+    x = hs_qpu_a(HS_QPU_A_FMAX, R(0), R(1), R(1));
+    check(hs_qpu_pack_alu(&x, &w) == 0, "fmax with identical inputs is allowed (fmax(x, x) == fmin(x, x))");
+    check(HS_QPU_RF(64) == HS_QPU_BADREG && HS_QPU_R(6) == HS_QPU_BADREG && HS_QPU_SMALL(48) == HS_QPU_BADREG &&
+              HS_QPU_MAGIC(64) == HS_QPU_BADREG,
+          "out-of-range register indexes give HS_QPU_BADREG");
+    x = hs_qpu_a(HS_QPU_A_ADD, HS_QPU_BADREG, R(1), R(2));
+    int e1 = hs_qpu_pack_alu(&x, &w);
+    x = hs_qpu_a(HS_QPU_A_ADD, R(0), HS_QPU_BADREG, R(2));
+    check(e1 == HS_QPU_E_OPERAND && hs_qpu_pack_alu(&x, &w) == HS_QPU_E_OPERAND, "HS_QPU_BADREG is refused as source and destination");
+    x = hs_qpu_a(HS_QPU_A_ADD, HS_QPU_SMALL(3), R(1), R(2));
+    int e2 = hs_qpu_pack_alu(&x, &w);
+    x = hs_qpu_a(HS_QPU_A_ADD, R(0), HS_QPU_TMUA, R(2));
+    check(e2 == HS_QPU_E_OPERAND && hs_qpu_pack_alu(&x, &w) == HS_QPU_E_OPERAND,
+          "a small immediate as destination and a magic register as source are refused");
+}
+
 static void rule_tests(void) {
     hs_qpu_prog p;
     int r;
@@ -244,6 +393,9 @@ static void rule_tests(void) {
     hs_qpu_prog_init(&p, buf, 4096);
     int l = hs_qpu_label_new(&p);
     hs_qpu_branch(&p, HS_QPU_B_ALWAYS, l, 0, 0);
+    nop(&p);
+    nop(&p);
+    nop(&p);
     check(hs_qpu_prog_finish(&p) == HS_QPU_E_LABEL, "branch to an unbound label is an error");
     /* three distinct register-file reads in one instruction */
     hs_qpu_alu x = hs_qpu_m(hs_qpu_a(HS_QPU_A_ADD, R(0), RF(1), RF(2)), HS_QPU_M_ADD, R(1), RF(3), R(0));
@@ -257,6 +409,7 @@ static void rule_tests(void) {
     check(hs_qpu_pack_alu(&x, &w) == HS_QPU_E_RADDR, "two rf reads plus a small immediate are an error");
     check(hs_qpu_imm_int(16) == HS_QPU_NOREG && hs_qpu_imm_float(3.0f) == HS_QPU_NOREG,
           "values with no small-immediate encoding are refused");
+    redteam_tests();
 }
 
 /* ---- corpus in the reference assembler's syntax ---- */
@@ -460,6 +613,8 @@ static void build_corpus(void) {
             y.sig = x.sig;
             y.sig_dst = x.sig_dst;
             corpus_add(y);
+        } else {
+            corpus_add(x); /* a REJECT line: the oracle must reject it too */
         }
     }
     /* register-file read sharing between the two ALUs */
@@ -489,6 +644,15 @@ static void build_corpus(void) {
                 nop(&p);
                 char name[64];
                 snprintf(name, sizeof(name), "br_%d_%d_%d", BC[c], BN[i], ub);
+                save(name, &p);
+                /* forward: branch over 3 delay slots and n nops to a later label */
+                hs_qpu_prog_init(&p, buf, 4096);
+                l = hs_qpu_label_new(&p);
+                hs_qpu_branch(&p, BC[c], l, ub > 0, ub == 2);
+                for (int k = 0; k < 3 + BN[i]; k++) nop(&p);
+                hs_qpu_label_bind(&p, l);
+                nop(&p);
+                snprintf(name, sizeof(name), "brf_%d_%d_%d", BC[c], BN[i], ub);
                 save(name, &p);
             }
 }

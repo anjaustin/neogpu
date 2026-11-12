@@ -30,14 +30,40 @@ evidence programs that reproduce the hangs.
 
 | rule | error |
 |---|---|
-| every TMU load that `ldtmu` reads has a `thrsw` at or after the load request and at least 2 instructions before the `ldtmu` | `HS_QPU_E_RULE_LOAD` |
-| a program does not end with TMU writes in flight (`tmuwt` or a `barrierid` first) | `HS_QPU_E_RULE_END` |
+| every TMU load that `ldtmu` reads has a `thrsw` at or after the load request, with at least 2 instructions between that `thrsw` and the `ldtmu` | `HS_QPU_E_RULE_LOAD` |
+| a program does not end with TMU writes in flight: `tmuwt`, or the measured `barrierid(syncb)` + `thrsw`, after the last store | `HS_QPU_E_RULE_END` |
+
+Conservative additions. These were not measured to hang, and they are refused
+until they are measured:
+
+| refused | error |
+|---|---|
+| loads never read, or a `tmud` write with no address, at the end | `HS_QPU_E_RULE_END` |
+| writes to TMU texture/config registers, which the rules do not model | `HS_QPU_E_RULE_UNCHECKED` |
+| `thrsw` or another branch in a branch's 3 delay slots, or a branch without 3 instructions after it | `HS_QPU_E_BRANCH` |
+
+Structural checks, always on:
+- One instruction may not write a register twice (add, mul or signal
+  destination). It may not issue more than one TMU write either, because the
+  order between them would be undefined (`HS_QPU_E_WRITE`).
+- An ldtmu and a tmua write in the same instruction are allowed: the
+  reference summation kernel does this, and its results were checked on the
+  GPU.
+- `faddnf` with identical inputs is refused (`HS_QPU_E_ORDER`). Operand order
+  is the only thing that tells faddnf from fadd, and identical inputs have
+  only one order.
+- A label binds once.
+- Branch conditions, labels and flags are range-checked, not truncated.
+- The register macros give `HS_QPU_BADREG` for out-of-range indexes, and every
+  slot refuses it.
 
 Limits of the rule check:
 - It follows instructions in program order: a loop body is checked as
   written.
 - It assumes one `ldtmu` per load, the default TMU configuration.
-- It tracks only TMUA/TMUAU general memory loads and stores.
+- Rule state is tracked even while the rules are off.
+  `hs_qpu_prog_finish` reports any violation if the rules are on when it
+  runs.
 
 `tests/test_qpu_encode` checks that the rules reject both load forms that hung
 the GPU (`ld_delay`, `ld_tmuau`) and a store left in flight, and that they
@@ -150,8 +176,19 @@ branch's 3 delay slots.
 | check | result |
 |---|---|
 | NeoGPU's programs (end, done, done_nowt, alu64, 8 gathers, 3 load forms) | **15 of 15 identical** |
-| branch loops: 7 conditions × 4 lengths × 3 uniform-stream forms | **84 of 84 identical** |
-| instruction corpus (every op and operand kind, every magic destination, every small immediate, every legal condition/flag pairing, every signal combination of up to 3) | **818 identical**, 293 rejected by both, 0 rejected by NeoGPU only, 2 known divergences |
+| branches: 7 conditions × 4 lengths × 3 uniform-stream forms, backward loops and forward jumps | **168 of 168 identical** |
+| instruction corpus (every op and operand kind, every magic destination, every small immediate, every legal condition/flag pairing, every signal combination of up to 3, accepted and rejected) | **815 identical**, 502 rejected by both, 0 rejected by NeoGPU only, 5 known divergences (below) |
+
+The check fails on any of these:
+- a word difference;
+- an instruction NeoGPU accepts and the oracle rejects;
+- an instruction NeoGPU alone rejects, unless it is a listed divergence;
+- a corpus line the oracle cannot even parse.
+
+The last one keeps a printer bug from passing as agreement.
+
+**Known divergence: faddnf with identical inputs** (3 corpus lines). NeoGPU
+refuses it. The oracle silently emits fadd.
 
 **Known divergence: fmov of a small immediate.** For fmov, mul mux b holds
 the float input modifier: 0 is abs, 1 is none, 2 is l and 3 is h (measured).
@@ -177,6 +214,46 @@ on the Pi.
 
 The 8-QPU, 4-in-flight sequential gather was slow again: 19.7 ms, now 3 of 3
 runs.
+
+## Red team, 2026-11-15
+
+An independent review found 14 issues; each one was reproduced with a small
+program. All are fixed, and each fix has a regression test in
+`tests/test_qpu_encode.c` (34 self-checks, clean under ASan and UBSan).
+
+Rule-check holes:
+- Any `barrierid` cleared a pending store.
+- A store whose data came through a signal was not seen as a store.
+- Unread loads and a dangling `tmud` at the end passed.
+- The result depended on add/mul slot order.
+- Rules toggled mid-program lost their state.
+
+Missing validation:
+- Conflicting writes in one instruction.
+- Branch arguments truncated (label to 16 bits, cond and flags to 8 bits).
+- faddnf(x, x) encoded as fadd.
+- A branch without delay slots, or a thrsw or branch inside them.
+- Rebinding a label.
+- Register macros wrapping out-of-range indexes.
+
+Checker gaps:
+- NeoGPU-only rejections were not counted as failures.
+- Rejected signal combinations never reached the oracle.
+- No forward branch was tested.
+- The rule-1 wording.
+
+The same pass over `tools/hwprobe_qpu.c` found and fixed:
+- `load()` accepted empty, truncated or oversized program files.
+- Repeated loads could exhaust the code buffer. Programs are now cached by
+  name.
+- `HWPROBE_FLAGKB` was not bounds-checked.
+- One concurrent-reader buffer was never used, and none were freed.
+- The GPU-completion thread was pinned to a core a CPU gather thread also
+  used.
+
+That last fix was measured. GPU time under concurrency was 142.7–143.6 ms
+after the fix and 142.7–143.5 ms before, so the published figures were not
+skewed.
 
 ## Reproducing
 
