@@ -212,8 +212,8 @@ on the Pi.
 | random gather, 64 MiB table | 36.9 M/s |
 | sequential gather | 580.8 M/s |
 
-The 8-QPU, 4-in-flight sequential gather was slow again: 19.7 ms, now 3 of 3
-runs.
+The 8-QPU, 4-in-flight sequential gather was slow again: 19.7 ms, 3 of 3
+runs. The cause was found and fixed the next day; see the section below.
 
 ## NeoGPU's own GPU path: hs_v3d and the shipped kernels
 
@@ -247,9 +247,76 @@ compared with the CPU, 0 GPU hangs.
 - Refused: 9 batches (unmeasured), a dispatch without BOs, and misaligned or
   overflowing program loads.
 
-The test's timings are not a benchmark, but the slow 8-batch 4-in-flight
-sequential case shows up there too: 3.78 ms, against 2.72 ms for 2 in flight
-and 1.84 ms for 8.
+The test's timings are not a benchmark. Before the layout fix below, the slow
+8-batch 4-in-flight sequential case showed up there too: 3.78 ms, against
+2.72 ms for 2 in flight and 1.84 ms for 8. With the fix the figures are
+2.02 / 3.01 / 1.90 ms.
+
+## The k = 3..5 gather slowdown: root cause and fix, 2026-11-16
+
+An investigating agent root-caused it with `tools/gather_anom.c`, which runs
+kernel variants under a wide perfmon and checks every output word. The key
+before/after was reproduced independently.
+
+**Cause.**
+- The original kernel interleaved the 8 batches: batch b at 64b, stride
+  64 × 8. With sequential indices, each 256-byte memory line was therefore
+  shared by 4 QPUs.
+- The L2T fetches a shared line once only if those QPUs reach it within
+  about 16–32 KiB of each other.
+- At k = 3, 4 and 5 the QPUs drift out of step during the run. A CPU-side
+  trace of `out` saw leads of up to ~700 × 512 B, growing with time.
+- The line is then fetched and written back 2–3 times. The bus moves the
+  same ~6.8 GB/s at k=4 and k=8, so the extra bytes are extra time.
+
+**Evidence.**
+- The AXI byte counters show the traffic directly. At k=4: 86 MiB read
+  against the 32 MiB needed, and 43 MiB written against 16 MiB (2.7×). At
+  k = 1, 2, 6, 7 and 8 the traffic is exactly 1×.
+- The skew experiment makes the effect appear on demand: starting each QPU
+  32 KiB further along gives exactly 4× traffic at k = 2 and k = 8 alike.
+  16 KiB gives 1×.
+- Address aliasing was ruled out: 9 offsets of out, idx and table, from
+  64 B to 8 MiB, changed nothing.
+- The slowdown builds up over a run: 1× up to 512 passes, 2.3× by 8192.
+
+**Fix, now shipped** in `hs_qpu_kernel_gather`, with its oracle twin
+updated: 8/8 gathers word-identical, 168/168 branches.
+- In pass q, batch b's load i reads base + (q·B + b)·64k + 64i + 4·lane. Each
+  batch owns a contiguous 64k-byte run per pass.
+- At k ≥ 4 a batch owns whole 256-byte lines, so drift no longer matters.
+- The uniform interface is unchanged: the kernel computes the per-pass
+  skip 64k(B−1) itself.
+- With 1 batch the address layout is the same as before.
+
+Measured on the GPU with 8 batches, sequential indices, 64 MiB table, 4 M
+elements. Median of 5, every word checked; old = variant 0, shipped =
+variant 5, same harness:
+
+| k | old | shipped | traffic, shipped |
+|---|---|---|---|
+| 1 | 18.05 ms | 17.95 ms | 1.0× |
+| 2 | 10.63 ms | 11.57 ms | 1.0× |
+| 4 | 19.44 ms (2.7×) | **7.87 ms** | 1.0× |
+| 8 | 7.14 ms | 6.89 ms | 1.0× |
+
+- Random indices: unchanged, 114.6–118.3 ms either way.
+- **The best sequential rate rose from 581 to 609 M/s.**
+- k = 2 is the open question. The harness measured it ~0.8–0.9 ms slower
+  in two separate runs, but `hwprobe_qpu` measured 11.28 ms, inside the old
+  layout's 11.14–11.96 ms run-to-run range. It is not settled whether that
+  is real. Its traffic is 1×. k = 8 remains the fastest choice in both
+  layouts.
+
+**Also found.**
+- A layout where each batch owns one large contiguous chunk is much worse
+  (66 ms at k=1, 4× reads): with chunks 2 MiB apart, 8 QPUs × 3 streams
+  conflict in the L2T's sets.
+- The first run of a newly loaded program costs ~10 ms extra.
+- The perfmon counter named "cache hit" counts memory transactions; the AXI
+  byte counters (40, 41) are the reliable measure of traffic.
+- This kernel's `(tidx >> 2) & 15` batch index is not 0..B−1 for 2 or 4
+  batches, which is why hs_v3d accepts only the measured 1 and 8.
 
 ## Red team, 2026-11-15
 

@@ -183,7 +183,7 @@ in M elements/s; the GPU number is the best of 1/8 QPUs with 1–8 loads in flig
 |---|---|---|---|
 | random, 512 KiB table (fits CPU L2, not GPU L2T) | 225.6 (4 cores, huge pages, prefetch) | 75.0 (8 QPU) | 0.33 |
 | random, 64 MiB table (DRAM) | 43.1 (4 cores, huge pages) | 37.0 (8 QPU, 1 in flight) | 0.86 |
-| sequential idx, 64 MiB table | 301.4 (1 core, 4K pages) | 581.4 (8 QPU, 8 in flight) | 1.93 |
+| sequential idx, 64 MiB table | 301.4 (1 core, 4K pages) | 608.8 (8 QPU, 8 in flight; 581.4 before the layout fix) | 2.02 |
 
 - **Random DRAM access has one system-wide ceiling of about 43 M accesses/s,**
   shared by the CPU and GPU:
@@ -196,10 +196,11 @@ in M elements/s; the GPU number is the best of 1/8 QPUs with 1–8 loads in flig
 
   Two runs agree to within 0.1. Three CPU cores already reach the ceiling. The
   GPU adds no random-access capacity: it only moves the work.
-- **Coherent (sequential) access is where the GPU's bandwidth shows:** 1.93x the
-  best CPU. The 8-QPU k=4 row is slow in both runs: 19.7 and 21.3 ms,
-  against 11.1–11.4 for k=2 and 7.1–7.2 for k=8, with 2.5–2.7x the DRAM reads.
-  It reproduces; the cause is not yet measured.
+- **Coherent (sequential) access is where the GPU's bandwidth shows:** 2.02x the
+  best CPU with the shipped kernel. The original layout slowed down at k=4
+  (19.7–21.3 ms, with 2.5–2.7x the DRAM reads). That was root-caused and
+  fixed on 2026-11-16 (QPU_ENCODER.md, "The k = 3..5 gather slowdown"). k=4
+  now takes 7.87 ms.
 - **Reading back cancels the win today.** Consuming the 16 MiB result from the
   GPU BO takes 11.4 ms (1.47 GB/s), against 3.7–3.8 ms from CPU memory. In the
   sequential case: GPU 7.2 + 11.4 = 18.6 ms end to end, against CPU 13.9 + 3.8 =

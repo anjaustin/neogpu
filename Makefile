@@ -254,6 +254,9 @@ hwprobe: $(HWPROBES)
 # the GPU lock: flock build/gpu.lock tools/hwprobe_mailbox)
 tools/hwprobe_mailbox: tools/hwprobe_mailbox.c src/hs_qpu.o src/hs_v3d.o
 	$(CC) -O2 -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_v3d.o -o $@
+# root cause of the k = 3..5 sequential-gather slowdown (QPU_ENCODER.md)
+tools/gather_anom: tools/gather_anom.c src/hs_qpu.o src/hs_qpu_kernels.o src/hs_v3d.o
+	$(CC) -O2 -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_qpu_kernels.o src/hs_v3d.o -o $@
 tools/hwprobe_%: tools/hwprobe_%.c
 	$(CC) -O2 -Wall -Wextra -I/usr/include/drm $< -o $@ -lm -lpthread
 hwprobe-progs: tools/hwprobe_qpu_progs.py
@@ -358,7 +361,7 @@ clean:
 	rm -f tests/test_evdev
 	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/panel_mode_probe tests/test_text_render
 	rm -f tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe neogpu_kworker_rt
-	rm -f $(HWPROBES) tests/test_qpu_encode tests/test_v3d_compute
+	rm -f $(HWPROBES) tools/gather_anom tests/test_qpu_encode tests/test_v3d_compute
 	rm -rf build/qpu
 	rm -f bench_legacy tests/test_headless_scalar
 	rm -f tests/test_tool_sanitize tests/test_tool_tsan

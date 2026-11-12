@@ -89,9 +89,11 @@ def qpu_alu(asm, *, inner):
 @qpu
 def qpu_gather(asm, *, num_qpus, k):
     # out[e] = table[idx[e]] for 4-byte elements. Uniforms: passes, idx base,
-    # table base, out base. Each lane owns element 16*qpu + lane of each
-    # 16*num_qpus block; a pass issues k index loads, then k gathers, then
-    # k stores, so up to k loads are in flight per QPU.
+    # table base, out base. Twin of hs_qpu_kernel_gather (src/hs_qpu_kernels.c),
+    # instruction for instruction. In pass q, batch b's load i reads
+    #   base + (q * num_qpus + b) * 64k + 64i + 4 * lane,
+    # so each batch owns a contiguous 64k-byte run per pass (the fix for the
+    # k = 3..5 slowdown; see QPU_ENCODER.md).
     # Measured rule (ld_* programs): a batch of TMU loads must end with a
     # thread-switch signal before its results are read, or the GPU hangs.
     nop(sig=ldunifrf(rf0))
@@ -99,21 +101,23 @@ def qpu_gather(asm, *, num_qpus, k):
     nop(sig=ldunifrf(rf2))
     nop(sig=ldunifrf(rf3))
     if num_qpus == 1:
-        shift = 0
         mov(rf5, 0)
     else:
-        shift = 3
         tidx(r0)
         shr(r0, r0, 2)
         band(rf5, r0, 0b1111)
-    shl(r0, rf5, 4)
+    shl(r0, rf5, 6)
+    nop().umul24(r0, r0, k)
     eidx(r1)
+    shl(r1, r1, 2)
     add(r0, r0, r1)
-    shl(r0, r0, 2)
     add(rf1, rf1, r0)
     add(rf3, rf3, r0)
     mov(r0, 1)
-    shl(rf4, r0, 6 + shift)  # stride = 64 B * num_qpus
+    shl(rf4, r0, 6)
+    mov(r0, k)
+    nop().umul24(r0, r0, num_qpus - 1)
+    shl(rf6, r0, 6)
     with loop as l:
         for i in range(k):
             if i == k - 1:
@@ -135,6 +139,8 @@ def qpu_gather(asm, *, num_qpus, k):
             nop(sig=ldtmu(r1))
             mov(tmud, r1)
             mov(tmua, rf3).add(rf3, rf3, rf4)
+        add(rf1, rf1, rf6)
+        add(rf3, rf3, rf6)
         sub(rf0, rf0, 1, cond='pushz')
         l.b(cond='na0')
         nop()
