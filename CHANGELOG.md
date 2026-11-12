@@ -44,6 +44,20 @@ days. Release headings use the date recorded at the time.
   `HSGraphics.flip_waits`, `last_flip_ns`. Pacing diagnostics:
   `make pacing-tools` (`tests/pacing_trace.so` records every flip of any
   program, `tests/pacing_sweep`, `tests/pacing_trace_report.py`).
+- **Uncapped frames repeated refreshes with every CPU busy.** The kernel's
+  commit for each page flip runs in an unbound kworker and makes vc4 firmware
+  clock calls (~1.7 ms each, two or three before the display list is
+  updated); with four busy cores the normal-priority kworker waited up to
+  6.7 ms for a CPU after them and missed the vblank (`test_08` 44-62 of ~600
+  refreshes repeated). New `tools/neogpu_kworker_rt` keeps the kernel's
+  default unbound workers at `SCHED_FIFO` 1 (`make neogpu_kworker_rt && sudo
+  make install-kworker-rt` installs it as a systemd service; 0.16% of one
+  core). Under the same load `test_08` then repeats 0 of 599 with idle
+  latency and motion, and `tests/test_present_pacing` passes 10 of 10 (was
+  0 of 5). Page flips stay non-blocking, so other programs reading display
+  state are not held up. `tests/test_present_pacing` adds a phase with one
+  busy process per core, enforced when the workers run `SCHED_FIFO`;
+  `tests/pacing_trace.so` also records atomic commits.
 - Display takeover now finds a CRTC through `possible_crtcs` when none is
   active, refuses a display whose mode does not match the surface instead of
   failing with `EINVAL` silently, checks `AddFB`/`SetCrtc` results, and a failed

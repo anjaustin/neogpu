@@ -70,3 +70,4 @@ tests/*.o
 /bench_legacy
 /tests/mutation-work/
 /tests/evidence-audit-*
+neogpu_kworker_rt

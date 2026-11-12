@@ -21,14 +21,31 @@
  * and the wait is used there but not
  * at ~0.55 refresh, where it measured only added latency.
  *
+ * Then the ~0.55-refresh frames again with every CPU busy (one spinning
+ * process per core). The kernel's commit work for a flip runs in an unbound
+ * kworker and includes firmware clock calls; at normal priority their
+ * wakeups waited for a CPU and 6-60 of ~330 refreshes repeated. With those
+ * workers at SCHED_FIFO (tools/neogpu_kworker_rt, `sudo make
+ * install-kworker-rt`) the contract is at most 1% repeats under that load.
+ * Without it the load phase is still measured and reported, and
+ * "load_checked" is false.
+ *
  * Usage: sudo tests/test_present_pacing [frames]
  * Output: one JSON object; exit 0 only if the run met its contract.
  */
 #include "hs_graphics.h"
+#include <ctype.h>
+#include <dirent.h>
+#include <sched.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+
 
 static const char* VS =
     "attribute vec2 p;\n"
@@ -46,6 +63,38 @@ static const char* FS =
     "    }\n"
     "    gl_FragColor = vec4(fract(a), fract(t), 0.5, 1.0);\n"
     "}\n";
+
+/* True when every default-pool unbound kworker ("kworker/u...", nice 0) runs
+ * SCHED_FIFO, as tools/neogpu_kworker_rt keeps them. */
+static bool unbound_workers_rt(void) {
+    DIR* d = opendir("/proc");
+    if (!d) return false;
+    int workers = 0, rt = 0;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (!isdigit((unsigned char)e->d_name[0])) continue;
+        char path[300], buf[1024];
+        snprintf(path, sizeof(path), "/proc/%s/stat", e->d_name);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+        if (!strstr(buf, "(kworker/u")) continue;
+        char* p = strrchr(buf, ')');
+        long field = 2, nice = -1, policy = -1;
+        for (char* tok = p ? strtok(p + 1, " ") : NULL; tok; tok = strtok(NULL, " ")) {
+            field++;
+            if (field == 19) nice = strtol(tok, NULL, 10);
+            if (field == 41) { policy = strtol(tok, NULL, 10); break; }
+        }
+        if (nice != 0) continue;
+        workers++;
+        rt += policy == SCHED_FIFO;
+    }
+    closedir(d);
+    return workers > 0 && rt == workers;
+}
 
 static double now_ms(void) {
     struct timespec ts;
@@ -218,23 +267,61 @@ int main(int argc, char** argv) {
     /* Waiting for the flip must not cost frame rate: the GPU stays busy. */
     bool slow_ok = slow_refreshes > 120 && slow_repeated * 100 <= slow_refreshes && slow_waits > 0 &&
                    slow_fps >= 0.99 * base_fps;
+    /* Every CPU busy, from separate processes: spinning threads in this
+     * process measured weaker (1-78 vs 7-38 repeats without the commit
+     * thread). */
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpus < 1) cpus = 1;
+    if (cpus > 64) cpus = 64;
+    pid_t spin_pids[64];
+    int spun = 0;
+    bool workers_rt = unbound_workers_rt();
+    for (long c = 0; c < cpus; c++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            prctl(PR_SET_PDEATHSIG, SIGKILL); /* never outlive the test */
+            if (getppid() == 1) _exit(0);
+            for (;;) {} /* killed below */
+        }
+        if (pid > 0) spin_pids[spun++] = pid;
+    }
+    usleep(200000);
+    for (int i = 0; i < 16; i++) {
+        draw(n_loc, t_loc, n, 0);
+        hs_graphics_present(&gfx);
+    }
+    u64 load_rep0 = gfx.refreshes_repeated;
+    u32 load_seq0 = gfx.last_flip_sequence;
+    for (int i = 0; i < 400; i++) {
+        draw(n_loc, t_loc, n, (float)i * 0.01f);
+        hs_graphics_present(&gfx);
+    }
+    u64 load_repeated = gfx.refreshes_repeated - load_rep0;
+    u32 load_refreshes = gfx.last_flip_sequence - load_seq0;
+    for (int i = 0; i < spun; i++) {
+        kill(spin_pids[i], SIGKILL);
+        waitpid(spin_pids[i], NULL, 0);
+    }
+    bool load_checked = workers_rt && unbound_workers_rt();
+    bool load_ok = !load_checked || (spun == cpus && load_refreshes > 100 && load_repeated * 100 <= load_refreshes);
     bool active = gfx.crtc_active;
     hs_graphics_finish(&gfx);
     double fps = frames * 1000.0 / elapsed;
-    bool ok = active && gfx.present_errors == 0 && presented + dropped == (u64)(frames + extra) && held && raw_swaps && counted && cheap_unheld && slow_ok && fast_waits == 0 &&
+    bool ok = active && gfx.present_errors == 0 && presented + dropped == (u64)(frames + extra) && held && raw_swaps && counted && cheap_unheld && slow_ok && load_ok && fast_waits == 0 &&
               flush_shows && fps > 1.5 * 1000.0 / refresh_ms && seq0 && refreshes > 0 && repeated * 100 <= refreshes;
     printf("{\"frames\":%d,\"iterations\":%d,\"gpu_frame_ms\":%.2f,\"refresh_ms\":%.2f,\"fps\":%.1f,"
            "\"presented\":%llu,\"dropped\":%llu,\"refreshes\":%u,\"repeated\":%llu,\"errors\":%u,\"held\":%s,\"raw_swaps\":%s,\"counted\":%s,\"cheap_unheld\":%s,\"flush_owed\":%llu,\"flush_shows\":%s,"
            "\"fast_waits\":%llu,\"slow_gpu_frame_ms\":%.2f,\"slow_fps\":%.1f,\"slow_refreshes\":%u,"
            "\"slow_repeated\":%llu,\"slow_waits\":%llu,\"no_wait_fps\":%.1f,\"no_wait_refreshes\":%u,"
-           "\"no_wait_repeated\":%llu,\"passed\":%s}\n",
+           "\"no_wait_repeated\":%llu,\"load_checked\":%s,\"load_procs\":%d,\"load_refreshes\":%u,"
+           "\"load_repeated\":%llu,\"passed\":%s}\n",
            frames, n, frame_ms, refresh_ms, fps, (unsigned long long)presented, (unsigned long long)dropped,
            refreshes, (unsigned long long)repeated, gfx.present_errors, held ? "true" : "false",
            raw_swaps ? "true" : "false", counted ? "true" : "false",
            cheap_unheld ? "true" : "false", (unsigned long long)owed,
            flush_shows ? "true" : "false", (unsigned long long)fast_waits, slow_ms, slow_fps, slow_refreshes,
            (unsigned long long)slow_repeated, (unsigned long long)slow_waits, base_fps, base_refreshes,
-           (unsigned long long)base_repeated,
-           ok ? "true" : "false");
+           (unsigned long long)base_repeated, load_checked ? "true" : "false", spun, load_refreshes,
+           (unsigned long long)load_repeated, ok ? "true" : "false");
     return ok ? 0 : 1;
 }

@@ -94,7 +94,9 @@ they measure what the system can render. At each refresh (60 Hz on the DSI
 panel) the panel shows the newest frame the GPU has finished, and the rest are
 dropped; `tests/test_present_pacing` checks that a GPU-heavy uncapped frame
 rate (~0.55 and ~0.95 of a refresh per frame) still puts a new frame on
-screen at every refresh; `make pacing-tools` builds a flip tracer that
+screen at every refresh, including with every CPU core busy once
+`sudo make install-kworker-rt` keeps the kernel workers that commit page
+flips at real-time priority; `make pacing-tools` builds a flip tracer that
 measures this for any program;
 `make present-hardware` verifies with an external CRTC probe that presented
 frames really are scanned out. Set `HSGraphics.vsync = true` to pace rendering

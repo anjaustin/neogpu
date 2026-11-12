@@ -1,0 +1,12 @@
+[Unit]
+Description=neogpu: keep unbound kernel workers (KMS page-flip commits) at SCHED_FIFO 1
+Documentation=https://github.com/anjaustin/neogpu/blob/main/tools/neogpu_kworker_rt.c
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/neogpu_kworker_rt 5000 1
+ExecStopPost=/usr/local/bin/neogpu_kworker_rt --restore
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

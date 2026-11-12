@@ -2,8 +2,10 @@
  * sequence, kernel timestamp, and which swap's frame it showed) and every
  * eglSwapBuffers call, unmodified binaries included. Written at exit to
  * $PACING_TRACE (default pacing-trace.txt): "F seq t_us swap_index" per flip,
- * "S t_us" per swap, "Q t_us swap_index" per page-flip queued (swap_index
- * counts swaps from 1; -1 if unknown).
+ * "S t_us" per swap, "Q t_us swap_index" per page-flip queued, by
+ * drmModePageFlip or by an atomic commit that sets a plane's FB_ID (swap_index
+ * counts swaps from 1; -1 if unknown). Flips may be queued from another
+ * thread than the one handling their events.
  *
  * Build: cc -O2 -shared -fPIC tests/pacing_trace.c -o tests/pacing_trace.so -ldl
  * Use:   PACING_TRACE=out.txt LD_PRELOAD=$PWD/tests/pacing_trace.so sudo -E ./tests/test_08_raycast_orbit
@@ -38,7 +40,7 @@ static double now_us(void) {
 }
 
 static void flip(int fd, unsigned seq, unsigned sec, unsigned usec, void* data) {
-    long shown = q_head != q_tail ? queued[q_head++ % 64] : -1;
+    long shown = q_head != __atomic_load_n(&q_tail, __ATOMIC_ACQUIRE) ? queued[q_head++ % 64] : -1;
     if (fn < CAP / 8) { fseq[fn] = seq; ft[fn] = sec * 1e6 + usec; fswap[fn] = shown; fn++; }
     user_handler(fd, seq, sec, usec, data);
 }
@@ -89,20 +91,46 @@ struct gbm_bo* gbm_surface_lock_front_buffer(struct gbm_surface* s) {
     return bo;
 }
 
+static void queue_record(uint32_t fb, double t) {
+    long swap = -1;
+    for (unsigned i = 0; i < map_fb_n; i++)
+        if (map_fb[i] == fb)
+            for (unsigned j = 0; j < map_h_n; j++)
+                if (map_h[j] == map_fb_handle[i]) swap = map_h_swap[j];
+    queued[__atomic_load_n(&q_tail, __ATOMIC_RELAXED) % 64] = swap;
+    __atomic_fetch_add(&q_tail, 1, __ATOMIC_RELEASE);
+    if (qn < (1 << 17)) { qt[qn] = t; qs[qn++] = swap; }
+}
+
 int drmModePageFlip(int fd, uint32_t crtc, uint32_t fb, uint32_t flags, void* data) {
     static int (*real)(int, uint32_t, uint32_t, uint32_t, void*);
     if (!real) real = dlsym(RTLD_NEXT, "drmModePageFlip");
     int rc = real(fd, crtc, fb, flags, data);
-    if (rc == 0) {
-        long swap = -1;
-        for (unsigned i = 0; i < map_fb_n; i++)
-            if (map_fb[i] == fb)
-                for (unsigned j = 0; j < map_h_n; j++)
-                    if (map_h[j] == map_fb_handle[i]) swap = map_h_swap[j];
-        queued[q_tail++ % 64] = swap;
-        if (qn < (1 << 17)) { qt[qn] = now_us(); qs[qn++] = swap; }
-    }
+    if (rc == 0) queue_record(fb, now_us());
     return rc;
+}
+
+/* Atomic commits: the framebuffer is the value given to an FB_ID property.
+ * A blocking commit returns after its flip, so the record is taken at entry
+ * and kept only if the commit succeeds. */
+static __thread uint32_t atomic_fb;
+int drmModeAtomicAddProperty(drmModeAtomicReqPtr req, uint32_t obj, uint32_t prop, uint64_t value) {
+    static int (*real)(drmModeAtomicReqPtr, uint32_t, uint32_t, uint64_t);
+    if (!real) real = dlsym(RTLD_NEXT, "drmModeAtomicAddProperty");
+    for (unsigned i = 0; i < map_fb_n; i++) if (map_fb[i] == value) atomic_fb = (uint32_t)value;
+    return real(req, obj, prop, value);
+}
+
+int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void* data) {
+    static int (*real)(int, drmModeAtomicReqPtr, uint32_t, void*);
+    if (!real) real = dlsym(RTLD_NEXT, "drmModeAtomicCommit");
+    uint32_t fb = atomic_fb;
+    atomic_fb = 0;
+    if (fb && (flags & DRM_MODE_PAGE_FLIP_EVENT)) {
+        /* Recorded before the call: the event can be handled before it returns. */
+        queue_record(fb, now_us());
+    }
+    return real(fd, req, flags, data);
 }
 
 EGLBoolean eglSwapBuffers(EGLDisplay d, EGLSurface s) {
