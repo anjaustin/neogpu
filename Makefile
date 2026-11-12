@@ -245,11 +245,15 @@ uninstall-kworker-rt:
 #   sudo tools/hwprobe_cpu [cpu]          (performance governor)
 #   tools/hwprobe_v3d [cpu]               (render group)
 #   tools/hwprobe_qpu build/qpu [cpu] [sections=amdcgG]
-HWPROBES = tools/hwprobe_cpu tools/hwprobe_v3d tools/hwprobe_qpu
+HWPROBES = tools/hwprobe_cpu tools/hwprobe_v3d tools/hwprobe_qpu tools/hwprobe_mailbox
 VC6_PY ?= $(HOME)/venvs/vc6/bin/python
 VC6_EXAMPLES ?= $(HOME)/src-ref/py-videocore6/examples
 .PHONY: hwprobe hwprobe-progs
 hwprobe: $(HWPROBES)
+# CPU <-> GPU inside one job, on NeoGPU's own encoder and runtime (run inside
+# the GPU lock: flock build/gpu.lock tools/hwprobe_mailbox)
+tools/hwprobe_mailbox: tools/hwprobe_mailbox.c src/hs_qpu.o src/hs_v3d.o
+	$(CC) -O2 -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_v3d.o -o $@
 tools/hwprobe_%: tools/hwprobe_%.c
 	$(CC) -O2 -Wall -Wextra -I/usr/include/drm $< -o $@ -lm -lpthread
 hwprobe-progs: tools/hwprobe_qpu_progs.py

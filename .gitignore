@@ -74,3 +74,4 @@ neogpu_kworker_rt
 /tools/hwprobe_cpu
 /tools/hwprobe_v3d
 /tools/hwprobe_qpu
+/tools/hwprobe_mailbox

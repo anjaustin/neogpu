@@ -220,3 +220,39 @@ A gather that ends each batch of k ≤ 8 loads with `thrsw` runs correctly (0
 hangs in all 24 configurations). The reference summation and scopy loop without
 a thread switch on each load; what makes that safe for them was not isolated.
 NeoGPU's code generator follows the measured form.
+
+## CPU ↔ GPU inside one running job (mailbox feasibility), measured 2026-11-16
+
+`tools/hwprobe_mailbox` is built only on NeoGPU's own encoder and runtime.
+Raw outputs: `tests/evidence-measure-20261116/mailbox/` on the Pi. The
+question: can a long-running QPU program exchange messages with the CPU
+through shared memory, skipping the 22–75 µs submit path?
+
+| | measured | runs |
+|---|---|---|
+| **A**: GPU stores, CPU watches the word | The CPU sees **only the final value, at job end**. `tmuwt` does not make a store visible; the stores stay in the GPU's caches until the kernel cleans them after the job | 3 × 100 ticks |
+| **B**: GPU polls a word the CPU then writes | The GPU **never sees** the write: 2 M polls over 191 ms at ~96 ns per poll, which is cache-hit speed | 8 |
+| **E**: eviction sweep of F KiB between polls | **F ≤ 192 KiB: never seen** (each job polled ~0.74 s after the write). F = 256 / 512 KiB: seen, latency 222 / 216 µs | 2 clean runs, 0 resets |
+| **E**: sweep of up to 512 KiB after each store | Still only the final value reaches the CPU | 9 sizes |
+| **C**: one job running longer and longer | 1000 ms ran to completion. A 1500 ms job was **reset at 1012 ms, and all its writes were lost** | 1 series |
+| **O**: TMU op code in the `tmuc` config byte (bits 7:4), each op as poll and as store-then-op, with and without `ldtmu` | see below | 2 rounds |
+
+TMU op results:
+- **Ops 0–3 hang** in every form tried (6 resets per op per round).
+- **Op 1 made stores visible mid-job:** ticks 1 and 2 arrived 1.000 ms apart, at 11 and 12 ms. Then the job hung.
+- **Op 4 returns corrupt data.**
+- **Op 15** (the default) is unchanged.
+- The idea that bits 7:4 hold an op was recalled from Mesa's V3D 4.1 headers and has not been verified. These semantics are not decoded.
+
+What this means:
+- **Within a job, the GPU's caches are not coherent with the CPU in either
+  direction.** A plain shared-memory mailbox cannot work.
+- Eviction gives CPU→GPU coherence only at ~220 µs per message, worse than
+  launching a job.
+- Nothing measured gives GPU→CPU visibility before job end, except the
+  undecoded op 1, which then hangs.
+- Any persistent program must also end within ~1 s.
+
+The lead worth taking is decoding the TMU operation semantics, starting with
+op 1's mid-job write-back, from Mesa's MIT-licensed hardware description:
+read it as documentation, then measure each claim.
