@@ -233,6 +233,26 @@ uninstall-kworker-rt:
 	rm -f /etc/systemd/system/neogpu-kworker-rt.service /usr/local/bin/neogpu_kworker_rt
 	systemctl daemon-reload
 
+# Hardware map probes (docs/benchmarks/HARDWARE_MAP_2026-11-15.md). They
+# talk to the kernel's v3d driver directly: no Mesa, no libdrm, no GLES.
+#   make hwprobe            build the three probes
+#   make hwprobe-progs      assemble the QPU programs into build/qpu (needs a
+#                           py-videocore6 venv: VC6_PY, VC6_EXAMPLES; an
+#                           instrument only, its output stays out of git)
+#   sudo tools/hwprobe_cpu [cpu]          (performance governor)
+#   tools/hwprobe_v3d [cpu]               (render group)
+#   tools/hwprobe_qpu build/qpu [cpu] [sections=amdcgG]
+HWPROBES = tools/hwprobe_cpu tools/hwprobe_v3d tools/hwprobe_qpu
+VC6_PY ?= $(HOME)/venvs/vc6/bin/python
+VC6_EXAMPLES ?= $(HOME)/src-ref/py-videocore6/examples
+.PHONY: hwprobe hwprobe-progs
+hwprobe: $(HWPROBES)
+tools/hwprobe_%: tools/hwprobe_%.c
+	$(CC) -O2 -Wall -Wextra -I/usr/include/drm $< -o $@ -lm -lpthread
+hwprobe-progs: tools/hwprobe_qpu_progs.py
+	mkdir -p build/qpu
+	VC6_EXAMPLES=$(VC6_EXAMPLES) $(VC6_PY) $< build/qpu
+
 .PHONY: pacing-tools
 pacing-tools: tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe
 
@@ -313,6 +333,8 @@ clean:
 	rm -f tests/test_evdev
 	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/panel_mode_probe tests/test_text_render
 	rm -f tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe neogpu_kworker_rt
+	rm -f $(HWPROBES)
+	rm -rf build/qpu
 	rm -f bench_legacy tests/test_headless_scalar
 	rm -f tests/test_tool_sanitize tests/test_tool_tsan
 	rm -f $(HS_OBJ) $(HS_DEPS) $(HS_TARGET) tests/*.o tests/test_01_clear tests/test_02_triangle tests/test_03_instancing tests/test_04_blending tests/test_05_cube3d tests/test_06_raycast tests/test_07_message_triangle tests/test_08_raycast_orbit neogpu_tool neogpu_pong neogpu_pong_ai neogpu_capture_demo neogpu_procgame
