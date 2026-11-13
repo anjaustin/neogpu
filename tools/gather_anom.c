@@ -230,6 +230,12 @@ int main(int argc, char** argv) {
         uint32_t* ix = (uint32_t*)(data.map + ioff);
         uint32_t* ot = (uint32_t*)(data.map + ooff);
         if (var == 4 && (uint64_t)8 * (uint64_t)skew * per * 4 > dsize) { printf("skip: skew beyond the BO\n"); continue; }
+        /* the GPU applies the skew with umul24, which uses the low 24 bits of
+         * each operand: a larger byte skew would silently run unskewed */
+        if (var == 4 && (uint64_t)skew * 64u * (uint64_t)B * (uint64_t)k >= (1u << 24)) {
+            printf("skip: skew offset beyond umul24's 24 bits\n");
+            continue;
+        }
         uint32_t NF = var == 4 ? N + 8u * (uint32_t)skew * per : N; /* skewed batches run past N (bounded above) */
         if (var == 4 && ((size_t)ioff + NF * 4ull > dsize || (size_t)ooff + NF * 4ull > dsize || ioff + NF * 4ull > ooff)) { printf("skip skew range\n"); continue; }
         uint32_t tent = mode == 0 ? TE : NF;

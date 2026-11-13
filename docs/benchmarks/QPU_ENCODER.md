@@ -492,5 +492,8 @@ one medium and three low issues. All are fixed and verified on the GPU with
 | (low) the Memory table's GPU+CPU row was not updated | It now gives the range over all 5 runs |
 
 Findings per round fell from 14 (round 1) to 10, 5 and 6 (the last mostly
-in newly committed code), then 1 medium in this pass. Every finding is
-closed with a test or a re-measurement.
+in newly committed code), then 1 medium + 3 low in this pass. A further
+pass over these four fixes found 1 medium (gather_anom's skew bound
+ignored umul24's 24-bit operands, so a large skew ran unskewed while
+reporting ok; it is now refused) and 1 low (this summary's count). Every
+finding is closed with a test or a re-measurement.
