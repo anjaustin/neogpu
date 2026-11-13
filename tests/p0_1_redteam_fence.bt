@@ -1,0 +1,9 @@
+uprobe:/lib/aarch64-linux-gnu/libc.so.6:getrusage /comm == "present_cost_pr"/ { @win = @win ? 0 : 1; }
+kprobe:drm_atomic_helper_wait_for_fences /@win/ { @in[tid] = 1; @wff_calls++; }
+kretprobe:drm_atomic_helper_wait_for_fences /@in[tid]/ { delete(@in[tid]); }
+kprobe:dma_fence_wait_timeout /@in[tid]/ {
+  $f = (struct dma_fence *)arg0;
+  @fence_waits[ksym($f->ops), $f->flags & 1] = count();
+  if (@p < 6) { printf("ctx=%llu seq=%llu flags=%llx ops=%s\n", $f->context, $f->seqno, $f->flags, ksym($f->ops)); @p++; }
+}
+END { clear(@in); clear(@win); clear(@p); }

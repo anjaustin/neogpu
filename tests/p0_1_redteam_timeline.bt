@@ -1,0 +1,11 @@
+uprobe:/lib/aarch64-linux-gnu/libc.so.6:getrusage /comm == "present_cost_pr"/ { @win = @win ? 0 : 1; if (@win) { @t0 = nsecs; @n = 0; } }
+uprobe:/lib/aarch64-linux-gnu/libEGL.so.1:eglSwapBuffers /@win && @n < 400/ { printf("%d swap_in\n", (nsecs-@t0)/1000); @n++; }
+uretprobe:/lib/aarch64-linux-gnu/libEGL.so.1:eglSwapBuffers /@win && @n < 400/ { printf("%d swap_out\n", (nsecs-@t0)/1000); }
+tracepoint:v3d:v3d_submit_cl_ioctl /@win && @n < 400/ { printf("%d submit_ioctl\n", (nsecs-@t0)/1000); }
+kprobe:v3d_render_job_run /@win && @n < 400/ { printf("%d render_run\n", (nsecs-@t0)/1000); }
+tracepoint:v3d:v3d_rcl_irq /@win && @n < 400/ { printf("%d render_done\n", (nsecs-@t0)/1000); }
+kprobe:vc4_page_flip /@win && @n < 400/ { printf("%d flip_ioctl\n", (nsecs-@t0)/1000); }
+kprobe:drm_atomic_helper_wait_for_fences /@win && @n < 400/ { printf("%d wff_in\n", (nsecs-@t0)/1000); }
+kretprobe:drm_atomic_helper_wait_for_fences /@win && @n < 400/ { printf("%d wff_out\n", (nsecs-@t0)/1000); }
+tracepoint:drm:drm_vblank_event_delivered /@win && @n < 400/ { printf("%d flip_event_delivered\n", (nsecs-@t0)/1000); }
+END { clear(@win); clear(@t0); clear(@n); }

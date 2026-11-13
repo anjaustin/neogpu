@@ -1,0 +1,27 @@
+// Red-team trace for P0-1. Window = between present_cost_probe's two getrusage calls.
+uprobe:/lib/aarch64-linux-gnu/libc.so.6:getrusage /comm == "present_cost_pr"/ {
+  if (@win) { @win = 0; @win_ns = nsecs - @t0; } else { @win = 1; @t0 = nsecs; }
+}
+kprobe:v3d_render_job_run /@win/ {
+  if (@last_rcl) { $g = nsecs - @last_rcl; @gap_us = hist($g / 1000); @gap_sum += $g; }
+  @rstart = nsecs; @running = 1;
+}
+tracepoint:v3d:v3d_rcl_irq /@win && @rstart/ {
+  $d = nsecs - @rstart; @render_hw_us = hist($d / 1000); @render_sum += $d; @render_n++;
+  @last_rcl = nsecs; @running = 0;
+}
+tracepoint:v3d:v3d_submit_cl_ioctl /@win/ { @ioctl_n++; @last_ioctl = nsecs; }
+kprobe:vc4_page_flip /@win/ { @flip_n++; if (@running) { @flip_while_render_running++; } }
+kprobe:drm_atomic_helper_wait_for_fences /@win/ { @wf[tid] = nsecs; }
+kretprobe:drm_atomic_helper_wait_for_fences /@wf[tid]/ {
+  $d = nsecs - @wf[tid]; @wff_us = hist($d / 1000); @wff_sum += $d; @wff_n++;
+  if ($d > 20000) { @wff_blocked_gt20us++; @wff_ret_minus_rcl_us = hist((nsecs - @last_rcl) / 1000); }
+  delete(@wf[tid]);
+}
+tracepoint:sched:sched_switch /@win/ {
+  if (args->prev_pid != 0 && @on[args->prev_pid]) { @cpu_us[args->prev_comm] = sum((nsecs - @on[args->prev_pid]) / 1000); }
+  @on[args->next_pid] = nsecs;
+}
+tracepoint:irq:irq_handler_entry /@win/ { @ie[cpu] = nsecs; }
+tracepoint:irq:irq_handler_exit /@win && @ie[cpu]/ { @irq_us[args->irq] = sum((nsecs - @ie[cpu]) / 1000); @irq_n[args->irq] = count(); }
+END { clear(@on); clear(@wf); clear(@ie); clear(@t0); clear(@rstart); clear(@last_rcl); clear(@last_ioctl); clear(@running); clear(@win); }

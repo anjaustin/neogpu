@@ -75,12 +75,23 @@ typedef struct {
      * are locked; call hs_graphics_flush_present() before swapping the
      * surface yourself. */
     struct gbm_bo* held_bo;
-    /* Smoothed time between vsync-off presents. Frames are held only when it
-     * is at least a quarter refresh: below that, not holding never repeated a
-     * refresh and holding added ~4.5 ms latency; at 0.28 refresh and above
-     * not holding repeats refreshes (tests/evidence-measure-20261114/sweep). */
+    /* Smoothed time between vsync-off presents. */
     u64            last_present_ns;
     u64            present_interval_ns;
+    /* Frames are held when present_interval_ns is at least this many
+     * thousandths of a refresh (init sets 350), or at least a quarter refresh
+     * within HS_GRAPHICS_HOLD_AFTER_REPEAT flips of a repeated refresh.
+     * Holding adds latency: at 4.2-5.9 ms frames (60 Hz) the shown frame's
+     * median age was 23.9-26.5 ms held and 19.7-20.6 ms not, at the same
+     * frame rate. On an idle CPU, or a busy one with the kworker-rt service,
+     * not holding repeated at most 0.34% of refreshes per run up to 5.87 ms,
+     * 0.3-1.3% at 6.3 ms and 3% at 6.7 ms. With every CPU busy and no
+     * service, or with spiky frame costs, it repeated more than holding;
+     * there repeats keep the quarter-refresh rule in force
+     * (tests/evidence-hold-cutoff-20261116, docs/audit/HARDWARE_HANDOFF_P0.md). */
+    u32            hold_permille;
+    u64            repeats_seen;      /* refreshes_repeated at the last present */
+    u64            hold_until_flip;   /* frames_presented below which the quarter rule applies */
     u64            last_flip_ns;      /* vblank timestamp of the last completed flip (CLOCK_MONOTONIC) */
     u64            flip_waits;        /* vsync off: presents that waited for a flip about to land */
     /* EGL_KHR_fence_sync; NULL when unsupported (frames then count as unfinished). */
@@ -191,6 +202,7 @@ static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height)
      * waited for. Set vsync = true to pace to the display instead. */
     gfx->vsync = false;
     gfx->swap_interval = -1;
+    gfx->hold_permille = 350;
     /* Taking the CRTC away from whatever currently owns it is what puts our
      * frames on the panel; it costs a full modeset on the first present. At
      * close() the kernel hands the CRTC back to the console (fbcon); an
@@ -706,8 +718,9 @@ static inline void hs_graphics_clear(HSGraphics* gfx, float r, float g, float b,
  *               (or, if none has, the older candidate): flipping a frame still
  *               rendering behind frames that will be dropped would miss the
  *               next refresh and repeat the old image. While a flip is in
- *               flight the newest frame is held (when frames take at least a
- *               quarter refresh; faster ones finish in time and are dropped)
+ *               flight the newest frame is held (when frames take at least
+ *               hold_permille of a refresh; faster ones finish in time and
+ *               are dropped)
  *               and flipped at the next present that finds the slot free
  *               (frames of 7/8 refresh or more wait for a flip about to
  *               land, so the next one is queued before the display's
@@ -718,6 +731,7 @@ static inline void hs_graphics_clear(HSGraphics* gfx, float r, float g, float b,
  *   vsync on  - the call returns after the flip completes (one frame per
  *               vblank; the scanned-out buffer is never rendered into).
  * Without take_display (offscreen use) the frame is only swapped. */
+#define HS_GRAPHICS_HOLD_AFTER_REPEAT 60
 static inline void hs_graphics_present(HSGraphics* gfx) {
     if (!gfx->initialized) return;
 
@@ -778,9 +792,17 @@ static inline void hs_graphics_present(HSGraphics* gfx) {
             if (hs_graphics_wait_flip(gfx, (int)(until / 1000000ull) + 3)) hs_graphics_retire_flip(gfx);
         }
     }
+    if (gfx->refreshes_repeated != gfx->repeats_seen) {
+        /* A refresh repeated: frames are not reaching the display in time
+         * (busy CPUs, uneven frame costs). Hold from a quarter refresh. */
+        gfx->repeats_seen = gfx->refreshes_repeated;
+        gfx->hold_until_flip = gfx->frames_presented + HS_GRAPHICS_HOLD_AFTER_REPEAT;
+    }
     if (gfx->flip_pending) {
         hs_graphics_drop_held(gfx);
-        if (gfx->present_interval_ns * 4 >= refresh_ns) {
+        bool repeating = gfx->frames_presented < gfx->hold_until_flip;
+        if (gfx->present_interval_ns * 1000 >= (u64)refresh_ns * gfx->hold_permille ||
+            (repeating && gfx->present_interval_ns * 4 >= refresh_ns)) {
             /* Hold the newest frame for the next free flip slot. */
             gfx->held_bo = bo;
         } else {

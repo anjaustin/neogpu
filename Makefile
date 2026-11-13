@@ -297,12 +297,26 @@ qpu-encode-check: qpu-progs hwprobe-progs
 	$(VC6_PY) tools/qpu_oracle_check.py build/qpu/neo build/qpu
 
 .PHONY: pacing-tools
-pacing-tools: tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe
+pacing-tools: tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe tests/present_cost_probe tests/p0_1_redteam_probe tests/p0_1_redteam2_newest
 
 tests/pacing_trace.so: tests/pacing_trace.c
 	$(CC) -O2 -Wall -Wextra -shared -fPIC -I/usr/include/libdrm $< -o $@ -ldl -lgbm
 
 tests/pacing_sweep: tests/pacing_sweep.c include/hs_graphics.h
+	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
+
+# P0-1 baseline: wall and CPU per present-path call (docs/audit/HARDWARE_HANDOFF_P0.md)
+tests/present_cost_probe: tests/present_cost_probe.c include/hs_graphics.h
+	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
+
+# P0-1 red team: CPU-injection and draw-heavy frames; the tests/p0_1_redteam_*.bt
+# bpftrace scripts trace fences, flips and render jobs (run as root)
+tests/p0_1_redteam_probe: tests/p0_1_redteam_probe.c include/hs_graphics.h
+	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
+
+# P0-1 red team 2: displayed-frame age, production hold policy vs flipping the
+# newest frame on its implicit fence (POLICY=prod|newest)
+tests/p0_1_redteam2_newest: tests/p0_1_redteam2_newest.c include/hs_graphics.h
 	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
 
 tests/flip_deadline_probe: tests/flip_deadline_probe.c include/hs_graphics.h
@@ -375,7 +389,7 @@ clean:
 	rm -f tests/test_p0 tests/test_p0_sanitize tests/test_p0_tsan tests/test_headless_sanitize tests/test_headless_tsan tests/*.d tools/*.d *.d
 	rm -f tests/test_evdev
 	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/panel_mode_probe tests/test_text_render
-	rm -f tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe neogpu_kworker_rt
+	rm -f tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe tests/present_cost_probe tests/p0_1_redteam_probe tests/p0_1_redteam2_newest tests/redteam-hold-cutoff/probe tests/redteam-hold-cutoff/gate_mut tests/redteam-hold-cutoff/gate_mut2 tests/redteam-hold-cutoff/gate_mut2.c tests/redteam-hold-cutoff/gate_orig neogpu_kworker_rt
 	rm -f $(HWPROBES) tools/gather_anom tools/tmuop_probe tools/bench_vs_mesa tests/test_qpu_encode tests/test_v3d_compute tests/test_v3d_runtime
 	rm -rf build/qpu
 	rm -f bench_legacy tests/test_headless_scalar

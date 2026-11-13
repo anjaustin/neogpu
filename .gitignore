@@ -64,6 +64,14 @@ tests/*.o
 /tests/test_present_pacing
 /tests/pacing_trace.so
 /tests/pacing_sweep
+/tests/present_cost_probe
+/tests/p0_1_redteam_probe
+/tests/p0_1_redteam2_newest
+/tests/redteam-hold-cutoff/probe
+/tests/redteam-hold-cutoff/gate_mut
+/tests/redteam-hold-cutoff/gate_mut2
+/tests/redteam-hold-cutoff/gate_mut2.c
+/tests/redteam-hold-cutoff/gate_orig
 /tests/flip_deadline_probe
 /tests/test_text_render
 /tests/test_headless_scalar

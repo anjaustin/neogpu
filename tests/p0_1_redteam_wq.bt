@@ -1,0 +1,6 @@
+uprobe:/lib/aarch64-linux-gnu/libc.so.6:getrusage /comm == "present_cost_pr"/ {
+  if (@win) { @win = 0; @win_ns = nsecs - @t0; } else { @win = 1; @t0 = nsecs; }
+}
+tracepoint:workqueue:workqueue_execute_start /@win/ { @ws[tid] = nsecs; @wf[tid] = args->function; }
+tracepoint:workqueue:workqueue_execute_end /@win && @ws[tid]/ { @work_us[ksym(@wf[tid])] = sum((nsecs - @ws[tid]) / 1000); @work_n[ksym(@wf[tid])] = count(); delete(@ws[tid]); }
+END { clear(@ws); clear(@wf); clear(@t0); clear(@win); }

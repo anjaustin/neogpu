@@ -1,0 +1,7 @@
+uprobe:/lib/aarch64-linux-gnu/libc.so.6:getrusage /comm == "present_cost_pr"/ { @win = @win ? 0 : 1; if (@win) { @t0 = nsecs; } }
+kprobe:dma_resv_add_fence /@win && @n < 300/ { $f = (struct dma_fence *)arg1; printf("%d add_fence resv=%p ctx=%llu seq=%llu usage=%d comm=%s\n", (nsecs-@t0)/1000, arg0, $f->context, $f->seqno, arg2, comm); @n++; }
+kprobe:dma_resv_get_singleton /@win && @n < 300/ { @gs[tid] = arg2; @gr[tid] = arg0; @gu[tid] = arg1; }
+kretprobe:dma_resv_get_singleton /@gs[tid]/ { $p = *(uint64 *)@gs[tid]; printf("%d get_singleton resv=%p usage=%d fence=%p comm=%s\n", (nsecs-@t0)/1000, @gr[tid], @gu[tid], $p, comm); delete(@gs[tid]); @n++; }
+kprobe:vc4_page_flip /@win && @n < 300/ { printf("%d flip_ioctl\n", (nsecs-@t0)/1000); }
+tracepoint:v3d:v3d_rcl_irq /@win && @n < 300/ { printf("%d render_done\n", (nsecs-@t0)/1000); }
+END { clear(@win); clear(@t0); clear(@n); clear(@gs); clear(@gr); clear(@gu); }

@@ -14,6 +14,12 @@
  * hs_graphics_flush_present() shows a held frame and leaves room for the
  * caller's own eglSwapBuffers.
  *
+ * Then frames of ~0.30 refresh, below hold_permille: they are never held
+ * (the newest frame is flipped and the kernel waits for its render), and at
+ * most 1% of refreshes repeat. Then ~0.42 refresh, above it, where not
+ * holding repeated ~3%: frames are held (after at least 99% of presents)
+ * and at most 1% repeat.
+ *
  * Then frames of ~0.95 refresh (~64 FPS): a flip must be queued 4-7 ms
  * before a vblank, and without waiting for a flip about to land ~12% of
  * refreshes repeated. Contract: at most 1% repeat, at no frame-rate cost
@@ -222,7 +228,7 @@ int main(int argc, char** argv) {
         draw(n_loc, t_loc, 1, 0);
         raw_swaps = raw_swaps && eglSwapBuffers(gfx.egl_display, gfx.egl_surface) == EGL_TRUE;
     }
-    /* Cheap frames (far below a quarter refresh) finish in time: they are
+    /* Cheap frames (far below hold_permille) finish in time: they are
      * dropped while a flip is in flight, never held. */
     bool cheap_unheld = true;
     for (int i = 0; i < 200; i++) {
@@ -230,6 +236,46 @@ int main(int argc, char** argv) {
         hs_graphics_present(&gfx);
         if (i >= 32) cheap_unheld = cheap_unheld && !gfx.held_bo;
     }
+    /* Frames between the cheap ones and hold_permille: not held. */
+    double mid_ms = 0;
+    int mid_n = calibrate(n_loc, t_loc, 0.30 * refresh_ms, 0.08, &mid_ms);
+    gfx.last_present_ns = gfx.present_interval_ns = 0; /* calibration's gap is not a frame */
+    /* Settle the smoothed interval, and outlast the quarter-refresh fallback
+     * that the repeats made above (the idle gap) switched on. */
+    for (int i = 0; i < 32 || (gfx.frames_presented < gfx.hold_until_flip && i < 2000); i++) {
+        draw(n_loc, t_loc, mid_n, 0);
+        hs_graphics_present(&gfx);
+    }
+    bool mid_unheld = mid_ms * 1000 < refresh_ms * gfx.hold_permille;
+    u64 mid_rep0 = gfx.refreshes_repeated;
+    u32 mid_seq0 = gfx.last_flip_sequence;
+    for (int i = 0; i < 600; i++) {
+        draw(n_loc, t_loc, mid_n, (float)i * 0.01f);
+        hs_graphics_present(&gfx);
+        mid_unheld = mid_unheld && !gfx.held_bo;
+    }
+    u64 mid_repeated = gfx.refreshes_repeated - mid_rep0;
+    u32 mid_refreshes = gfx.last_flip_sequence - mid_seq0;
+    bool mid_ok = mid_unheld && mid_refreshes > 120 && mid_repeated * 100 <= mid_refreshes;
+    /* Frames above hold_permille: held. */
+    double upper_ms = 0;
+    int upper_n = calibrate(n_loc, t_loc, 0.42 * refresh_ms, 0.04, &upper_ms);
+    gfx.last_present_ns = gfx.present_interval_ns = 0;
+    for (int i = 0; i < 32; i++) {
+        draw(n_loc, t_loc, upper_n, 0);
+        hs_graphics_present(&gfx);
+    }
+    u64 upper_rep0 = gfx.refreshes_repeated;
+    u32 upper_seq0 = gfx.last_flip_sequence;
+    int upper_held = 0;
+    for (int i = 0; i < 600; i++) {
+        draw(n_loc, t_loc, upper_n, (float)i * 0.01f);
+        hs_graphics_present(&gfx);
+        upper_held += gfx.held_bo != NULL;
+    }
+    u64 upper_repeated = gfx.refreshes_repeated - upper_rep0;
+    u32 upper_refreshes = gfx.last_flip_sequence - upper_seq0;
+    bool upper_ok = upper_held * 100 >= 600 * 99 && upper_refreshes > 120 && upper_repeated * 100 <= upper_refreshes;
     /* Slow frames: ~0.95 refresh each, uncapped. */
     double slow_ms = 0;
     int slow_n = calibrate(n_loc, t_loc, 0.95 * refresh_ms, 0.04, &slow_ms);
@@ -307,10 +353,12 @@ int main(int argc, char** argv) {
     bool active = gfx.crtc_active;
     hs_graphics_finish(&gfx);
     double fps = frames * 1000.0 / elapsed;
-    bool ok = active && gfx.present_errors == 0 && presented + dropped == (u64)(frames + extra) && held && raw_swaps && counted && cheap_unheld && slow_ok && load_ok && fast_waits == 0 &&
+    bool ok = active && gfx.present_errors == 0 && presented + dropped == (u64)(frames + extra) && held && raw_swaps && counted && cheap_unheld && mid_ok && upper_ok && slow_ok && load_ok && fast_waits == 0 &&
               flush_shows && fps > 1.5 * 1000.0 / refresh_ms && seq0 && refreshes > 0 && repeated * 100 <= refreshes;
     printf("{\"frames\":%d,\"iterations\":%d,\"gpu_frame_ms\":%.2f,\"refresh_ms\":%.2f,\"fps\":%.1f,"
            "\"presented\":%llu,\"dropped\":%llu,\"refreshes\":%u,\"repeated\":%llu,\"errors\":%u,\"held\":%s,\"raw_swaps\":%s,\"counted\":%s,\"cheap_unheld\":%s,\"flush_owed\":%llu,\"flush_shows\":%s,"
+           "\"mid_gpu_frame_ms\":%.2f,\"mid_unheld\":%s,\"mid_refreshes\":%u,\"mid_repeated\":%llu,"
+           "\"upper_gpu_frame_ms\":%.2f,\"upper_held\":%d,\"upper_refreshes\":%u,\"upper_repeated\":%llu,"
            "\"fast_waits\":%llu,\"slow_gpu_frame_ms\":%.2f,\"slow_fps\":%.1f,\"slow_refreshes\":%u,"
            "\"slow_repeated\":%llu,\"slow_waits\":%llu,\"no_wait_fps\":%.1f,\"no_wait_refreshes\":%u,"
            "\"no_wait_repeated\":%llu,\"load_checked\":%s,\"load_procs\":%d,\"load_refreshes\":%u,"
@@ -319,7 +367,9 @@ int main(int argc, char** argv) {
            refreshes, (unsigned long long)repeated, gfx.present_errors, held ? "true" : "false",
            raw_swaps ? "true" : "false", counted ? "true" : "false",
            cheap_unheld ? "true" : "false", (unsigned long long)owed,
-           flush_shows ? "true" : "false", (unsigned long long)fast_waits, slow_ms, slow_fps, slow_refreshes,
+           flush_shows ? "true" : "false", mid_ms, mid_unheld ? "true" : "false", mid_refreshes,
+           (unsigned long long)mid_repeated, upper_ms, upper_held, upper_refreshes,
+           (unsigned long long)upper_repeated, (unsigned long long)fast_waits, slow_ms, slow_fps, slow_refreshes,
            (unsigned long long)slow_repeated, (unsigned long long)slow_waits, base_fps, base_refreshes,
            (unsigned long long)base_repeated, load_checked ? "true" : "false", spun, load_refreshes,
            (unsigned long long)load_repeated, ok ? "true" : "false");
