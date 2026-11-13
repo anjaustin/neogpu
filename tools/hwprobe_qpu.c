@@ -164,7 +164,7 @@ static void submit(const prog_t* p, uint32_t unif_off, int nqpu, uint32_t perfmo
     s.cfg[0] = 1u << 16;
     s.cfg[1] = 1u << 16;
     s.cfg[2] = 1u << 16;
-    s.cfg[3] = ((((wgs_per_sg * wg_size + 15) / 16) - 1) << 12) | (wgs_per_sg << 8) | (wg_size & 0xff);
+    s.cfg[3] = ((((wgs_per_sg * wg_size + 15) / 16) - 1) << 12) | ((wgs_per_sg & 0xf) << 8) | (wg_size & 0xff);
     s.cfg[4] = (uint32_t)nqpu - 1;
     s.cfg[5] = code.gpu + p->off;
     s.cfg[6] = unif.gpu + unif_off;
@@ -223,6 +223,19 @@ static void section_alu(void) {
     }
 }
 
+/* Keep the GPU busy for ~ms with the ALU loop (8 QPUs) before a timed job.
+ * The V3D clock drops when the GPU idles (measured: 749.6 MHz after a short
+ * idle, a 493.4 MHz average over a 29 ms job after 1 s idle; same cycle
+ * count both times). A loop pass is 69 instructions x 4 cycles. */
+/* default 1 ms (measured enough); HWPROBE_WARM_MS overrides, 0 disables */
+static double warm_ms(void) { return getenv("HWPROBE_WARM_MS") ? atof(getenv("HWPROBE_WARM_MS")) : 1.0; }
+static void gpu_warm(double ms) {
+    if (ms <= 0) return;
+    prog_t a = load("alu64");
+    *U(0) = (uint32_t)(ms * 1e-3 * 749.6e6 / (69.0 * 4.0)) + 1;
+    run(&a, 0, 8, NULL);
+}
+
 static void section_mem(void) {
     printf("\n## TMU bandwidth (every result checked; memset ends with tmuwt, see HWPROBE_MEMSET_SUFFIX)\n");
     printf("%-26s %10s %10s %12s %14s %14s\n", "program", "MiB", "ms", "GB/s wall", "mem reads M", "mem writes M");
@@ -246,6 +259,7 @@ static void section_mem(void) {
         int ok = 1;
         for (int t = 0; t < TRIALS; t++) {
             memset(data.map + yoff, 0, 16 * 8 * 4);
+            gpu_warm(warm_ms());
             ns[t] = run(&p, 4096, nq, v);
             uint32_t s = 0;
             for (int i = 0; i < 16 * nq; i++) s += ((uint32_t*)(data.map + yoff))[i];
@@ -276,10 +290,10 @@ static void section_mem(void) {
         int ok = 1;
         for (int t = 0; t < TRIALS; t++) {
             memset(data.map, 0xA5, ms_len * 4);
+            gpu_warm(warm_ms());
             ns[t] = run(&p, 8192, nq, v);
             uint32_t* x = (uint32_t*)data.map;
-            for (size_t i = 0; i < ms_len; i += 997) ok &= x[i] == 0x5A5A5A5A;
-            ok &= x[ms_len - 1] == 0x5A5A5A5A;
+            for (size_t i = 0; i < ms_len; i++) ok &= x[i] == 0x5A5A5A5A; /* every word */
         }
         double m = median(ns, TRIALS);
         printf("%-26s %10.0f %10.2f %12.2f %14.1f %14.1f %s\n", nq == 8 ? "write: memset 8 QPU" : "write: memset 1 QPU",
@@ -305,10 +319,16 @@ static void section_mem(void) {
         uint64_t v[NCTR];
         int ok = 1;
         for (int t = 0; t < TRIALS; t++) {
-            memset(y, 0, cp_len * 4);
+            /* sentinel: 0 would hide y[0], since x[0] == 0. HWPROBE_SCOPY_FILL
+             * (a byte) overrides it, to measure whether the destination's
+             * prior contents change the copy's speed. */
+            memset(y, getenv("HWPROBE_SCOPY_FILL") ? atoi(getenv("HWPROBE_SCOPY_FILL")) : 0xEE, cp_len * 4);
+            if (getenv("HWPROBE_SETTLE_MS")) usleep((useconds_t)atoi(getenv("HWPROBE_SETTLE_MS")) * 1000u);
+            gpu_warm(warm_ms());
             ns[t] = run(&p, 12288, nq, v);
-            for (size_t i = 0; i < cp_len; i += 991) ok &= y[i] == (uint32_t)i;
-            ok &= y[cp_len - 1] == (uint32_t)(cp_len - 1);
+            /* every word (HWPROBE_CHECK_STRIDE samples instead, for the same experiment) */
+            size_t cs = getenv("HWPROBE_CHECK_STRIDE") ? (size_t)atoi(getenv("HWPROBE_CHECK_STRIDE")) : 1;
+            for (size_t i = 0; i < cp_len; i += cs ? cs : 1) ok &= y[i] == (uint32_t)i;
         }
         double m = median(ns, TRIALS);
         printf("%-26s %10.0f %10.2f %12.2f %14.1f %14.1f %s  (GB/s counts read + write)\n",
@@ -333,8 +353,14 @@ static void section_dispatch(void) {
     }
     /* time until a GPU write is visible to a CPU spinning on the mapped word */
     /* HWPROBE_FLAGKB: flag offset in the data BO, KiB (default 65536 = 64 MiB) */
-    uint64_t flag_kb = getenv("HWPROBE_FLAGKB") ? strtoull(getenv("HWPROBE_FLAGKB"), NULL, 10) : 65536u;
-    if ((flag_kb << 10) + 4 > data.size) { /* checked before narrowing: no wrap */
+    uint64_t flag_kb = 65536u;
+    if (getenv("HWPROBE_FLAGKB")) {
+        char* end;
+        errno = 0;
+        flag_kb = strtoull(getenv("HWPROBE_FLAGKB"), &end, 10);
+        if (errno || end == getenv("HWPROBE_FLAGKB") || *end) flag_kb = UINT64_MAX; /* not a number: refused */
+    }
+    if (flag_kb > (data.size >> 10) || (flag_kb << 10) + 4 > data.size) { /* bounded before shifting: no wrap */
         fprintf(stderr, "HWPROBE_FLAGKB: %llu KiB is outside the %zu-byte data BO\n", (unsigned long long)flag_kb,
                 data.size);
         exit(1);
@@ -708,6 +734,7 @@ static void section_gather(void) {
                 int ok = 1;
                 for (int t = 0; t < 5; t++) { /* every trial checked; sentinel fill (hash32(0) == 0) */
                     memset(go, 0xEE, (size_t)G_N * 4);
+                    gpu_warm(warm_ms());
                     ns[t] = run(&p, 20480, nq, v);
                     for (uint32_t i = 0; i < G_N; i++) ok &= go[i] == hash32(gi[i]);
                 }

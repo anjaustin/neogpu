@@ -276,13 +276,18 @@ static void wbarrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
 
 /* GPU resets so far, from dmesg; -1 if it cannot be read (no sudo) */
 static int resets(void) {
-    FILE* f = popen("sudo -n dmesg 2>/dev/null | grep -c 'Resetting GPU for hang'", "r");
-    int n = -1;
-    if (f) {
-        if (fscanf(f, "%d", &n) != 1) n = -1;
-        pclose(f);
+    /* count in C and require dmesg itself to succeed: a pipe into grep -c
+     * printed 0 even when sudo failed (red team 3) */
+    FILE* f = popen("sudo -n dmesg 2>/dev/null", "r");
+    if (!f) return -1;
+    char line[512];
+    int n = 0, lines = 0;
+    while (fgets(line, sizeof(line), f)) {
+        lines++;
+        if (strstr(line, "Resetting GPU for hang")) n++;
     }
-    return n;
+    int st = pclose(f);
+    return st == 0 && lines > 0 ? n : -1;
 }
 /* "+n", or "unknown" when either count could not be read: never report
  * 0 resets that were not counted */
@@ -303,6 +308,7 @@ static void section_tick(uint32_t tick_gpu, uint32_t cfg) {
         printf("\n## A: GPU stores during a running job (1 batch, a store + tmuwt every ~1 ms, 100 ticks)\n");
     volatile uint32_t* word = (volatile uint32_t*)data.map;
     for (int run = 0; run < 3; run++) {
+        int r0 = resets();
         *word = 0;
         wbarrier();
         uint32_t* u = (uint32_t*)unif.map;
@@ -347,6 +353,7 @@ static void section_tick(uint32_t tick_gpu, uint32_t cfg) {
                "(WAIT_BO) at %.3f ms; final word %u; gaps between observed values min %.3f / mean %.3f / max %.3f ms%s\n",
                run, distinct, seen_at[1] / 1e6, seen_at[100] / 1e6, t_done / 1e6, *word, gmin / 1e6,
                ng ? gsum / ng / 1e6 : 0, gmax / 1e6, e ? " (WAIT_BO error)" : "");
+        printf("   GPU resets during run %d: %s\n", run, reset_delta(r0, resets()));
     }
 }
 

@@ -76,3 +76,4 @@ neogpu_kworker_rt
 /tools/hwprobe_qpu
 /tools/hwprobe_mailbox
 /tools/gather_anom
+/tools/tmuop_probe

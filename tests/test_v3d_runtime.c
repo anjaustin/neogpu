@@ -36,8 +36,11 @@ int main(void) {
     check(hs_v3d_open(&dev, "/dev/null") == -ENODEV && dev.fd == -1, "a non-DRM node is refused (-ENODEV), fd left -1");
     check(hs_v3d_open(&dev, "/nonexistent/renderD999") == -ENOENT, "a missing node gives -ENOENT");
     /* on this Pi card0 is v3d's primary node and card1 is vc4 (display) */
+    /* -ENODEV only: -EACCES would mean the open failed before the driver
+     * name check this is meant to exercise */
     int e = hs_v3d_open(&dev, "/dev/dri/card1");
-    check(e == -ENODEV || e == -EACCES || e == -EPERM, "card1 (vc4, the display driver) is refused");
+    printf("     (card1 returned %d)\n", e);
+    check(e == -ENODEV, "card1 (vc4, the display driver) is refused by the driver-name check (-ENODEV)");
     if (e == 0) hs_v3d_close(&dev);
 
     int fd0 = count_fds();
@@ -53,7 +56,7 @@ int main(void) {
     check(dev.fd == -1, "double close is harmless");
 
     if (hs_v3d_open(&dev, NULL)) return 1;
-    int fd1 = count_fds();
+    int fd1 = count_fds(), m0 = count_maps();
     for (int i = 0; i < 300; i++) {
         hs_v3d_bo bo;
         if (hs_v3d_bo_new(&dev, &bo, (size_t)(1 + i % 7) * 4096 + (i % 3) * 100)) {
@@ -65,7 +68,7 @@ int main(void) {
         hs_v3d_bo_free(&dev, &bo);
         hs_v3d_bo_free(&dev, &bo); /* double free: harmless */
     }
-    check(count_fds() == fd1, "300 BO cycles (odd sizes, double free) leak no fd");
+    check(count_fds() == fd1 && count_maps() == m0, "300 BO cycles (odd sizes, double free) leak no fd or mapping");
     int m1 = count_maps();
     for (int i = 0; i < 100; i++) {
         hs_v3d_bo bo;
@@ -82,7 +85,8 @@ int main(void) {
     e = hs_v3d_bo_new(&dev, &big, (size_t)2 << 30);
     check(e == 0, "a 2 GiB BO can be created");
     int e2 = hs_v3d_bo_new(&dev, &bo, (size_t)5 << 29);
-    check(e2 != 0 && bo.handle == 0 && bo.map == NULL, "a BO beyond the GPU address space fails cleanly");
+    check(e2 == -ENOSPC && bo.handle == 0 && bo.map == NULL,
+          "a BO beyond the GPU's 4 GiB address space fails cleanly with -ENOSPC");
     printf("     (the refused allocation returned %d: %s)\n", e2, strerror(e2 < 0 ? -e2 : e2));
     if (!e2) hs_v3d_bo_free(&dev, &bo);
     if (!e) hs_v3d_bo_free(&dev, &big);

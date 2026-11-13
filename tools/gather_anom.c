@@ -232,9 +232,19 @@ int main(int argc, char** argv) {
         if (var == 4 && ((size_t)ioff + NF * 4ull > dsize || (size_t)ooff + NF * 4ull > dsize || ioff + NF * 4ull > ooff)) { printf("skip skew range\n"); continue; }
         uint32_t tent = mode == 0 ? TE : NF;
         if (passes == 0) { printf("skip: N below one pass (%u elements)\n", per); continue; }
-        if ((size_t)toff + (size_t)tent * 4 > dsize || (toff < ioff && (size_t)toff + (size_t)tent * 4 > ioff)) {
-            printf("skip table fill range\n");
-            continue;
+        {
+            /* table, idx and out must lie inside the BO and not overlap */
+            uint64_t lo[3] = {toff, ioff, ooff}, hi[3] = {toff + (uint64_t)tent * 4, ioff + (uint64_t)NF * 4,
+                                                        ooff + (uint64_t)NF * 4};
+            int bad = 0;
+            for (int x = 0; x < 3; x++) {
+                bad |= hi[x] > dsize;
+                for (int y = x + 1; y < 3; y++) bad |= lo[x] < hi[y] && lo[y] < hi[x];
+            }
+            if (bad) {
+                printf("skip: table/idx/out out of range or overlapping\n");
+                continue;
+            }
         }
         /* (re)fill table and idx */
         for (uint32_t i = 0; i < tent; i++) tb[i] = hash32(i);
@@ -267,7 +277,7 @@ int main(int argc, char** argv) {
             if (getenv("TRACE") && t == 0 && var == 0) {
                 /* CPU watches out[] while the GPU runs: per batch, the highest
                  * load slot L (= pass*k + i) whose first word is visible in
-                 * memory (binary search; out was zeroed). */
+                 * memory (binary search; out was filled with the 0xEE sentinel). */
                 uint32_t nl = passes * (uint32_t)k;
                 for (int step = 0; step < 4000; step++) {
                     uint64_t tn = now_ns();
@@ -278,7 +288,7 @@ int main(int argc, char** argv) {
                         while (lo < hi) {
                             uint32_t mid = (lo + hi) / 2;
                             uint32_t e = ((mid * (uint32_t)B) + (uint32_t)bb) * 16u;
-                            if (((volatile uint32_t*)ot)[e] != 0 || e == 0) lo = mid + 1; else hi = mid;
+                            if (((volatile uint32_t*)ot)[e] != 0xEEEEEEEEu) lo = mid + 1; else hi = mid;
                         }
                         fr[bb] = lo;
                         done &= lo == nl;

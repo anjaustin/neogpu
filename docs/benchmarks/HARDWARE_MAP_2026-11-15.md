@@ -259,3 +259,99 @@ What this means:
 The lead worth taking is decoding the TMU operation semantics, starting with
 op 1's mid-job write-back, from Mesa's MIT-licensed hardware description:
 read it as documentation, then measure each claim.
+
+## TMU cache operations: a working mid-job mailbox, decoded 2026-11-16
+
+A decoding agent read Mesa's MIT-licensed hardware description as
+documentation and measured every claim on the Pi with `tools/tmuop_probe.c`.
+The central results were then reproduced independently. Raw outputs are on
+the Pi in `tests/evidence-tmuop-20261116/` (the agent's) and
+`tests/evidence-measure-20261116/` (the reproduction).
+
+**Setting the config.** Writing an address to `tmuau` takes the next uniform
+as that access's config word:
+
+    0xFFFFFF00 | perpixel<<7 | op<<3 | type
+
+- type 7 is 32-bit; op 15 is a regular access.
+- The op field is **bits 6:3** (measured): op 8 returned the old value and
+  incremented memory, 9 decremented, 10 inverted, and 15 read normally.
+- The existing kernels' 0xFC bytes decode as per-pixel, op 15, vec4.
+- Every op consumes one uniform.
+
+The earlier `tmuc` experiment (above) wrote `op<<4 | 0xF`. That is per-quad
+mode with ops 1, 3, 5, 7 and 9, not 0–4. Its "op 1" was really op 3, which
+publishes stores, as it saw. Why those runs hung was not re-tested.
+
+| op | returns data | CPU write → GPU sees it | GPU store → CPU sees it mid-job | other |
+|---|---|---|---|---|
+| 0 | no | no | no | |
+| 1 | no | **yes** | no | discards the GPU's own unwritten store |
+| 2 | no | **yes** | **yes** | publishes, then reloads |
+| 3 | no | no | **yes** | publishes only |
+| 4 | no | no | no | full L1 clear: the stale copy is held beyond L1 |
+| 8 / 9 / 10 | old value | n/a | n/a | atomic inc / dec / not |
+
+How the table was measured:
+- 2 runs per cell, 0 resets.
+- Reproduced independently for ops 1–3: 2 runs each, 0 resets. With op 2
+  the CPU saw a GPU store at 0.089–0.091 ms into a 60 ms job; with op 3 at
+  0.082–0.094 ms.
+- **Reach of an op:**
+  - Publishing covers at least the 64-byte line.
+  - Reloading covers only the words the op itself addressed, so each lane
+    runs the op on its own word.
+  - Whether the stale data sits in the TMU's write combiner or in the L2T
+    was inferred, not isolated.
+
+**Recipe:**
+- **GPU → CPU:** store, `tmuwt`, then op 2 or 3 on the same address via
+  `tmuau`.
+- **CPU → GPU:** op 2 or 1 on the word via `tmuau`, then a normal load.
+- **Never use op 1 on data the GPU has written:** it discards it.
+
+**Ping-pong inside one running job:** the CPU writes a sequence number, the
+GPU sees it and acks, the CPU sees the ack.
+
+| | messages | RTT p50 | p99 | max | rate |
+|---|---|---|---|---|---|
+| decoding agent: 1 word with or without `tmuwt`, and a 16-word payload | 70,000, 0 lost, 0 torn of 30,000 payloads | 0.67–0.98 µs | 1.15–2.41 µs | 31–284 µs | 0.42–1.20 M/s |
+| reproduction: op 2, 1 word, `tmuwt` | 3 × 10,000, 0 lost, 0 resets | **0.76 µs** | 1.02 µs | 34–143 µs | 0.55–1.20 M/s |
+
+That is about **30–100x faster than a kernel submit** (22–75 µs).
+
+What it costs on the GPU, and what still binds:
+- A coherent poll costs ~330 ns on the GPU, against ~96 ns for a stale,
+  cache-hit poll.
+- A job is still reset at ~1 s, so a persistent program must finish and be
+  relaunched within that.
+- Every op consumes a uniform. Rewinding the uniform stream with a
+  branch's `ub` field is untested.
+- The message rate varied 0.42–1.2 M/s between runs, for an unexplained
+  reason. The first run in the reproduction was the slow one.
+
+## The GPU clock drops when the GPU idles (measured 2026-11-16)
+
+Found while red-teaming `hwprobe_qpu`. Raw outputs:
+`tests/evidence-measure-20261116/redteam3/`.
+- After the GPU has been idle for 200 ms or more, the next job runs on a low
+  clock. The scopy kernel took the same 14.41 M GPU cycles either way:
+  19.23 ms at 749.6 MHz after a short idle, but 29.2 ms (a 492.7–493.4 MHz
+  average) after 200 ms or 1 s of idle.
+- Idle gaps of 0, 10 and 50 ms kept the full clock. The threshold lies
+  between 50 and 200 ms and was not narrowed further.
+- **A 1 ms warm-up job just before restores the full clock**: 749.2–749.3 MHz
+  at warm-ups of 1, 5, 20, 50 and 100 ms.
+- The destination's prior contents had no effect: fills of 0x00, 0x01, 0xEE
+  and 0xFF gave the same times.
+
+What it means:
+- The first job after an idle spell pays up to ~1.5x in time. A latency-
+  sensitive NeoGPU path should keep the GPU warm, or account for the cost.
+- `hwprobe_qpu` now runs a 1 ms ALU warm-up before every timed memory and
+  gather job (`HWPROBE_WARM_MS`, default 1, 0 disables). With every word
+  checked, it re-measured the published figures unchanged: scopy
+  6.98 GB/s, memset 5.68, summation 11.63; gather 612.6 M/s sequential
+  (k=8) and 36.0–36.3 M/s random.
+- They had been steady-clock numbers all along. The sampled checks used
+  before were short enough to keep the GPU warm.

@@ -430,3 +430,23 @@ make qpu-progs                 # NeoGPU-encoded programs -> build/qpu/neo
 make qpu-encode-check          # + oracle comparison (needs the py-videocore6 venv)
 tools/hwprobe_qpu build/qpu/neo 0 adgG
 ```
+
+## Red team 3 (second pass over the round-2 fixes), 2026-11-16
+
+A fresh reviewer verified the round-2 fixes. Findings 1–3 and 5 are
+confirmed fixed (the zero-pass guard, uniform validation, the batch
+restriction, the BO failure path). It found five remaining defects; all are
+now fixed:
+
+| finding | fix |
+|---|---|
+| `hwprobe_mailbox` still reported 0 resets when dmesg was unreadable: `grep -c` prints 0 on empty input | `resets()` counts in C and requires dmesg's own exit status. Section A now reports resets too. (On this Pi `sudo -n dmesg` works: the counts read 205, so the published zero-reset figures stand.) |
+| The sentinel change broke `gather_anom`'s drift trace, which still looked for non-zero words | It now looks for the sentinel (verified: 15 samples traced) |
+| `HWPROBE_FLAGKB` could still wrap at 2^54, and non-numbers read as 0 | Bounded before shifting; non-numbers refused (verified) |
+| test_v3d_runtime accepted any error for the beyond-address-space BO (the doc said -ENOSPC), and accepted -EACCES for card1, which would skip the name check | It now asserts -ENOSPC, measured on this 8 GB Pi, and -ENODEV for card1 (measured: -19). Mappings are checked over all 400 BO cycles |
+| hwprobe_qpu's scopy zero-filled its destination (blind at y[0]), and memset/scopy checked ~1 word in 1000 against an "every result checked" header | Sentinel fill; every word is now checked |
+
+Fixing the last item exposed the GPU idle-clock effect
+(HARDWARE_MAP_2026-11-15.md, "The GPU clock drops when the GPU idles"). The
+full checks took long enough for the clock to drop. Timed jobs now get a
+1 ms warm-up, and the published figures re-measured unchanged.
