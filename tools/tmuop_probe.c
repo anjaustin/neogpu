@@ -465,7 +465,7 @@ static void section_m(int op, int runs) {
             continue;
         }
         gpu_warm(warm_gpu);
-        uint64_t t0 = now_ns(), t_msg1 = 0;
+        uint64_t t0 = now_ns(), t_msg1 = 0, t_last = 0;
         int e = dispatch(pg, 4096);
         if (e) die("dispatch", e);
         uint32_t done = 0;
@@ -490,6 +490,7 @@ static void section_m(int op, int runs) {
             if (!ok) break;
             rtt[n - 1] = b - a;
             done = n;
+            t_last = b; /* the rate ends at the last ack seen, not after a timeout */
             if (n == 1) t_msg1 = b; /* the exchange rate is measured from here: start-up excluded */
             if (g_payload) {
                 int bad = 0;
@@ -508,7 +509,7 @@ static void section_m(int op, int runs) {
                 }
             }
         }
-        uint64_t tm = now_ns();
+        uint64_t tm = t_last;
         e = hs_v3d_bo_wait(&dev, &data, 5000000000ull);
         double ms = (now_ns() - t0) / 1e6;
 

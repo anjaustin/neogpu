@@ -79,7 +79,7 @@ floating-point throughput than the whole QPU array.
 | QPU TMU read, 1 QPU | 2.22 |
 | QPU TMU write, 1 or 8 QPUs (memset) | 5.67 |
 | QPU copy, 8 QPUs, read+write | 6.98 |
-| GPU reading while 1 / 3 CPU threads read | 8.25 / 7.55 (CPU gets 2.97 / 2.83) |
+| GPU reading while 1 / 3 CPU threads read | 8.13–8.27 / 7.51–7.68 (CPU gets 2.92–2.98 / 2.82–2.89), across the 3 clean runs and 2 red-team re-runs |
 | CPU read of a v3d BO mapping, ldp q | **1.476, the same at 16K, 256K and 16M** (the mapping is uncached) |
 | CPU write to a v3d BO mapping | 4.16 |
 

@@ -477,3 +477,20 @@ Figures re-measured with the fixed tools:
 - G: totals 42.2–42.4 M/s, equal to the CPU alone, so the conclusion holds;
   the GPU share under load is 31.0 M/s warm, against 29.3 earlier on a
   cold clock.
+
+## Convergence check, 2026-11-16
+
+A last reviewer, reading only the round-4 changes, verified them and found
+one medium and three low issues. All are fixed and verified on the GPU with
+0 resets:
+
+| finding | fix |
+|---|---|
+| (medium) section c's sum check could pass on a correct sum left at the same offset by the memory section, even if a job never ran | The sum slots are cleared before every timed run (expected total 0xFF000000, never 0). Verified with `mc` in one process: "sums ok" |
+| (low) a lost mailbox message would include its 50 ms timeout in the rate | The rate now ends at the last ack seen. Unchanged when nothing is lost: 1.20–1.21 M/s |
+| (low) a huge skew wrapped gather_anom's 32-bit range check | Bounded in 64 bits ("skip: skew beyond the BO", verified) |
+| (low) the Memory table's GPU+CPU row was not updated | It now gives the range over all 5 runs |
+
+Findings per round fell from 14 (round 1) to 10, 5 and 6 (the last mostly
+in newly committed code), then 1 medium in this pass. Every finding is
+closed with a test or a re-measurement.

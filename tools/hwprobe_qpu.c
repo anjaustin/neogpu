@@ -458,6 +458,10 @@ static void section_concurrent(void) {
     for (size_t i = 0; i < sum_len; i++) x[i] = (uint32_t)i;
     uint32_t* ysum = (uint32_t*)(data.map + sum_len * 4);
     int sums_ok = 1;
+/* the sum slots are cleared before every timed run (CLEAR_SUM), so a job
+ * that never ran cannot pass on a sum left by an earlier section; the
+ * expected total, 0xFF000000 for 32 Mi elements, is not 0 */
+#define CLEAR_SUM() memset(ysum, 0, 16 * 8 * 4)
 #define CHECK_SUM()                                                                                    \
     do {                                                                                               \
         uint32_t s_ = 0;                                                                               \
@@ -474,6 +478,7 @@ static void section_concurrent(void) {
     for (int nthr = 1; nthr <= 3; nthr += 2) {
         double solo[5], mixed[5], cpu[5];
         for (int t = 0; t < 5; t++) {
+            CLEAR_SUM();
             gpu_warm(warm_ms());
             solo[t] = sum_len * 4.0 / run(&p, 4096, 8, NULL);
             CHECK_SUM();
@@ -487,6 +492,7 @@ static void section_concurrent(void) {
             double g = 0;
             const int reps = 5;
             for (int k = 0; k < reps; k++) {
+                CLEAR_SUM();
                 gpu_warm(warm_ms()); /* also under CPU load: the warm job is untimed */
                 g += run(&p, 4096, 8, NULL);
                 CHECK_SUM();

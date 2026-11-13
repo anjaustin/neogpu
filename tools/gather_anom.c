@@ -229,7 +229,8 @@ int main(int argc, char** argv) {
         uint32_t* tb = (uint32_t*)(data.map + toff);
         uint32_t* ix = (uint32_t*)(data.map + ioff);
         uint32_t* ot = (uint32_t*)(data.map + ooff);
-        uint32_t NF = var == 4 ? N + 8u * (uint32_t)skew * per : N; /* skewed batches run past N */
+        if (var == 4 && (uint64_t)8 * (uint64_t)skew * per * 4 > dsize) { printf("skip: skew beyond the BO\n"); continue; }
+        uint32_t NF = var == 4 ? N + 8u * (uint32_t)skew * per : N; /* skewed batches run past N (bounded above) */
         if (var == 4 && ((size_t)ioff + NF * 4ull > dsize || (size_t)ooff + NF * 4ull > dsize || ioff + NF * 4ull > ooff)) { printf("skip skew range\n"); continue; }
         uint32_t tent = mode == 0 ? TE : NF;
         if (passes == 0) { printf("skip: N below one pass (%u elements)\n", per); continue; }
