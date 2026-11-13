@@ -214,6 +214,16 @@ tests/test_present_flip: tests/test_present_flip.c include/hs_graphics.h
 tests/test_present_pacing: tests/test_present_pacing.c include/hs_graphics.h
 	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
 
+tests/test_present_scaled: tests/test_present_scaled.c include/hs_graphics.h
+	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
+
+# P0-3 display-controller (HVS) probes: libdrm only, no GPU or Mesa
+# (docs/audit/HARDWARE_HANDOFF_P0.md). Each needs DRM master; run with sudo.
+.PHONY: p0-3-tools
+p0-3-tools: tests/p0_3_plane_inventory tests/p0_3_hvs_probe tests/p0_3_writeback_check
+tests/p0_3_plane_inventory tests/p0_3_hvs_probe tests/p0_3_writeback_check: tests/%: tests/%.c
+	$(CC) -O2 -Wall -Wextra -I/usr/include/libdrm $< -ldrm -o $@
+
 # Pacing diagnostics (not part of a gate): pacing_trace.so records every page
 # flip and swap of any program it is preloaded into; pacing_sweep renders a
 # shader calibrated to a fraction of a refresh; flip_deadline_probe measures
@@ -326,12 +336,13 @@ tests/test_text_render: tests/test_text_render.c src/hs_text.o include/hs_graphi
 	$(CC) $(CFLAGS) $< src/hs_text.o $(LDFLAGS) -o $@
 
 .PHONY: present-hardware
-present-hardware: tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/test_text_render
+present-hardware: tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/test_present_scaled tests/test_text_render
 	python3 -E tests/test_present_hardware.py
 	./tests/test_present_flip 60 1 0 idle
 	./tests/test_present_flip 60 1 0 mismatch
 	./tests/test_present_flip 1 1 0 initfail
 	./tests/test_present_pacing 600
+	./tests/test_present_scaled 400 240
 	./tests/test_text_render
 
 tests/test_evdev: tests/test_evdev.c src/hs_input_stream.o
@@ -388,7 +399,7 @@ clean:
 	rm -f tests/test_architecture_sanitize tests/test_architecture_latency_sanitize tests/test_architecture_tsan tests/test_architecture_latency_tsan
 	rm -f tests/test_p0 tests/test_p0_sanitize tests/test_p0_tsan tests/test_headless_sanitize tests/test_headless_tsan tests/*.d tools/*.d *.d
 	rm -f tests/test_evdev
-	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/panel_mode_probe tests/test_text_render
+	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/test_present_scaled tests/p0_3_plane_inventory tests/p0_3_hvs_probe tests/p0_3_writeback_check tests/redteam-p0-3/fail_atomic.so tests/redteam-p0-3/memstress tests/redteam-p0-3/rt_scaled tests/redteam-p0-3/rt_wb_edge tests/panel_mode_probe tests/test_text_render
 	rm -f tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe tests/present_cost_probe tests/p0_1_redteam_probe tests/p0_1_redteam2_newest tests/redteam-hold-cutoff/probe tests/redteam-hold-cutoff/gate_mut tests/redteam-hold-cutoff/gate_mut2 tests/redteam-hold-cutoff/gate_mut2.c tests/redteam-hold-cutoff/gate_orig neogpu_kworker_rt
 	rm -f $(HWPROBES) tools/gather_anom tools/tmuop_probe tools/bench_vs_mesa tests/test_qpu_encode tests/test_v3d_compute tests/test_v3d_runtime
 	rm -rf build/qpu

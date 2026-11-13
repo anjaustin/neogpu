@@ -62,6 +62,15 @@ tests/*.o
 /tests/scanout_probe
 /tests/test_present_flip
 /tests/test_present_pacing
+/tests/test_present_scaled
+/tests/p0_3_plane_inventory
+/tests/p0_3_hvs_probe
+/tests/p0_3_writeback_check
+/tests/redteam-p0-3/fail_atomic.so
+/tests/redteam-p0-3/memstress
+/tests/redteam-p0-3/rt_scaled
+/tests/redteam-p0-3/rt_wb_edge
+/tests/redteam-p0-3/mutants/
 /tests/pacing_trace.so
 /tests/pacing_sweep
 /tests/present_cost_probe

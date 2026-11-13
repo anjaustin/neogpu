@@ -56,6 +56,11 @@ typedef struct {
     bool           reuse_connector_scan;
     bool           display_found;
     bool           size_defaulted;
+    /* hs_graphics_init_scaled: the surface is smaller than the display's
+     * mode and the display controller (HVS) scales it to the full panel at
+     * scanout. Takeover programs the primary plane with one atomic commit;
+     * flips after that are the same legacy page flips as unscaled. */
+    bool           scaled_scanout;
     bool           crtc_setup_done;   /* takeover attempted (success or not) */
     bool           crtc_active;       /* our framebuffer is being scanned out */
     bool           flip_pending;      /* a page flip was queued and has not completed */
@@ -190,7 +195,39 @@ static inline int hs_graphics_select_display(int fd, uint32_t require_type, HSGr
  * that knows its target size passes it, which also means the display is not
  * taken unless that size is the panel's own mode.
  */
+static inline int hs_graphics_init_common(HSGraphics* gfx, u32 width, u32 height, bool scaled);
 static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height) {
+    return hs_graphics_init_common(gfx, width, height, false);
+}
+
+#ifdef HS_GRAPHICS_SHELVED_SCALED
+/* SHELVED (P0-3, docs/audit/HARDWARE_HANDOFF_P0.md): not part of the public
+ * API. On the panel the stretched image looked pixelated, not like a native
+ * render, so this is a quality trade, not a speed-up. Kept, behind this define,
+ * only for the P0-3 tests and probes. */
+/* Render at width x height and show it on the attached display, scaled to the
+ * display's full mode by the display controller (the vc4 HVS) at scanout, at
+ * no GPU cost. The GPU's fill work shrinks with the pixel count: the ray-cast
+ * scene of test_08 renders 3.9x faster at 400x240 than at 800x480. The image
+ * is stretched to the panel (keep the panel's aspect ratio to avoid
+ * distortion) and is softer than a native-resolution render. Each dimension
+ * must be at most the display's; the size of the display's own mode behaves
+ * exactly like hs_graphics_init. Fails (returns -1) without a display or if
+ * the size is larger than the display's mode.
+ * - Use a width that is a multiple of 8: odd widths measured ~0.17 ms of
+ *   extra time per frame (799x479: 1265 vs 1603 FPS on a trivial frame).
+ * - The HVS's default filter is a 4-tap cubic-like kernel; it places the image
+ *   ~0.38 output px right and down at 2x, and a 1-px border looks heavier at
+ *   the left/top than at the right/bottom (tests/evidence-p0-3-20261116).
+ * - Scanout is free for the display but reads memory: a smaller render size
+ *   reads less than native. */
+static inline int hs_graphics_init_scaled(HSGraphics* gfx, u32 width, u32 height) {
+    if (!width || !height) return -1;
+    return hs_graphics_init_common(gfx, width, height, true);
+}
+#endif /* HS_GRAPHICS_SHELVED_SCALED */
+
+static inline int hs_graphics_init_common(HSGraphics* gfx, u32 width, u32 height, bool scaled) {
     memset(gfx, 0, sizeof(HSGraphics));
     gfx->drm_fd = -1;
     gfx->egl_display = EGL_NO_DISPLAY;
@@ -236,7 +273,12 @@ static inline int hs_graphics_init_sized(HSGraphics* gfx, u32 width, u32 height)
         detected_height = gfx->display_mode.vdisplay;
     }
 
-    if (width && height) {
+    if (scaled) {
+        if (!gfx->display_found || width > detected_width || height > detected_height) goto fail;
+        gfx->screen_width = width;
+        gfx->screen_height = height;
+        gfx->scaled_scanout = width != detected_width || height != detected_height;
+    } else if (width && height) {
         /* The caller knows the target size. Present on the attached panel
          * only when the requested size is that panel's own mode; otherwise
          * this is an offscreen target and the display is not ours to take. */
@@ -529,6 +571,150 @@ static inline void hs_graphics_present_failed(HSGraphics* gfx, const char* why) 
     gfx->present_error = why;
 }
 
+/* Property id of name on a KMS object, or 0. */
+static inline uint32_t hs_graphics_prop(int fd, uint32_t obj, uint32_t type, const char* name, uint64_t* value) {
+    drmModeObjectProperties* props = drmModeObjectGetProperties(fd, obj, type);
+    uint32_t id = 0;
+    for (uint32_t i = 0; props && i < props->count_props && !id; i++) {
+        drmModePropertyRes* p = drmModeGetProperty(fd, props->props[i]);
+        if (p && !strcmp(p->name, name)) {
+            id = p->prop_id;
+            if (value) *value = props->prop_values[i];
+        }
+        drmModeFreeProperty(p);
+    }
+    drmModeFreeObjectProperties(props);
+    return id;
+}
+
+/* Plane properties a previous DRM client may have left changed, and their
+ * defaults; the console's restore resets only rotation (measured,
+ * tests/evidence-p0-3-redteam-20261116/inherited_props.jsonl). An enum or
+ * range property the kernel lacks is skipped. */
+static const struct { const char* name; uint64_t value; } hs_graphics_plane_defaults[] = {
+    {"alpha", 0xffff},
+    {"pixel blend mode", 0},  /* Pre-multiplied (the kernel default) */
+    {"SCALING_FILTER", 0},    /* Default */
+    {"rotation", 1},          /* rotate-0 */
+};
+
+/* The primary plane that can drive gfx's CRTC (universal planes on), or 0. */
+static inline uint32_t hs_graphics_primary_plane(HSGraphics* gfx) {
+    int fd = gfx->drm_fd;
+    if (drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1)) return 0;
+    drmModeRes* res = drmModeGetResources(fd);
+    int crtc_index = -1;
+    for (int i = 0; res && i < res->count_crtcs; i++)
+        if (res->crtcs[i] == gfx->display_crtc_id) crtc_index = i;
+    drmModeFreeResources(res);
+    drmModePlaneRes* planes = drmModeGetPlaneResources(fd);
+    uint32_t primary = 0;
+    for (uint32_t i = 0; crtc_index >= 0 && planes && i < planes->count_planes && !primary; i++) {
+        drmModePlane* p = drmModeGetPlane(fd, planes->planes[i]);
+        uint64_t type = 0;
+        if (p && (p->possible_crtcs & (1u << crtc_index)) &&
+            hs_graphics_prop(fd, p->plane_id, DRM_MODE_OBJECT_PLANE, "type", &type) && type == DRM_PLANE_TYPE_PRIMARY)
+            primary = p->plane_id;
+        drmModeFreePlane(p);
+    }
+    drmModeFreePlaneResources(planes);
+    return primary;
+}
+
+/* Native takeover: turn off any other plane a previous client left on the
+ * CRTC (SetCrtc does not), and put the primary plane's properties back to
+ * their defaults where they differ. Each change is a commit; normally none
+ * is needed. */
+static inline void hs_graphics_reset_plane(HSGraphics* gfx) {
+    uint32_t primary = hs_graphics_primary_plane(gfx);
+    drmModePlaneRes* planes = primary ? drmModeGetPlaneResources(gfx->drm_fd) : NULL;
+    for (uint32_t i = 0; planes && i < planes->count_planes; i++) {
+        drmModePlane* p = drmModeGetPlane(gfx->drm_fd, planes->planes[i]);
+        if (p && p->plane_id != primary && p->crtc_id == gfx->display_crtc_id)
+            drmModeSetPlane(gfx->drm_fd, p->plane_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        drmModeFreePlane(p);
+    }
+    drmModeFreePlaneResources(planes);
+    for (size_t i = 0; primary && i < sizeof(hs_graphics_plane_defaults) / sizeof(hs_graphics_plane_defaults[0]); i++) {
+        uint64_t value = 0;
+        uint32_t id = hs_graphics_prop(gfx->drm_fd, primary, DRM_MODE_OBJECT_PLANE, hs_graphics_plane_defaults[i].name, &value);
+        if (id && value != hs_graphics_plane_defaults[i].value)
+            drmModeObjectSetProperty(gfx->drm_fd, primary, DRM_MODE_OBJECT_PLANE, id, hs_graphics_plane_defaults[i].value);
+    }
+}
+
+/* Scaled takeover: one atomic modeset that shows fb (the render size) on the
+ * CRTC's primary plane stretched to the full mode, puts the plane's
+ * alpha, blend mode, filter and rotation back to their defaults, and turns
+ * off any other plane left on this CRTC. Later legacy page flips keep the plane's source
+ * and destination rectangles (measured: tests/evidence-p0-3-20261116). */
+static inline int hs_graphics_set_scaled(HSGraphics* gfx, uint32_t fb) {
+    int fd = gfx->drm_fd;
+    if (drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) || drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1))
+        return -1;
+    drmModeRes* res = drmModeGetResources(fd);
+    int crtc_index = -1;
+    for (int i = 0; res && i < res->count_crtcs; i++)
+        if (res->crtcs[i] == gfx->display_crtc_id) crtc_index = i;
+    drmModeFreeResources(res);
+    drmModePlaneRes* planes = drmModeGetPlaneResources(fd);
+    if (crtc_index < 0 || !planes) {
+        drmModeFreePlaneResources(planes);
+        return -1;
+    }
+    drmModeAtomicReq* req = drmModeAtomicAlloc();
+    uint32_t primary = 0, blob = 0;
+    int bad = !req;
+    for (uint32_t i = 0; !bad && i < planes->count_planes; i++) {
+        drmModePlane* p = drmModeGetPlane(fd, planes->planes[i]);
+        if (!p) continue;
+        uint64_t type = 0;
+        bool ours = p->possible_crtcs & (1u << crtc_index);
+        if (ours && !primary && hs_graphics_prop(fd, p->plane_id, DRM_MODE_OBJECT_PLANE, "type", &type) &&
+            type == DRM_PLANE_TYPE_PRIMARY) {
+            primary = p->plane_id;
+        } else if (p->crtc_id == gfx->display_crtc_id) {
+            uint32_t crtc_prop = hs_graphics_prop(fd, p->plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_ID", NULL);
+            uint32_t fb_prop = hs_graphics_prop(fd, p->plane_id, DRM_MODE_OBJECT_PLANE, "FB_ID", NULL);
+            bad |= !crtc_prop || drmModeAtomicAddProperty(req, p->plane_id, crtc_prop, 0) < 0;
+            bad |= !fb_prop || drmModeAtomicAddProperty(req, p->plane_id, fb_prop, 0) < 0;
+        }
+        drmModeFreePlane(p);
+    }
+    drmModeFreePlaneResources(planes);
+    if (!bad && primary && !drmModeCreatePropertyBlob(fd, &gfx->display_mode, sizeof(gfx->display_mode), &blob)) {
+        struct { uint32_t obj, type; const char* name; uint64_t value; } set[] = {
+            {gfx->display_crtc_id, DRM_MODE_OBJECT_CRTC, "MODE_ID", blob},
+            {gfx->display_crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE", 1},
+            {gfx->display_connector_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID", gfx->display_crtc_id},
+            {primary, DRM_MODE_OBJECT_PLANE, "FB_ID", fb},
+            {primary, DRM_MODE_OBJECT_PLANE, "CRTC_ID", gfx->display_crtc_id},
+            {primary, DRM_MODE_OBJECT_PLANE, "SRC_X", 0},
+            {primary, DRM_MODE_OBJECT_PLANE, "SRC_Y", 0},
+            {primary, DRM_MODE_OBJECT_PLANE, "SRC_W", (uint64_t)gfx->screen_width << 16},
+            {primary, DRM_MODE_OBJECT_PLANE, "SRC_H", (uint64_t)gfx->screen_height << 16},
+            {primary, DRM_MODE_OBJECT_PLANE, "CRTC_X", 0},
+            {primary, DRM_MODE_OBJECT_PLANE, "CRTC_Y", 0},
+            {primary, DRM_MODE_OBJECT_PLANE, "CRTC_W", gfx->display_mode.hdisplay},
+            {primary, DRM_MODE_OBJECT_PLANE, "CRTC_H", gfx->display_mode.vdisplay},
+        };
+        for (size_t i = 0; !bad && i < sizeof(set) / sizeof(set[0]); i++) {
+            uint32_t id = hs_graphics_prop(fd, set[i].obj, set[i].type, set[i].name, NULL);
+            bad |= !id || drmModeAtomicAddProperty(req, set[i].obj, id, set[i].value) < 0;
+        }
+        for (size_t i = 0; !bad && i < sizeof(hs_graphics_plane_defaults) / sizeof(hs_graphics_plane_defaults[0]); i++) {
+            uint32_t id = hs_graphics_prop(fd, primary, DRM_MODE_OBJECT_PLANE, hs_graphics_plane_defaults[i].name, NULL);
+            bad |= id && drmModeAtomicAddProperty(req, primary, id, hs_graphics_plane_defaults[i].value) < 0;
+        }
+    } else {
+        bad = 1;
+    }
+    int rc = bad ? -1 : drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+    drmModeAtomicFree(req);
+    if (blob) drmModeDestroyPropertyBlob(fd, blob);
+    return rc;
+}
+
 /* First present: resolve the display and program the CRTC with this frame. */
 static inline void hs_graphics_takeover(HSGraphics* gfx) {
     gfx->crtc_setup_done = 1;
@@ -552,7 +738,8 @@ static inline void hs_graphics_takeover(HSGraphics* gfx) {
         hs_graphics_present_failed(gfx, "no connected display with a usable CRTC");
         return;
     }
-    if (gfx->display_mode.hdisplay != gfx->screen_width || gfx->display_mode.vdisplay != gfx->screen_height) {
+    if (!gfx->scaled_scanout &&
+        (gfx->display_mode.hdisplay != gfx->screen_width || gfx->display_mode.vdisplay != gfx->screen_height)) {
         /* The surface was sized for a different (or no) display; scanning it
          * out with this mode would fail with EINVAL. Stay render-only. */
         errno = EINVAL;
@@ -567,12 +754,17 @@ static inline void hs_graphics_takeover(HSGraphics* gfx) {
     }
     uint32_t fb = hs_graphics_fb_for_bo(gfx, bo);
     uint32_t connector = gfx->display_connector_id;
-    if (!fb || drmModeSetCrtc(gfx->drm_fd, gfx->display_crtc_id, fb, 0, 0, &connector, 1,
-                              &gfx->display_mode) != 0) {
-        hs_graphics_present_failed(gfx, fb ? "drmModeSetCrtc failed" : "drmModeAddFB failed");
+    int set = !fb ? -1
+            : gfx->scaled_scanout ? hs_graphics_set_scaled(gfx, fb)
+            : drmModeSetCrtc(gfx->drm_fd, gfx->display_crtc_id, fb, 0, 0, &connector, 1, &gfx->display_mode);
+    if (set != 0) {
+        hs_graphics_present_failed(gfx, !fb ? "drmModeAddFB failed"
+                                        : gfx->scaled_scanout ? "scaled atomic modeset failed"
+                                                              : "drmModeSetCrtc failed");
         gbm_surface_release_buffer(gfx->gbm_surface, bo);
         return;
     }
+    if (!gfx->scaled_scanout) hs_graphics_reset_plane(gfx);
     gfx->scanout_bo = bo;
     gfx->crtc_active = true;
     gfx->present_error = NULL;

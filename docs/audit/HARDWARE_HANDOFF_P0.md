@@ -24,7 +24,7 @@ So the gains lie in hardware blocks that NeoGPU does not use yet.
 |---|---|---|---|---|
 | P0-1 | The present path's waits around `eglSwapBuffers` and the flip | Fence-driven atomic flips (`IN_FENCE_FD`): the kernel and display flip when rendering completes | The thread's CPU is 32–55% of wall while waiting (COST_BREAKDOWN §5). Unknown: where, and whether the thread sleeps or spins | **Rejected as a hand-off after two red teams.** Implicit fences already allow what `IN_FENCE_FD` would. The GPU is saturated on fill-bound frames, an estimated 20–30 of 4,926 flips could land a refresh earlier, and 9–108 µs of CPU per frame is at stake. **Found instead, and made:** the hold cutoff rose from 250‰ to 350‰ of a refresh (`hold_permille`). Frames of 4.2–5.8 ms are shown 4.2–5.9 ms fresher (median) at the same frame rate, with ≤0.34% repeats per run. After any repeated refresh the old quarter-refresh rule applies for 60 flips, which removed the two regressions a third red team found |
 | P0-2 | One draw plus one `glBufferData` per glyph (`hs_text.c`) | One instanced draw, with quads built by the GPU's vertex stage | **Measured (P0-1 red team):** about 16 µs of CPU per draw with this pattern. 100 draws give 614 FPS with the GPU 13% busy, so text-heavy frames are CPU-bound | Next |
-| P0-3 | The GPU renders every layer at full panel resolution into one plane | HVS planes: static layers composed at scanout, and upscaling from a lower render resolution | 0.68 ns per pixel of fill, measured (COST_BREAKDOWN §8). Unknown: HVS blend and scale cost | Not started |
+| P0-3 | The GPU renders every layer at full panel resolution into one plane | HVS planes: static layers composed at scanout, and upscaling from a lower render resolution | 0.68 ns per pixel of fill, measured (COST_BREAKDOWN §8). Unknown: HVS blend and scale cost | **Shelved 2026-11-16.** Watched on the panel, the scaled image looked progressively more pixelated, not like a native render: a quality trade, not a speed-up. `hs_graphics_init_scaled` is out of the public API (behind `HS_GRAPHICS_SHELVED_SCALED`, kept for the tests). Kept: the plane-reset fix, the layer measurements and the tests. Reconstruction upscaling (adaptive edge refinement, temporal) was proposed and is shelved too. Before shelving: **Scaling made (opt-in):** `hs_graphics_init_scaled` renders at a reduced size and the HVS scales it at scanout. test_08 runs 1.76× faster at 600×360 and 3.9× at 400×240, on the panel. HVS composition and scaling cost no frame time on this panel (they do use memory bandwidth). Layers and sprites: measured capable, not built (no current user with a GPU cost to save). **Red team found and fixed:** takeover (native too) inherited a previous client's plane alpha, filter and blend mode, and native takeover left stray overlays on. The test now kills 14 of 14 mutants |
 | P0-4 | Capture: `glReadPixels`, then a CPU swizzle and flip, then a write | The writeback connector (the frame actually scanned out); the H.264 encoder for recording | Unknown: current cost | Not started |
 | P0-5 | Each GPU message is a job (~37 µs floor) | A persistent QPU mailbox | 0.76 µs RTT, 110–138× Mesa (VS_MESA.md) | Not started |
 | P0-6 | Mesa's start-up (`gbm_create_device` 79.5 ms) | A direct V3D compute → KMS scanout path for scenes compute can render | Direct cold start 0.47 ms, measured. Unknown: sharing a v3d BO with vc4 | Not started |
@@ -396,3 +396,128 @@ Checked by red team 2 and confirmed:
 - the kernel functions behind the kernel-thread CPU. Kernel symbols are
   restricted, even to `sudo perf`.
 - the CPU cost of an atomic commit with `IN_FENCE_FD`.
+
+## P0-3: HVS planes and scaling
+
+> **Status: shelved (2026-11-16).** The user watched the four render sizes on the panel (the rerun matched these numbers to within 1%: 109.9, 193.7, 428.7, 930.7, 110.1 FPS, 0 underruns, resets 205→205). The scaled image looked progressively more pixelated, not truly upscaled. A smaller render plus a stretch is a quality trade, not a speed-up, so `hs_graphics_init_scaled` is now behind `#ifdef HS_GRAPHICS_SHELVED_SCALED`. Still in force: the plane-reset fix on native takeover (F1) and its test. Reconstruction (adaptive edge refinement, or temporal upsampling with jitter and motion vectors) would keep native quality, but is not built: it would need its own P0, gated on error against native output and on the user's eyes.
+
+### What the hardware offers (`tests/p0_3_plane_inventory`, `planes.json`)
+
+- The DSI CRTC can use 1 primary, 16 overlay and 1 cursor plane.
+- Every plane has alpha (0–65535), blend mode (pre-multiplied, coverage,
+  none), zpos 1–17, rotation (0/180, reflect x/y), a scaling filter
+  (Default or Nearest Neighbor) and 39 formats including YUV.
+- Atomic modesetting is available. `hvs_underrun` in debugfs counts underruns.
+
+Evidence: `tests/evidence-p0-3-20261116/`.
+
+### What composition and scaling cost (`tests/p0_3_hvs_probe`, `hvs_matrix.jsonl`)
+
+- **Method:** atomic commits of CPU-filled dumb buffers (no GPU, no Mesa),
+  one nonblocking commit per frame with its page-flip event, 3 runs × 600
+  frames per configuration, governor `performance`.
+- **Result** (free for the display, not for memory: 16 full-screen overlays
+  cut a concurrent 4-thread memcpy from 3.63 to 3.13 GB/s; one scaled
+  400×240 plane reads 4× fewer bytes than native): all 66 runs ran at 60.09 FPS with 0 missed refreshes, 0 HVS
+  underruns and 0 failed commits:
+  - primary scaled from 800×480, 600×360, 400×240, 266×160 and 200×120 to
+    800×480, Default and Nearest filters;
+  - 1, 4, 8 and 16 moving 64×64 alpha sprites;
+  - 1–16 full-screen 800×480 ARGB overlays;
+  - 4 moving 256×256 sprites, 4 sprites scaled 2×, 8 full-screen overlays
+    scaled 2×.
+- **Commit CPU (calling thread):** ~29 µs, plus ~3.6 µs per moved sprite
+  plane (16 sprites: 87 µs). Kernel-worker CPU was not measured here.
+
+### The lever: render smaller, scale at scanout
+
+- **Legacy flips keep the scaling.** After one atomic modeset that scales
+  the primary plane, `drmModePageFlip` (what `hs_graphics_present` uses)
+  flipped 400×240 buffers onto the 800×480 panel with 0 misses; the kernel's
+  plane state mid-run read `src 400x240`, `crtc 800x480`
+  (`legacy_flip.jsonl`, `legacy_state_midrun.txt`). So the scaled path
+  reuses the tuned pacing code unchanged.
+- **GPU throughput of test_08_raycast_orbit** (`tests/p0_3_render_scale.sh`,
+  2 runs each, identical offscreen and on the panel):
+
+  | render size | offscreen FPS | on the panel (HVS-scaled) FPS | vs native |
+  |---|---|---|---|
+  | 800×480 | 110.7 | 110.4–110.5 | 1× |
+  | 600×360 | 195.3–195.4 | 195.1 | 1.76× |
+  | 400×240 | 433.2–433.4 | 426.9–432.2 | 3.9× |
+  | 266×160 | 942.5–942.7 | 930.4–940.0 | 8.5× |
+
+  Throughput tracks pixel count (1.78×, 4×, 9× fewer pixels), so the scene
+  is fill-bound and the HVS scaling adds nothing measurable.
+
+### Made: `hs_graphics_init_scaled(gfx, w, h)` (opt-in)
+
+- Renders at w×h and takes the display; takeover is one atomic modeset that
+  stretches the primary plane to the mode and turns off other planes on the
+  CRTC. Flips after that are the existing legacy path.
+- `hs_graphics_init_sized` keeps its meaning (a non-panel size is an
+  offscreen target). Each dimension must be at most the display's; the
+  panel's own size behaves like `hs_graphics_init`.
+- It is opt-in, not the default: a scaled image is softer, and only the
+  application knows whether that trade is right.
+- **Gate:** `tests/test_present_scaled` in `make present-hardware` (see
+  red team 1 for what it checks after hardening).
+
+### What the HVS outputs (`tests/p0_3_writeback_check`, `writeback/`)
+
+The writeback connector captures what the HVS composes, compared with a CPU
+reference. It reaches only CRTC 0, so it checks the HVS, not the DSI path
+after it.
+
+| case | result |
+|---|---|
+| unscaled 800×480 | exact |
+| 400×240 → 800×480 and 200×120 → 800×480, Nearest | sample mapping is plain replication; each pixel leaks ~1 LSB into its neighbours, so a full-swing pattern is off by ≤2 LSB |
+| same, Default filter (what `init_scaled` uses) | a separable 4-tap cubic-like filter with negative lobes, not bilinear. The image sits ~0.38 output px (2×) or ~0.27 px (4×) right and down of a centre-aligned scale. No standard kernel matched; a fitted cubic (B=0.25, C=0.35, offset −0.44 source px) is within 2–3 LSB on line profiles |
+| pre-multiplied overlay over primary, alpha 0x80 and a 0–255 ramp | within 1 LSB of src + dst·(1−a) |
+| coverage blend and plane alpha | standard DRM formulas within 1 LSB |
+| 4 overlapping overlays, zpos 3,1,4,2 | exact painter's order |
+
+### Red team 1 (P0-3)
+
+An independent agent attacked the change (tools `tests/redteam-p0-3/`,
+evidence `tests/evidence-p0-3-redteam-20261116/`). It reproduced claims
+1–5 (throughput 110.5 / 432.2 FPS on the panel; legacy flips keep the
+scaling over thousands of flips; GBM scanout buffers are linear, like the
+probe's dumb buffers). Findings and what was done:
+
+| id | finding | sev | remediation and result |
+|---|---|---|---|
+| F1 | Takeover inherited the primary plane's alpha, filter and blend mode from the previous DRM client; the console's restore resets only rotation. After the author's own probe, `init_scaled` ran in Nearest; the native path inherited alpha and blend the same way | med | **Both takeovers now reset alpha, blend mode, filter and rotation** (scaled: in its one commit; native: only properties that differ, normally none). Native takeover also turns off stray planes on the CRTC, which `SetCrtc` never did. Measured takeover: 10.3 → 11.0 ms median at the native path (10 runs each, ranges 8.6–24.4 vs 8.9–25.7), scaled 11.9 ms (`takeover_cost.jsonl`). The HVS probe restores what it changes |
+| F2 | `test_present_scaled` let 6 of 11 mutants through (offset rects, filter, alpha, stray planes, missing ACTIVE or MODE_ID) | med | The test now first sabotages the display from a second DRM client (quarter alpha, Nearest, coverage blend, a stray overlay; or the CRTC off with no mode and the connector detached), then checks every rect and property, the stray overlay, `ACTIVE` and 10 paced flips. `tests/p0_3_mutants.sh`: **14 of 14 mutants fail, the control passes** (`mutants.txt`) |
+| F3 | The test never exercised held or paced frames | low | Added a calibrated heavy phase (~0.6 refresh of GPU time at the render size, held by the pacing code): 0 repeats in 182 refreshes at 400×240, 600×360 and 800×480 |
+| F4 | The Default filter's edges are uneven at 2×: a 1-px line at the left/top keeps 115% of a mid line's energy, at the right/bottom 79% | low | Documented in `hs_graphics_init_scaled`'s comment |
+| F5 | A fractional SRC_X needs SRC_W shrunk by the same amount (else ENOSPC); 0.41 px centres the middle but changes the scale | low | Not changed; a (w+1)×(h+1) buffer with a 0.4 px offset could correct the shift, unmeasured |
+| F6 | Odd render widths cost ~0.17 ms per frame (799×479: 1265 vs 1603 FPS on a trivial frame); the cost disappears under load | low | Documented: use a width that is a multiple of 8 |
+| F7 | While another process holds the DRM device open, exit leaves the panel black (no last close, so no console restore); same for native | low, pre-existing | Not changed |
+| F8 | "Free" needs a qualifier: HVS reads use shared memory bandwidth | low | Reworded above |
+
+Checked and fine by the red team: 1×1 to 800×480 sizes including odd and
+non-aspect ones (91 of 91 refreshes each, console restored), a forced
+atomic-commit failure (clean error, no crash, no leak), SIGKILL mid-run
+(console comes back; native and scaled clients take the panel after),
+pacing of scaled vs native frames at equal frame times (no difference).
+
+**Gates after remediation:** `check-sources` 0, build 0 warnings, `make
+test` 0, `make present-hardware` 6 of 6, resets 205 → 205, HVS underruns
+0 → 0.
+
+### Layers and sprites: capable, not built
+
+The HVS composes 16 full-screen alpha overlays or 16 moving sprites at no
+measured cost, and blends exactly. No NeoGPU workload today spends GPU time
+that layers would save: a full-screen pass costs ~0.26 ms at 0.68 ns/px, and
+the HUD and text cost is CPU per draw (P0-2). The natural first user is a
+full-resolution HUD over a scaled scene.
+
+### Not measured
+
+- Displays other than the 800×480 DSI panel (HDMI was not connected).
+- Kernel-worker CPU for atomic commits.
+- What the DSI panel shows after the HVS (writeback reaches only CRTC 0).
+- `hs_backend_gles` has no way to request a scaled render size yet.
