@@ -270,14 +270,28 @@ static int dispatch(uint32_t code_gpu, uint32_t unif_off) {
     return hs_v3d_dispatch(&dev, &d);
 }
 static void wbarrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
+/* GPU resets so far, counted in C from `sudo -n dmesg`; -1 unless dmesg
+ * itself succeeded (a pipe into grep -c printed 0 on failure: red team 4).
+ * Limitation: counts the lines still in the kernel ring buffer. */
 static int resets(void) {
-    FILE* f = popen("sudo -n dmesg 2>/dev/null | grep -c 'Resetting GPU for hang'", "r");
-    int n = -1;
-    if (f) {
-        if (fscanf(f, "%d", &n) != 1) n = -1;
-        pclose(f);
+    FILE* f = popen("sudo -n dmesg 2>/dev/null", "r");
+    if (!f) return -1;
+    char line[512];
+    int n = 0, lines = 0;
+    while (fgets(line, sizeof(line), f)) {
+        lines++;
+        if (strstr(line, "Resetting GPU for hang")) n++;
     }
-    return n;
+    int st = pclose(f);
+    return st == 0 && lines > 0 ? n : -1;
+}
+static const char* reset_delta(int r0, int r1) {
+    static char b[4][32];
+    static int k;
+    char* o = b[k++ & 3];
+    if (r0 < 0 || r1 < 0) return "unknown";
+    snprintf(o, 32, "%d", r1 - r0);
+    return o;
 }
 static uint32_t cfg_of(int op) { return 0xFFFFFF80u | (uint32_t)op << 3 | 7u; }
 static uint32_t* W32(size_t off) { return (uint32_t*)(data.map + off); }
@@ -309,9 +323,9 @@ static void section_p(int op) {
         nk += W32(OFF_OUT)[l] == 0x0B000000u + (uint32_t)l;
         nA += W32(OFF_OUT)[l] == 0x0A000000u + 0x100u * (uint32_t)l;
     }
-    printf("P op %2d cfg 0x%08x: %.2f ms%s resets %d | ldtmu1 lanes0-3 %08x %08x %08x %08x (==B in %d/16, ==A in %d/16)"
+    printf("P op %2d cfg 0x%08x: %.2f ms%s resets %s | ldtmu1 lanes0-3 %08x %08x %08x %08x (==B in %d/16, ==A in %d/16)"
            " | ldtmu2 lanes0-3 %08x %08x %08x %08x | A after lanes0-3 %08x %08x %08x %08x\n",
-           op, cfg_of(op), ms, e ? " WAIT_ERR" : "", resets() - r0, W32(OFF_OUT)[0], W32(OFF_OUT)[1],
+           op, cfg_of(op), ms, e ? " WAIT_ERR" : "", reset_delta(r0, resets()), W32(OFF_OUT)[0], W32(OFF_OUT)[1],
            W32(OFF_OUT)[2], W32(OFF_OUT)[3], nk, nA, W32(OFF_OUT)[16], W32(OFF_OUT)[17], W32(OFF_OUT)[18],
            W32(OFF_OUT)[19], W32(OFF_A)[0], W32(OFF_A)[1], W32(OFF_A)[2], W32(OFF_A)[3]);
 }
@@ -339,9 +353,9 @@ static void section_r(int op, int ret, int runs) {
         wbarrier();
         e = hs_v3d_bo_wait(&dev, &data, 5000000000ull);
         double ms = (now_ns() - t0) / 1e6;
-        printf("R op %2d ret %d opoff %u run %d: %.1f ms%s resets %d | before %08x | after-write %08x | op-data %08x | after-op "
+        printf("R op %2d ret %d opoff %u run %d: %.1f ms%s resets %s | before %08x | after-write %08x | op-data %08x | after-op "
                "%08x (lane15 %08x)\n",
-               op, ret, g_opoff, run, ms, e ? " WAIT_ERR" : "", resets() - r0, W32(OFF_OUT)[0], W32(OFF_OUT)[16],
+               op, ret, g_opoff, run, ms, e ? " WAIT_ERR" : "", reset_delta(r0, resets()), W32(OFF_OUT)[0], W32(OFF_OUT)[16],
                W32(OFF_OUT)[32], W32(OFF_OUT)[48], W32(OFF_OUT)[63]);
     }
 }
@@ -372,9 +386,9 @@ static void section_w(int op, int ret, int runs) {
         }
         e = hs_v3d_bo_wait(&dev, &data, 5000000000ull);
         double ms = (now_ns() - t0) / 1e6;
-        printf("W%s op %2d ret %d opoff %u run %d: job %.1f ms%s resets %d | CPU saw 1 at %s%.3f ms, 2 at %.3f ms; final lane0 %u "
+        printf("W%s op %2d ret %d opoff %u run %d: job %.1f ms%s resets %s | CPU saw 1 at %s%.3f ms, 2 at %.3f ms; final lane0 %u "
                "lane15 %u\n",
-               g_single ? "1" : "", op, ret, g_opoff, run, ms, e ? " WAIT_ERR" : "", resets() - r0, t1 ? "" : "never ", t1 / 1e6, t2 / 1e6,
+               g_single ? "1" : "", op, ret, g_opoff, run, ms, e ? " WAIT_ERR" : "", reset_delta(r0, resets()), t1 ? "" : "never ", t1 / 1e6, t2 / 1e6,
                s[0], s[15]);
     }
 }
@@ -385,11 +399,34 @@ static int cmp_u64(const void* a, const void* b) {
     return x < y ? -1 : x > y;
 }
 /* MSGS messages (0: none, just measure the poll cost), BUDGET polls */
+/* warm-up: spin ~ms on one QPU, so the timed job does not start on the
+ * low clock the GPU drops to after >= 200 ms idle (HARDWARE_MAP) */
+static int prog_warm(hs_qpu_prog* p) {
+    ldunifrf(p, 0);
+    int l = hs_qpu_label_new(p);
+    hs_qpu_label_bind(p, l);
+    dec_pushz(p, 0);
+    branch(p, HS_QPU_B_NA0, l);
+    hs_qpu_emit_end(p);
+    return hs_qpu_prog_finish(p);
+}
+static void gpu_warm(uint32_t warm_gpu) {
+    uint32_t* u = (uint32_t*)unif.map + 512; /* words 512..: clear of the M stream (1024..) */
+    u[0] = SPIN_1MS;                          /* 5 instructions x 4 cycles per pass: ~1 ms */
+    int e = dispatch(warm_gpu, 512 * 4);
+    if (e) die("dispatch warm", e);
+    hs_v3d_bo_wait(&dev, &data, 2000000000ull);
+}
+
 static void section_m(int op, int runs) {
     uint32_t msgs = getenv("MSGS") ? (uint32_t)atoi(getenv("MSGS")) : 1000;
     uint32_t budget = getenv("BUDGET") ? (uint32_t)atoi(getenv("BUDGET")) : 100000;
     uint32_t maxu = (uint32_t)(unif.size / 4) - 1024 - 8; /* stream starts 1024 words in */
-    if (budget + (msgs ? msgs : 1) > maxu) budget = maxu - (msgs ? msgs : 1);
+    if (msgs > 200000) die("MSGS above 200000 (the RTT table)", EINVAL);
+    if (budget < 2) die("BUDGET must be at least 2 (0 would wrap the GPU's poll counter)", EINVAL);
+    /* the GPU consumes up to 4 + budget + msgs uniforms; all must be filled */
+    if (4ull + budget + (msgs ? msgs : 1) > maxu) budget = maxu - 4 - (msgs ? msgs : 1);
+    uint32_t warm_gpu = load_prog(prog_warm);
     g_wt = getenv("NOWT") == NULL;
     g_payload = getenv("PAYLOAD") != NULL;
     uint32_t pg = load_prog(prog_m);
@@ -407,7 +444,28 @@ static void section_m(int op, int runs) {
         u[3] = budget;
         for (uint32_t i = 4; i < maxu; i++) u[i] = cfg_of(op);
         wbarrier();
-        uint64_t t0 = now_ns();
+        if (!msgs) {
+            /* per-poll cost without start-up: the slope between a half and
+             * a full budget, each job after a warm-up */
+            double tj[2];
+            for (int h = 0; h < 2; h++) {
+                u[3] = h ? budget : budget / 2;
+                wbarrier();
+                gpu_warm(warm_gpu);
+                uint64_t a0 = now_ns();
+                int e = dispatch(pg, 4096);
+                if (e) die("dispatch", e);
+                hs_v3d_bo_wait(&dev, &data, 5000000000ull);
+                tj[h] = (double)(now_ns() - a0);
+            }
+            printf("M op %2d wt %d run %d: no messages; %u vs %u polls: %.2f vs %.2f ms => %.1f ns per poll (slope, "
+                   "start-up excluded); resets %s\n",
+                   op, g_wt, run, budget / 2, budget, tj[0] / 1e6, tj[1] / 1e6,
+                   (tj[1] - tj[0]) / (double)(budget - budget / 2), reset_delta(r0, resets()));
+            continue;
+        }
+        gpu_warm(warm_gpu);
+        uint64_t t0 = now_ns(), t_msg1 = 0;
         int e = dispatch(pg, 4096);
         if (e) die("dispatch", e);
         uint32_t done = 0;
@@ -432,6 +490,7 @@ static void section_m(int op, int runs) {
             if (!ok) break;
             rtt[n - 1] = b - a;
             done = n;
+            if (n == 1) t_msg1 = b; /* the exchange rate is measured from here: start-up excluded */
             if (g_payload) {
                 int bad = 0;
                 for (int l = 1; l < 16; l++) bad |= ack[l] != n * 16 + (uint32_t)l + 1;
@@ -452,19 +511,20 @@ static void section_m(int op, int runs) {
         uint64_t tm = now_ns();
         e = hs_v3d_bo_wait(&dev, &data, 5000000000ull);
         double ms = (now_ns() - t0) / 1e6;
-        if (!msgs) {
-            printf("M op %2d wt %d run %d: no messages, %u polls, job %.2f ms => %.1f ns per poll%s resets %d\n", op, g_wt,
-                   run, budget, ms, ms * 1e6 / budget, e ? " WAIT_ERR" : "", resets() - r0);
-            continue;
-        }
+
         /* stats over messages 2..done (message 1 includes job start-up) */
         uint32_t k = done > 1 ? done - 1 : 0;
         if (k) qsort(rtt + 1, k, sizeof(rtt[0]), cmp_u64);
-        printf("M%s op %2d wt %d run %d: %u of %u messages round-tripped; msg1 %.1f us; RTT (msgs 2..) min %.2f p50 %.2f "
-               "p90 %.2f p99 %.2f max %.2f us; %.0f msgs/s over the exchange; job %.2f ms%s resets %d; ack lane15 %u\n",
-               g_payload ? "16" : "", op, g_wt, run, done, msgs, rtt[0] / 1e3, k ? rtt[1] / 1e3 : 0, k ? rtt[1 + k / 2] / 1e3 : 0,
+        char m1[32];
+        if (done) snprintf(m1, sizeof(m1), "%.1f us", rtt[0] / 1e3);
+        else snprintf(m1, sizeof(m1), "n/a");
+        printf("M%s op %2d wt %d run %d: %u of %u messages round-tripped; msg1 (incl. start-up) %s; RTT (msgs 2..) min %.2f "
+               "p50 %.2f p90 %.2f p99 %.2f max %.2f us; %.0f msgs/s over msgs 2.. (start-up excluded); job %.2f ms%s "
+               "resets %s; ack lane15 %u\n",
+               g_payload ? "16" : "", op, g_wt, run, done, msgs, m1, k ? rtt[1] / 1e3 : 0, k ? rtt[1 + k / 2] / 1e3 : 0,
                k ? rtt[1 + k * 9 / 10] / 1e3 : 0, k ? rtt[1 + k * 99 / 100] / 1e3 : 0, k ? rtt[k] / 1e3 : 0,
-               done / ((tm - t0) / 1e9), ms, e ? " WAIT_ERR" : "", resets() - r0, ack[15]);
+               (k && tm > t_msg1) ? k / ((tm - t_msg1) / 1e9) : 0.0, ms, e ? " WAIT_ERR" : "", reset_delta(r0, resets()),
+               ack[15]);
         if (g_payload) printf("   payload: %u torn messages (%u correct 100 us later)\n", torn, torn_fixed);
         torn = torn_fixed = 0;
     }

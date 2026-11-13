@@ -6,6 +6,8 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -38,9 +40,11 @@ int main(void) {
     /* on this Pi card0 is v3d's primary node and card1 is vc4 (display) */
     /* -ENODEV only: -EACCES would mean the open failed before the driver
      * name check this is meant to exercise */
+    int raw = open("/dev/dri/card1", O_RDWR | O_CLOEXEC); /* it must open as a file, so the name check runs */
+    if (raw >= 0) close(raw);
     int e = hs_v3d_open(&dev, "/dev/dri/card1");
-    printf("     (card1 returned %d)\n", e);
-    check(e == -ENODEV, "card1 (vc4, the display driver) is refused by the driver-name check (-ENODEV)");
+    printf("     (card1 opens as a file: %s; hs_v3d_open returned %d)\n", raw >= 0 ? "yes" : "no", e);
+    check(raw >= 0 && e == -ENODEV, "card1 (vc4, the display driver) opens but is refused by the driver-name check");
     if (e == 0) hs_v3d_close(&dev);
 
     int fd0 = count_fds();

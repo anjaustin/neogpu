@@ -450,3 +450,30 @@ Fixing the last item exposed the GPU idle-clock effect
 (HARDWARE_MAP_2026-11-15.md, "The GPU clock drops when the GPU idles"). The
 full checks took long enough for the clock to drop. Timed jobs now get a
 1 ms warm-up, and the published figures re-measured unchanged.
+
+## Red team 4 (final pass), 2026-11-16
+
+Fixes 1–4 of round 3 were verified. Six further findings were fixed:
+
+| finding | fix (verified on the GPU, 0 resets) |
+|---|---|
+| `tmuop_probe` still had the `grep -c` reset bug fixed in `hwprobe_mailbox` | The same counting in C with an exit-status check; "unknown" when unreadable |
+| The mailbox rate included the ~10 ms first-job start-up, which was the whole of the "unexplained" 0.42–1.2 M/s spread | The rate is now over messages 2..N, a steady 1.20–1.22 M/s. Per-poll cost is a slope between two budgets (321–323 ns), not wall time divided by polls |
+| `tmuop_probe` M had no GPU warm-up | A 1 ms warm-up job before each timed job |
+| hwprobe_qpu sections c and G had no warm-up, and c never checked its sums (its header also claimed perfmon on every job) | Warm-up before each timed job, untimed; c fills and checks its own data ("sums ok"); the header is corrected |
+| M bounds | MSGS ≤ 200000; BUDGET ≥ 2 (0 wrapped the GPU's counter); the uniform stream is sized for 4 + budget + msgs; "msg1" reads n/a when nothing arrived |
+| "Every op consumes one uniform" was stated as measured | Now marked as documented (Mesa), not measured |
+
+Minor:
+- test_v3d_runtime now proves `card1` opens as a file before asserting the
+  driver-name refusal.
+- gather_anom refuses negative skew.
+- Reset counts read the kernel ring buffer, which can rotate; this is
+  noted in the tools.
+
+Figures re-measured with the fixed tools:
+- the mailbox table;
+- the concurrency section c: 11.63 / 8.26 / 7.67 GB/s, sums ok;
+- G: totals 42.2–42.4 M/s, equal to the CPU alone, so the conclusion holds;
+  the GPU share under load is 31.0 M/s warm, against 29.3 earlier on a
+  cold clock.

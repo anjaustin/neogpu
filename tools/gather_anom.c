@@ -218,6 +218,7 @@ int main(int argc, char** argv) {
         if (sscanf(line, "%d %d %u %x %x %x %d %d %d %d", &B, &k, &N, &toff, &ioff, &ooff, &mode, &var, &trials, &skew) < 8) continue;
         if (trials > 15) trials = 15;
         if (trials < 1) trials = 1;
+        if (skew < 0) { printf("skip: skew must be >= 0\n"); continue; }
         if (B != 1 && B != 8) { printf("skip: B must be 1 or 8 (the batch index is wrong otherwise)\n"); continue; }
         unsigned per = 16u * (unsigned)B * (unsigned)k;
         unsigned passes = N / per;

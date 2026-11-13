@@ -2,8 +2,11 @@
  * v3d driver directly (compute shader dispatch, no Mesa, no libdrm) and
  * measure: GPU clock, QPU ALU throughput, TMU read/write/copy bandwidth (1 and
  * 8 QPUs), dispatch latency and job rate, and GPU vs CPU memory bandwidth
- * when both run at once. Every job carries the GPU's own performance counters
- * (perfmon), and every data result is checked.
+ * when both run at once. Timed jobs in the ALU, memory and gather sections
+ * carry the GPU's own performance counters (perfmon); the dispatch and
+ * concurrency sections time bare jobs. Every data result is checked, every
+ * word, and timed memory/gather/concurrency jobs follow a 1 ms GPU warm-up
+ * (the clock drops after >= 200 ms idle; HWPROBE_WARM_MS).
  *
  * Programs are raw QPU instruction words (little-endian u64 files), produced
  * by tools/hwprobe_qpu_progs.py (make hwprobe-progs writes them to build/qpu).
@@ -450,6 +453,17 @@ static void section_concurrent(void) {
     u[2] = data.gpu + (uint32_t)(sum_len * 4);
     u[3] = u[4] = 0xFCFCFCFC;
     u[5] = (uint32_t)(4 * (-nu + 3));
+    /* own data, so the summation can be checked whatever ran before */
+    uint32_t* x = (uint32_t*)data.map;
+    for (size_t i = 0; i < sum_len; i++) x[i] = (uint32_t)i;
+    uint32_t* ysum = (uint32_t*)(data.map + sum_len * 4);
+    int sums_ok = 1;
+#define CHECK_SUM()                                                                                    \
+    do {                                                                                               \
+        uint32_t s_ = 0;                                                                               \
+        for (int i_ = 0; i_ < 16 * 8; i_++) s_ += ysum[i_];                                            \
+        sums_ok &= s_ == (uint32_t)((uint64_t)(sum_len - 1) * sum_len / 2);                           \
+    } while (0)
     rd_t rd[3];
     for (int i = 0; i < 3; i++) {
         rd[i].buf = mmap(NULL, 64u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -460,7 +474,9 @@ static void section_concurrent(void) {
     for (int nthr = 1; nthr <= 3; nthr += 2) {
         double solo[5], mixed[5], cpu[5];
         for (int t = 0; t < 5; t++) {
+            gpu_warm(warm_ms());
             solo[t] = sum_len * 4.0 / run(&p, 4096, 8, NULL);
+            CHECK_SUM();
             atomic_store(&cpu_stop, 0);
             pthread_t id[4];
             for (int i = 0; i < nthr; i++) {
@@ -470,7 +486,11 @@ static void section_concurrent(void) {
             usleep(20000);
             double g = 0;
             const int reps = 5;
-            for (int k = 0; k < reps; k++) g += run(&p, 4096, 8, NULL);
+            for (int k = 0; k < reps; k++) {
+                gpu_warm(warm_ms()); /* also under CPU load: the warm job is untimed */
+                g += run(&p, 4096, 8, NULL);
+                CHECK_SUM();
+            }
             atomic_store(&cpu_stop, 1);
             double cb = 0;
             for (int i = 0; i < nthr; i++) {
@@ -480,7 +500,8 @@ static void section_concurrent(void) {
             mixed[t] = sum_len * 4.0 * reps / g;
             cpu[t] = cb;
         }
-        printf("%-24d %12.2f %12.2f %12.2f\n", nthr, median(solo, 5), median(mixed, 5), median(cpu, 5));
+        printf("%-24d %12.2f %12.2f %12.2f %s\n", nthr, median(solo, 5), median(mixed, 5), median(cpu, 5),
+               sums_ok ? "sums ok" : "SUM WRONG");
     }
     double alone[5];
     for (int t = 0; t < 5; t++) {
@@ -618,6 +639,7 @@ static void section_gather_concurrent(void) {
         for (int t = 0; t < 5; t++) {
             memset(go, 0xEE, (size_t)G_N * 4); /* sentinel: hash32(0) == 0 */
             memset(co, 0xEE, (size_t)G_N * 4);
+            if (gpu) gpu_warm(warm_ms()); /* before the clock starts: untimed */
             gwait_t w = {0, now_ns(), nthr == 3 ? 3 : -1};
             pthread_t wt;
             if (gpu) {

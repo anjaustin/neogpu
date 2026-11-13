@@ -191,11 +191,16 @@ in M elements/s; the GPU number is the best of 1/8 QPUs with 1–8 loads in flig
   | run | random gathers, M/s |
   |---|---|
   | GPU alone | 36.9 |
-  | CPU, 3 or 4 cores | 43.0–43.6 |
-  | CPU and GPU together | 43.1–43.3 total |
+  | CPU, 3 or 4 cores | 42.2–43.7 |
+  | CPU and GPU together | 42.2–43.4 total |
 
-  Two runs agree to within 0.1. Three CPU cores already reach the ceiling. The
-  GPU adds no random-access capacity: it only moves the work.
+  Three runs. In each, the combined total equals the CPU-alone rate to within
+  0.3. Three CPU cores already reach the ceiling. The GPU adds no
+  random-access capacity: it only moves the work.
+  - The GPU's own rate under concurrency was 29.2–29.4 M/s in the first two
+    runs, whose GPU jobs could start on the idle-dropped clock. With a 1 ms
+    warm-up before each GPU job (red team 4) it was 31.0 M/s; the totals
+    were unchanged.
 - **Coherent (sequential) access is where the GPU's bandwidth shows:** 2.02x the
   best CPU with the shipped kernel. The original layout slowed down at k=4
   (19.7–21.3 ms, with 2.5–2.7x the DRAM reads). That was root-caused and
@@ -277,7 +282,9 @@ as that access's config word:
 - The op field is **bits 6:3** (measured): op 8 returned the old value and
   incremented memory, 9 decremented, 10 inverted, and 15 read normally.
 - The existing kernels' 0xFC bytes decode as per-pixel, op 15, vec4.
-- Every op consumes one uniform.
+- Every op consumes one uniform, per Mesa's description. The probes'
+  designs cannot tell this apart from an op that consumes none, so it is
+  documented, not measured.
 
 The earlier `tmuc` experiment (above) wrote `op<<4 | 0xF`. That is per-quad
 mode with ops 1, 3, 5, 7 and 9, not 0–4. Its "op 1" was really op 3, which
@@ -315,20 +322,34 @@ GPU sees it and acks, the CPU sees the ack.
 
 | | messages | RTT p50 | p99 | max | rate |
 |---|---|---|---|---|---|
-| decoding agent: 1 word with or without `tmuwt`, and a 16-word payload | 70,000, 0 lost, 0 torn of 30,000 payloads | 0.67–0.98 µs | 1.15–2.41 µs | 31–284 µs | 0.42–1.20 M/s |
-| reproduction: op 2, 1 word, `tmuwt` | 3 × 10,000, 0 lost, 0 resets | **0.76 µs** | 1.02 µs | 34–143 µs | 0.55–1.20 M/s |
+| op 2, 1 word, `tmuwt` after each op | 3 × 10,000, 0 lost | **0.76 µs** | 1.00 µs | 19–110 µs | 1.20–1.22 M/s |
+| op 2, 1 word, no `tmuwt` after ops | 3 × 10,000, 0 lost | **0.65 µs** | 0.89 µs | 31–111 µs | 1.36–1.41 M/s |
+| op 2, 16-word payload, sequence word written last | 3 × 10,000, 0 lost, 0 torn | 0.72 µs | 1.19–1.22 µs | 16–73 µs | 0.76–0.78 M/s |
+
+How these were measured:
+- `tests/evidence-measure-20261116/redteam4/m-*.txt`, 0 resets.
+- Each job follows a 1 ms GPU warm-up.
+- The rate is over messages 2..N and excludes the job's ~10 ms first-job
+  start-up.
+- The decoding agent's earlier 70,000 messages (0 lost, 0 torn) agree on
+  RTT. Their quoted rates, 0.42–1.2 M/s, varied only because they included
+  that start-up (red team 4).
 
 That is about **30–100x faster than a kernel submit** (22–75 µs).
 
 What it costs on the GPU, and what still binds:
-- A coherent poll costs ~330 ns on the GPU, against ~96 ns for a stale,
-  cache-hit poll.
+- **GPU cost per poll**, measured as a slope between 500 k and 1 M polls so
+  start-up is excluded; 2 runs each:
+
+  | poll | ns per poll |
+  |---|---|
+  | coherent op-2 poll | 321–323 (291 without `tmuwt`) |
+  | stale regular op-15 poll | 82.4–82.9 |
+
 - A job is still reset at ~1 s, so a persistent program must finish and be
   relaunched within that.
 - Every op consumes a uniform. Rewinding the uniform stream with a
   branch's `ub` field is untested.
-- The message rate varied 0.42–1.2 M/s between runs, for an unexplained
-  reason. The first run in the reproduction was the slow one.
 
 ## The GPU clock drops when the GPU idles (measured 2026-11-16)
 
