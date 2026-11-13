@@ -330,7 +330,11 @@ variant 5, same harness:
 - The first job a process dispatches costs ~10–12 ms extra: the fmov
   experiment measured 12.1 ms, then 0.15 ms for the next job. Later newly
   loaded programs do not pay it; in test_v3d_compute each gather is a fresh
-  program and takes 2–5 ms.
+  program and takes 2–5 ms. Corrected cause (VS_MESA.md, 2026-11-16): it is
+  not per process. It is the v3d device's runtime resume after more than
+  100 ms of GPU idle (`autosuspend_delay_ms = 100`): 10.41–10.46 ms when
+  `runtime_status` was `suspended`, 0.46–0.51 ms when `active`, 10 of 10
+  runs.
 - The perfmon counter named "cache hit" counts memory transactions; the AXI
   byte counters (40, 41) are the reliable measure of traffic.
 - This kernel's `(tidx >> 2) & 15` batch index is not 0..B−1 for 2 or 4

@@ -19,6 +19,16 @@
  * system-wide). Returns hs_qpu_prog_finish's result. */
 int hs_qpu_kernel_gather(hs_qpu_prog* p, int batches, int k);
 
+/* The default gather configuration: the measured best against Mesa's GLES
+ * 3.1 compute and the CPU (docs/benchmarks/VS_MESA.md, 2026-11-16, median of
+ * 7, every word checked). 8 batches with k = 8 was fastest on sequential
+ * indices (612.8 M/s, 1.78x Mesa's best) and on random indices into a
+ * 512 KiB table (74.6 M/s). On random indices into 64 MiB it was within
+ * 0.8% of the best (36.0 vs 36.3 M/s at k = 1; DRAM-bound). Use these unless
+ * a measurement of your workload says otherwise. */
+#define HS_QPU_GATHER_BATCHES 8
+#define HS_QPU_GATHER_K 8
+
 /* Fills u[0..3] for hs_qpu_kernel_gather. Returns 0, or HS_QPU_E_OPERAND
  * when elements is 0 or not a multiple of 16 * batches * k (the kernel
  * would skip the remainder), when batches or k is unsupported, or when an

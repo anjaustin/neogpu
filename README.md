@@ -65,6 +65,7 @@ Three consequences fall out of that design:
 | Tooling / IPC | **Working** | Unix socket + TCP server, query/control surface |
 | Capture & replay | **Working** | `HSCAP1`, owned payload journal, strict native-layout file format |
 | NEON math library | **Working** | vec4/mat4/quat, SIMD-backed |
+| Direct GPU compute (no Mesa) | **Working on hardware** | Own QPU encoder (`hs_qpu`) and kernel v3d runtime (`hs_v3d`), built by default; ships gather (default `HS_QPU_GATHER_BATCHES`/`_K`, the measured best) and store_one, checked word for word on the GPU. Rendering still goes through GLES |
 
 **The runtime and the renderer are the product.** The former BitNet/ML
 experiment has moved to a separate repository and is no longer included here.
@@ -120,6 +121,63 @@ and rejected experiments. Message-only frame rates are not displayed GPU FPS.
 > memory. Recording allocates its independent payload journal lazily and releases
 > it with `hs_gpu_shutdown()`. Exact layout/memory measurements are in the P0
 > ledger; earlier tiny-binary and ~2 MB buffer claims are not current evidence.
+
+### Direct GPU path vs. the reference stack
+
+NeoGPU also drives the Pi 4's V3D GPU directly through the kernel's v3d
+driver. That path uses no Mesa, no libdrm and no GLES, and its QPU programs
+come from NeoGPU's own encoder. Below, it runs the same jobs on the same GPU
+as the reference stack, Mesa 26.0.8's OpenGL ES 3.1 compute shaders, and as
+the fastest CPU path (4 × Cortex-A72).
+
+How it was measured (2026-11-16):
+- every output word was checked on every trial, and every path was correct;
+- NeoGPU and Mesa trials were interleaved;
+- each figure is the median of 7 trials;
+- Mesa's figure is its best of 12 configurations;
+- there were 0 GPU resets.
+
+| Workload | NeoGPU | Mesa | vs. Mesa | Best CPU | vs. CPU |
+|---|---:|---:|---:|---:|---:|
+| Process start to first checked result, GPU awake | 0.47 ms | 81 ms | **~172×** | — | — |
+| Process start to first checked result, GPU runtime-suspended | 10.4 ms | 91 ms | 8.8× | — | — |
+| Single-job round trip, p50 (12 runs; two modes per process, see below) | 61.3–62.1 or 73.5–74.0 µs | 83.9–86.0 or 101.8–105.1 µs | 1.35–1.43× | — | — |
+| Pipelined small jobs, 1000 queued (12 runs) | 24.2k–27.2k jobs/s | 13.0k–14.1k or 24.2k–27.1k jobs/s | 0.98–1.87× | — | — |
+| Gather `out[i] = table[idx[i]]`, sequential, 4M elements | 612.8 M/s | 345.2 M/s | **1.78×** | 245.2 M/s | 2.50× |
+| Gather, random, 512 KiB table | 74.6 M/s | 73.3 M/s | 1.02× | 229.6 M/s | 0.32× |
+| Gather, random, 64 MiB table | 36.3 M/s | 34.0 M/s | 1.07× | 42.2 M/s | 0.86× |
+| CPU ↔ GPU message inside a running job (measured probe, not yet shipped) | 0.76 µs RTT, 1.2 M msg/s | 83.9–105.1 µs per job, 13.0k–27.1k jobs/s | **110–138×** latency, **44–92×** rate | — | — |
+
+What the numbers say:
+- **Per-job dispatch cost is largely shared.** NeoGPU's best is the
+  kernel's floor of about 37 µs per job.
+- **Dispatch timings fall into one of two modes per process.** A fast-or-slow
+  split (about 12 µs per round trip) hits both paths, and Mesa's pipelined
+  rate also halves in some runs. NeoGPU led the round trip in every run. The
+  cause is not yet traced.
+- **The in-job mailbox goes around that floor.** It is the route to an order
+  of magnitude on CPU ↔ GPU traffic.
+- **Random access is bound by memory, not by either GPU path.** Both GPU
+  paths sit near DRAM's shared ~43 M/s ceiling. The CPU wins when the table
+  fits in its 1 MiB L2 cache.
+- **The ~10 ms cold cost is the GPU waking up.** The GPU suspends after
+  100 ms idle, and both paths pay the 10.4 ms resume.
+
+**Reproduce:**
+
+```bash
+make bench-vs-mesa        # exits 1 if any path's output is wrong
+make tools/tmuop_probe
+tools/bench_vs_mesa cold neo; tools/bench_vs_mesa cold mesa
+flock build/gpu.lock tools/tmuop_probe M 2 3
+```
+
+Full method, every configuration and the limits of the comparison are in
+[docs/benchmarks/VS_MESA.md](docs/benchmarks/VS_MESA.md). The hardware
+measurements behind it are in
+[docs/benchmarks/HARDWARE_MAP_2026-11-15.md](docs/benchmarks/HARDWARE_MAP_2026-11-15.md),
+and the encoder is described in
+[docs/benchmarks/QPU_ENCODER.md](docs/benchmarks/QPU_ENCODER.md).
 
 ## Quick Start
 

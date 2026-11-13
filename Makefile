@@ -261,6 +261,14 @@ tools/gather_anom: tools/gather_anom.c src/hs_qpu.o src/hs_qpu_kernels.o src/hs_
 # decodes the TMU per-access cache ops; ping-pong mailbox (HARDWARE_MAP)
 tools/tmuop_probe: tools/tmuop_probe.c src/hs_qpu.o src/hs_v3d.o
 	$(CC) -O2 -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_v3d.o -o $@
+# NeoGPU against the reference stack (Mesa GLES 3.1 compute) and the CPU on
+# the same jobs (docs/benchmarks/VS_MESA.md; run inside the GPU lock)
+tools/bench_vs_mesa: tools/bench_vs_mesa.c src/hs_qpu.o src/hs_qpu_kernels.o src/hs_v3d.o
+	$(CC) -O2 -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_qpu_kernels.o src/hs_v3d.o -o $@ -lGLESv2 -lEGL -lgbm -lpthread
+.PHONY: bench-vs-mesa
+bench-vs-mesa: tools/bench_vs_mesa
+	mkdir -p build
+	flock build/gpu.lock tools/bench_vs_mesa lpg 7
 tools/hwprobe_%: tools/hwprobe_%.c
 	$(CC) -O2 -Wall -Wextra -I/usr/include/drm $< -o $@ -lm -lpthread
 hwprobe-progs: tools/hwprobe_qpu_progs.py
@@ -368,7 +376,7 @@ clean:
 	rm -f tests/test_evdev
 	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/panel_mode_probe tests/test_text_render
 	rm -f tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe neogpu_kworker_rt
-	rm -f $(HWPROBES) tools/gather_anom tools/tmuop_probe tests/test_qpu_encode tests/test_v3d_compute tests/test_v3d_runtime
+	rm -f $(HWPROBES) tools/gather_anom tools/tmuop_probe tools/bench_vs_mesa tests/test_qpu_encode tests/test_v3d_compute tests/test_v3d_runtime
 	rm -rf build/qpu
 	rm -f bench_legacy tests/test_headless_scalar
 	rm -f tests/test_tool_sanitize tests/test_tool_tsan

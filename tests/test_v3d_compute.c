@@ -114,7 +114,7 @@ int main(void) {
      * past out[]) */
     {
         hs_qpu_prog_init(&p, prog, 1024);
-        n = hs_qpu_kernel_gather(&p, 8, 8);
+        n = hs_qpu_kernel_gather(&p, HS_QPU_GATHER_BATCHES, HS_QPU_GATHER_K);
         uint32_t gpu = n > 0 ? hs_v3d_load(&code, off, prog, (uint32_t)n) : 0;
         off += 4096;
         uint32_t* u = (uint32_t*)unif.map + 32;
@@ -123,7 +123,7 @@ int main(void) {
         u[2] = data.gpu;
         u[3] = data.gpu + (TABLE + N) * 4;
         fill_out(out);
-        hs_v3d_dispatch_desc z = {gpu, unif.gpu + 128, 8, handles, 3, 0};
+        hs_v3d_dispatch_desc z = {gpu, unif.gpu + 128, HS_QPU_GATHER_BATCHES, handles, 3, 0};
         uint64_t t0 = now_ns();
         e = gpu ? hs_v3d_dispatch(&dev, &z) : -EINVAL;
         w = e ? e : hs_v3d_bo_wait(&dev, &data, 2000000000ull);

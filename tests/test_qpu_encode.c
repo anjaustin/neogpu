@@ -284,6 +284,16 @@ static void redteam_tests(void) {
     check(run_body(b_dangling_tmud) == HS_QPU_E_RULE_END, "a tmud write with no address before the end is refused");
     check(run_body(b_rules_toggled) == HS_QPU_E_RULE_END, "a store emitted while rules were off is still caught");
     check(run_body(b_texture_write) == HS_QPU_E_RULE_UNCHECKED, "TMU texture writes are refused under the rules");
+    {
+        static uint64_t dbuf[1024];
+        hs_qpu_prog dp;
+        uint32_t du[4];
+        hs_qpu_prog_init(&dp, dbuf, 1024);
+        check(HS_QPU_GATHER_BATCHES == 8 && HS_QPU_GATHER_K == 8 &&
+                  hs_qpu_kernel_gather(&dp, HS_QPU_GATHER_BATCHES, HS_QPU_GATHER_K) > 0 &&
+                  hs_qpu_gather_uniforms(du, 4u << 20, HS_QPU_GATHER_BATCHES, HS_QPU_GATHER_K, 0, 0, 0) == 0,
+              "the default gather configuration is the measured best (8 batches, k = 8) and encodes under the rules");
+    }
     check(run_body(b_branch_last) == HS_QPU_E_BRANCH, "a branch without its 3 delay slots is refused");
     check(run_body(b_thrsw_in_delay) == HS_QPU_E_BRANCH, "thrsw in a branch delay slot is refused");
     check(run_body(b_branch_in_delay) == HS_QPU_E_BRANCH, "a branch in another branch's delay slots is refused");
