@@ -41,13 +41,18 @@ int hs_v3d_bo_wait(hs_v3d* dev, const hs_v3d_bo* bo, uint64_t timeout_ns);
  * Returns the program's GPU address, or 0 if it does not fit. */
 uint32_t hs_v3d_load(hs_v3d_bo* code, size_t off, const uint64_t* prog, uint32_t n);
 
-/* One compute dispatch in the configuration every program in this tree was
- * measured with: workgroup counts 1 x 1 x 1, workgroup size 16, 16
- * workgroups per supergroup, and CFG4 = batches - 1. That runs `batches`
- * 16-lane batches. A program reads its batch index as (tidx >> 2) & 15.
- * Only batches = 1 or 8 is accepted: for 2 or 4 that index is not
- * 0..batches-1 (measured: wrong output), and the other counts were never
- * measured. `bos` lists every BO the job touches (code, uniforms, data), so
+/* One compute dispatch: workgroup counts batches x 1 x 1, workgroup size 16,
+ * 16 workgroups per supergroup, and CFG4 = batches - 1. That runs `batches`
+ * 16-lane batches. A program reads its batch number from the register the
+ * hardware presets at entry: rf0 & 15 (the workgroup x; 0..batches-1, once
+ * each, in no fixed order), before it overwrites rf0.
+ * Do not use the QPU thread index for this. Until 2026-11-17 programs here
+ * read (tidx >> 2) & 15, which is only distinct per batch while nothing else
+ * uses the GPU: beside a renderer 173 of 78,894 eight-batch jobs gave every
+ * batch its own number, and the gather kernel wrote wrong words in 3,273 of
+ * 3,279 jobs; with rf0, 79,177 of 79,177 (tools/p0_5_batch_id_probe,
+ * docs/audit/HARDWARE_HANDOFF_P0.md P0-5).
+ * Only batches = 1 or 8 is accepted: the other counts were never measured. `bos` lists every BO the job touches (code, uniforms, data), so
  * the kernel can track them. Returns 0 or -errno (-EINVAL for a refused
  * descriptor). */
 typedef struct {

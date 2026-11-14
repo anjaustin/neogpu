@@ -26,7 +26,7 @@ So the gains lie in hardware blocks that NeoGPU does not use yet.
 | P0-2 | One draw plus one `glBufferData` per glyph (`hs_text.c`) | One instanced draw, with quads built by the GPU's vertex stage | **Measured (P0-1 red team):** about 16 µs of CPU per draw with this pattern. 100 draws give 614 FPS with the GPU 13% busy, so text-heavy frames are CPU-bound | Next |
 | P0-3 | The GPU renders every layer at full panel resolution into one plane | HVS planes: static layers composed at scanout, and upscaling from a lower render resolution | 0.68 ns per pixel of fill, measured (COST_BREAKDOWN §8). Unknown: HVS blend and scale cost | **Shelved 2026-11-16.** Watched on the panel, the scaled image looked progressively more pixelated, not like a native render: a quality trade, not a speed-up. `hs_graphics_init_scaled` is out of the public API (behind `HS_GRAPHICS_SHELVED_SCALED`, kept for the tests). Kept: the plane-reset fix, the layer measurements and the tests. Reconstruction upscaling (adaptive edge refinement, temporal) was proposed and is shelved too. Before shelving: **Scaling made (opt-in):** `hs_graphics_init_scaled` renders at a reduced size and the HVS scales it at scanout. test_08 runs 1.76× faster at 600×360 and 3.9× at 400×240, on the panel. HVS composition and scaling cost no frame time on this panel (they do use memory bandwidth). Layers and sprites: measured capable, not built (no current user with a GPU cost to save). **Red team found and fixed:** takeover (native too) inherited a previous client's plane alpha, filter and blend mode, and native takeover left stray overlays on. The test now kills 14 of 14 mutants |
 | P0-4 | Capture: `glReadPixels`, then a CPU swizzle and flip, then a write | The writeback connector (the frame actually scanned out); the H.264 encoder for recording | Unknown: current cost | Not started |
-| P0-5 | Each GPU message is a job (~37 µs floor) | A persistent QPU mailbox | 0.76 µs RTT, 110–138× Mesa (VS_MESA.md) | **Built and measured; not red-teamed, not committed as shipped (2026-11-16).** `hs_mailbox` passes its 26 checks on 1 and 8 batches. Messages cost 1.4–3.1 µs, against 64–71 µs for a job. **It wins in one regime:** arithmetic-deep work (4,096 steps per element) runs 1.24–1.31× faster than all 4 CPU cores, bit-exact. For gathers and for shallow arithmetic the CPU wins at every size tested. Costs: a resident poller takes 3.4–3.6% from a Mesa renderer, and a lease is not bounded in time under contention |
+| P0-5 | Each GPU message is a job (~37 µs floor) | A persistent QPU mailbox | 0.76 µs RTT, 110–138× Mesa (VS_MESA.md) | **Built, red-teamed and hardened (2026-11-17); nothing in NeoGPU calls it yet.** Messages cost 2.1–3.3 µs, against 64–71 µs for a job. **It wins in one regime:** arithmetic-deep work (4,096 steps per element) runs 1.24–1.31× faster than all 4 CPU cores, bit-exact. For gathers and for shallow arithmetic the CPU wins at every size tested. The red team found a defect in shipped code: every 8-batch program took its batch number from the QPU thread index and wrote wrong words beside a renderer (gather kernel: 3,273 of 3,279 jobs); fixed, 0 of 3,206 after. Costs while the mailbox is in use: 2–3% of a Mesa renderer on 1 batch, 34–40% on 8; nothing once the caller has been quiet for 2 ms |
 | P0-6 | Mesa's start-up (`gbm_create_device` 79.5 ms) | A direct V3D compute → KMS scanout path for scenes compute can render | Direct cold start 0.47 ms, measured. Unknown: sharing a v3d BO with vc4 | Not started |
 | P0-7 | Texture uploads | The TFU (raster to tiled, mipmaps) | No streaming-texture user today | Not started |
 
@@ -522,7 +522,7 @@ full-resolution HUD over a scaled scene.
 - What the DSI panel shows after the HVS (writeback reaches only CRTC 0).
 - `hs_backend_gles` has no way to request a scaled render size yet.
 
-## P0-5: persistent QPU mailbox (built, wins on deep arithmetic only)
+## P0-5: persistent QPU mailbox (built and red-teamed; wins on deep arithmetic only)
 
 Probe: `tools/p0_5_mailbox_probe.c` (`make tools/p0_5_mailbox_probe`). Raw
 outputs on the Pi: `tests/evidence-p0-5-20261116/`. The probe runs a resident
@@ -650,6 +650,8 @@ as the GPU): 7.2 GFLOPS on one core and 28.7 on four, flat from 8 to 16
 vectors. The fused form reached 5.1 and 20.4: GCC wraps each `fmla` in two
 register copies. An earlier baseline in `tests/test_mailbox bench` (fused,
 `-O2`) reached only 17.6 on four cores, so its figures are not used here.
+Since 2026-11-17 that benchmark uses the unfused form too (28.6 on four
+cores, checked).
 
 Median time in µs (mailbox: `bench_2_rerun.jsonl`, 3 rounds; CPU:
 `chain_cpu_nofuse.jsonl`, 21 reps; 0 resets):
@@ -673,15 +675,205 @@ Median time in µs (mailbox: `bench_2_rerun.jsonl`, 3 rounds; CPU:
   all four.
 - An echo costs 1.93 µs on 1 batch and 3.07 µs on 8.
 
+The figures above are from the library as first built (commit `be3f863`).
+The red team below changed it; the arithmetic table was re-measured
+afterwards and is unchanged within 1% (59.4, 71.1, 893 and 1,097 µs for the
+four winning rows; `final_bench.txt`).
+
+### Red team (P0-5), 2026-11-17
+
+- **Target:** `hs_mailbox` as committed in `be3f863`.
+- **Method:** two independent reads of the code (one of the original, one
+  of the rewrite, which found 7 more defects); `tests/redteam-p0-5/rt_mailbox`
+  (functional cases, lease timing, soaks, and runs beside
+  `tests/test_08_raycast_orbit`); `tools/p0_5_batch_id_probe`; mutation
+  tests (`tests/redteam-p0-5/mutants.py`).
+- **Evidence:** `tests/evidence-p0-5-rt-20261117/` (`before_*` is the
+  library at `be3f863`, `final*` the final code, `after*` the rounds
+  between).
+- **GPU resets across all of it:** 207 → 207. HVS underruns: 0.
+
+**Finding 1, in shipped code: the batch number came from the QPU thread
+index.** Every 8-batch program (the gather kernel and the mailbox) computed
+its batch as `(tidx >> 2) & 15`. That gives each batch its own number only
+while nothing else uses the GPU.
+
+| 8 batches | alone | beside `test_08` |
+|---|---|---|
+| jobs in which every batch got its own number, thread index | 62,265 of 62,265 | 173 of 78,894 |
+| the same, `rf0` (workgroup x) | 65,111 of 65,111 | 79,177 of 79,177 |
+| shipped gather kernel, jobs with wrong words, before | 0 of 2,818 | 3,273 of 3,279 |
+| shipped gather kernel, jobs with wrong words, after | 0 of 2,290 | 0 of 3,206 |
+| mailbox, 8 batches, before | correct | requests time out after 1 s |
+| mailbox, 8 batches, after | correct | correct (0 wrong in 44,441 + 28,935 requests) |
+
+- The hardware presets a batch number at program entry. With workgroup
+  counts batches × 1 × 1 (what Mesa submits), `rf0` holds 0..7, each once
+  (`batch_id_show.txt`).
+- **Fix:** `hs_v3d_dispatch` now submits batches × 1 × 1;
+  `hs_qpu_kernel_gather` and `hs_mailbox` read `rf0 & 15` before they
+  overwrite `rf0`.
+- Alone on the GPU nothing changed: the 8-batch gather job takes 1,575 µs
+  for 65,536 elements (1,579 before).
+- Every earlier 8-batch figure in this tree was measured alone and stands.
+  1-batch programs were never affected.
+
+**Finding 2: a lease was bounded by a poll count, and a poll is not a
+fixed time.** (`before_lease.txt`, `before_coexist.txt`)
+
+| idle lease | 1 batch | 8 batches |
+|---|---|---|
+| 100,000 polls, alone | 31.9 ms | 43.7 ms |
+| 1,000,000 polls, alone | 320 ms | 437 ms |
+| 100,000 polls, beside `test_08` | 244–248 ms | did not finish (finding 1) |
+| 20,000 polls, beside `test_08` | 47–51 ms | did not finish (finding 1) |
+
+- Alone, a poll costs 0.32 µs on 1 batch and 0.44 µs on 8, linear in the
+  budget. Beside the renderer it costs 2.4 µs.
+- The library accepted budgets up to 4,000,000 polls: 1.3–1.7 s alone, past
+  the kernel's job reset.
+- **Fix:** the default budget is 30,000 polls and the largest is 250,000.
+  The poll loop reads three yield words, and a watchdog thread checks every
+  1 ms:
+  - no lease job has ended for `max_lease_us` (50 ms): every batch ends its
+    lease at its next poll, even with requests pending;
+  - the caller has not sent or waited for `idle_us` (2 ms): leases end as
+    soon as no request is pending.
+
+| after the fix (`final2_*`) | 1 batch | 8 batches |
+|---|---|---|
+| longest lease, largest budget, beside `test_08`, one echo per ms | 52.7 ms | 53.0 ms |
+| the same without the watchdog, alone (reference) | 85.8 ms | 114.9 ms |
+| GPU free again after the last call | 2.19 ms (max 2.24) | 2.16 ms (max 2.19) |
+| the same without the watchdog, largest budget | 169 ms | 228 ms |
+
+The hardest case for the bound is a caller that never lets the ring empty.
+Four of the largest gathers always in flight, budget 100,000, `max_lease_us`
+20 ms (`final_pipe.txt`, `final2_pipe.txt`):
+
+| longest lease | 1 batch | 8 batches |
+|---|---|---|
+| alone, watchdog | 21.7 ms | 23.8 ms |
+| alone, no watchdog | 56.0 ms | 241 ms |
+| beside `test_08`, watchdog | 27.8 ms | 62.5 ms |
+
+- The bound is `max_lease_us`, plus one 1 ms tick, plus the requests the
+  batches are running when the yield arrives. Beside the renderer on 8
+  batches that last term was about 40 ms.
+
+- Without the thread (a stopped process, or `watchdog_off`) only the poll
+  budget ends a lease. At the default budget beside `test_08` the longest
+  lease was 76.9 ms on 1 batch and 89.3 ms on 8
+  (`after7_coexist_wdoff.txt`); up to 3 can be queued.
+- One request cannot be interrupted, so `send` bounds its size: 512 gather
+  chunks per batch (8,192 elements on 1 batch, 65,536 on 8) and 65,536
+  budget units for a chain. The largest requests take 0.61 ms (gather) and
+  2.63 ms (chain) alone on 1 batch, 2.22 and 2.64 ms on 8. The longest
+  request in 90 s soaks beside the renderer took 4.7 ms on 1 batch and
+  8.0 ms on 8.
+
+**Finding 3: on 8 batches beside a renderer, batches do not all run at
+once.** A batch that has served a request and polls for the next holds
+back batches that have not started.
+- `hs_mailbox_wait` now sets the caller's yield word when some batches have
+  acknowledged a request and others have not for 300 µs.
+- With it, echo p99 beside the renderer is 0.41 ms; with it removed
+  (mutant `m13`), 41.6 ms, with single waits up to 357 ms.
+
+**Findings 4–11, host side** (each confirmed on the unmodified library
+where that was safe, `before_cases.txt`; each fixed and covered by a case):
+
+| # | before | after |
+|---|---|---|
+| 4 | `hs_mailbox_send` checked nothing: a zero step count or a huge element count would loop until the kernel reset the GPU | `send` refuses 17 kinds of bad request (count, alignment, range outside the listed BOs, overlap, unknown op, stop) |
+| 5 | after 2³² − 1 requests (2.8 h at 430 k/s) every send failed for good | sequence numbers wrap; 600 checked requests across the wrap |
+| 6 | leases the kernel killed were never replaced: every later request timed out | a stalled wait finds the queue empty and resubmits (first request after: 20.3 ms) |
+| 7 | a killed lease made the next one start from stale state and replay acknowledged requests from reused slots | a batch's published acknowledgement is its only state: the next lease resumes at the first unacknowledged request |
+| 8 | a request could then run twice, wrong for in-place work | output overlapping input is refused |
+| 9 | `hs_mailbox_wait` on a sequence never sent spun to its timeout | `-EINVAL` |
+| 10 | `stop` dropped unfinished requests' bookkeeping and marked the mailbox stopped even when the stop failed; a stop sent through `send` wedged it | `stop` waits for every request, and only a completed stop changes state; `send` refuses the stop op |
+| 11 | `send` published a request before submitting the lease and returned the submit error; `-EBUSY` ignored acknowledgements; `start` used a static buffer | submit first, publish after; `-EBUSY` re-reads the acknowledgements; stack buffer |
+
+**Findings 12–18, from the second read (of the rewrite):**
+
+| # | defect in the rewrite | fix |
+|---|---|---|
+| 12 | a stop whose wait timed out sent a second stop request when retried; no lease would ever serve it | the stop request is sent once; a retry waits for it; sends are refused meanwhile |
+| 13 | the yield was only honoured with no request pending: a caller that kept the ring full held a lease to its budget (241 ms measured on 8 batches) | a third yield word ends the lease with requests pending (table above) |
+| 14 | lease counts that differ between batches (a killed job that only some batches finished) stopped all submission | signed accounting against the jobs finished on every batch |
+| 15 | gather checked only the table's first word against the output | gather takes the table's length; range and overlap are checked in full |
+| 16 | a lease took at most `slots` requests per batch, but a slot one batch had cached could be read by another batch of the same job for a later request | a lease ends where the ring wraps: within a job a slot index means one request for every batch. Not demonstrated on hardware; closed by construction |
+| 17 | the watchdog compared its clock with a time stamped by the caller, and both threads wrote one yield word | the caller bumps a counter; the watchdog times it on its own clock; park and wake use a counter-then-state handshake |
+| 18 | the header promised more than the code did about `max_lease_us` | the header states what is measured above |
+
+**What the mailbox costs a renderer** (`test_08` alone: 110.2–110.6 FPS;
+`final2_coexist.txt`, `final2_pipe.txt`, `final2_long_coexist.txt`):
+
+| caller | 1 batch | 8 batches |
+|---|---|---|
+| one echo every 20 ms | 110.2 FPS | 103.8 FPS |
+| one echo every 100 µs | 108.2 FPS | 66.8 FPS |
+| one 256-step chain every 100 µs | 107.4 FPS | 72.4 FPS |
+| four of the largest gathers always in flight | 103.8 FPS | 85.8 FPS |
+| 90 s of mixed requests (9 renderer runs) | 105.1–106.1 FPS | 94.0–100.4 FPS |
+| echo latency beside the renderer, p50 / p99 | 12.2 / 20.0 µs | 31.0 / 407 µs |
+
+- A resident 8-batch poller occupies every QPU: use 8 batches when the GPU
+  is otherwise free, or in bursts.
+
+**Other compute jobs queue behind the leases** (`final2_jobwait.txt`):
+
+| a plain job submitted right after a mailbox request | 1 batch | 8 batches |
+|---|---|---|
+| no mailbox | 0.065 ms | 0.072 ms |
+| behind the leases, watchdog on | 3.11 ms | 3.11 ms |
+| behind the leases, watchdog off | 20.4 ms | 27.5 ms |
+| `hs_mailbox_stop` first (stop + job) | 0.157 ms | 0.158 ms |
+
+- Two mailboxes used alternately cost each other 2.7–3.0 ms per call.
+
+**Platform facts met on the way:**
+- `hs_v3d_bo_wait` with a zero timeout blocks 1.9–2.0 ms while a job holds
+  the BO (`after3_bowait.txt`). The library only calls it with the caller
+  away or on a 20 ms stall.
+- The first request after more than 100–200 ms of GPU idle takes 10.0 ms,
+  for a plain job and for the mailbox alike (`after4_idlegap.txt`). This is
+  the runtime resume recorded in VS_MESA.md.
+
+**Do the tests have teeth?** `mutants.py` breaks the library one way at a
+time (`final2_mutants.txt`, `final2_mutants_rerun.txt`): 17 of 17 mutants caught, the unmodified
+control passes. They cover the size, overlap and table checks, the wrap
+compare, lease replacement and accounting, the watchdog and its age yield,
+the ring-wrap lease end, index reload, result publish, the single stop
+request, and the thread-index batch number in the mailbox and in the gather
+kernel.
+
+**Final state** (`final*`):
+- `tests/test_mailbox`: 26 checks, 0 wrong words.
+- `rt_mailbox cases`: 46 cases on 1 and 8 batches, all pass.
+- Soaks of random checked requests, pauses and stops: 60 s alone and 90 s
+  beside back-to-back renderer runs, on 1 and 8 batches: 0 wrong, 0 lost
+  leases.
+- Cost of the hardening: an echo is 2.09 µs on 1 batch and 3.33 µs on 8
+  (1.93 and 3.07 before). The benchmark's CPU chain is now the fastest one
+  found (28.6 GFLOPS on four cores, checked).
+
 **Where this leaves P0-5:**
 - The mailbox is a real GPU arithmetic path at microsecond latency, worth
   1.2–1.3× all four CPU cores on deep per-element arithmetic and nothing on
   gathers or shallow work.
-- It has not been red-teamed. Known open points: a lease is bounded by a
-  poll count, not by time (see the 2 resets above), a long request has no
-  bound against the ~1 s reset that was measured here, and the coexistence
-  figures are for the probe, not for `hs_mailbox` on 8 batches.
+- It is now safe to leave running: bounded leases, bounded requests, checked
+  arguments, and it gives the GPU back 2 ms after the caller goes quiet.
 - Nothing in NeoGPU calls it yet.
 
-Not measured: a job-based chain kernel (no such kernel exists), any renderer
-other than `test_08`, and CPU code hand-written in assembly.
+Not measured:
+- A real kernel reset of a lease. The recovery path was exercised through
+  what the CPU sees afterwards (leases counted as queued that are gone,
+  lease counts that differ between batches), not by making the kernel kill
+  one.
+- Whether a slot cached by one batch is in fact served stale to another
+  (finding 16).
+- Any renderer other than `test_08`; 2 or 4 batches; a job-based chain
+  kernel (none exists); CPU code hand-written in assembly.
+- Gather indices are not checked by the library: an index outside the table
+  reads whatever that GPU address holds.

@@ -99,3 +99,6 @@ neogpu_kworker_rt
 /tools/p0_5_chain_cpu
 /tests/test_mailbox
 /tools/bench_vs_mesa
+/tests/redteam-p0-5/rt_mailbox
+/tests/redteam-p0-5/mutants/
+/tools/p0_5_batch_id_probe

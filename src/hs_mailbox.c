@@ -1,15 +1,31 @@
 /* hs_mailbox: see include/hs_mailbox.h. Register use of the resident program
  * (per batch, 16 lanes; l = lane, b = batch):
  *   rf0 M+4l   rf1 ACK_b+4l   rf3 budget   rf4 next sequence   rf5 lane-0 mask
- *   rf6 STATE_b+4l   rf7 SLOT0+4l   rf8 SLOTEND+4l   rf9 b   rf10 requests left
- *   rf11 slot+4l   rf14 leases   rf15/rf16 state lines 1/2   rf17 64
+ *   rf6 STATE_b+4l (stop flag)   rf7 SLOT0+4l   rf8 SLOTEND+4l   rf9 b
+ *   rf11 slot+4l   rf12 poll subtrahend (lane 0: next sequence; lanes 1..4:
+ *   1)   rf13 ~0 on lanes 5..15   rf14 leases   rf16 STATE_b+128+4l (lease
+ *   count)   rf17 64   rf18 1 on lanes 1..4   rf19 slots-1   rf20 ~0 on lane 3
  *   rf22 64*batches (chunk stride)   rf23 64*b+4l   rf24..rf31 request lines
  *   rf33..rf43 op temporaries
+ *
+ * The sequence line M: word 0 is the last sequence sent. Words 1..3 are
+ * yield words (word 4 is never written):
+ *   1  set by the caller's thread: end the lease when no request is pending
+ *   2  set by the watchdog when the caller is idle: the same
+ *   3  set by the watchdog when a lease is too old: end it now, even with
+ *      requests pending (the next lease serves them)
+ *
+ * What survives a lease: only memory the GPU published. A batch's ACK line is
+ * its whole durable state: a lease starts at ACK + 1 and takes its slot from
+ * that number, so a lease that dies (kernel reset) is resumed by the next one
+ * at the first request it had not acknowledged. Requests may therefore run
+ * more than once, which is why send refuses outputs that overlap inputs.
  */
 #define _GNU_SOURCE
 #include "hs_mailbox.h"
 
 #include <errno.h>
+#include <sched.h>
 #include <string.h>
 #include <time.h>
 
@@ -21,14 +37,20 @@
 #define I(v) hs_qpu_imm_int(v)
 
 enum {
-    OFF_M = 0,
+    OFF_M = 0,        /* word 0: last sequence sent; words 1..3: yield words (see above) */
     OFF_ACK = 4096,   /* + 256 * batch */
-    OFF_STATE = 8192, /* + 256 * batch: lines next seq, slot offset, leases */
+    OFF_STATE = 8192, /* + 256 * batch: line 0 stop flag, line 2 leases finished */
     OFF_WARM = 12288,
     OFF_SLOTS = 16384,
     SLOT_BYTES = 512, /* 8 lines; a multiple of the GPU's 256-byte fetch */
-    MAX_UNITS = 65536, /* budget units one request may take per batch */
+    MAX_UNITS = HS_MB_MAX_UNITS,
     HEADER = 9,
+    STALL_NS = 300000,     /* a request some batches acknowledged and others have not: yield */
+    LOST_CHECK_NS = 20000000, /* the check blocks ~2 ms while a job runs: only on a long stall */
+    WD_TICK_NS = 1000000,
+    WD_RUN = 0,    /* leases may be running; no idle yield */
+    WD_IDLE = 1,   /* the idle yield (word 2) is set */
+    WD_PARKED = 2, /* nothing queued: the watchdog sleeps until the caller returns */
 };
 
 static void emit(hs_qpu_prog* p, hs_qpu_alu x) { hs_qpu_emit(p, &x); }
@@ -106,22 +128,32 @@ static void chain_i2(hs_qpu_prog* p) {
 
 static int build(hs_qpu_prog* p) {
     hs_qpu_prog_rules(p, 0); /* TMUAU and multi-load forms are outside the checker; forms measured in P0-5 */
+    mov(p, RF(9), RF(0)); /* the hardware's batch number (workgroup x), before rf0 is overwritten */
     ldunifrf(p, 0);
     ldunifrf(p, 1);
     ldunifrf(p, 3);
     ldunifrf(p, 6);
     ldunifrf(p, 7);
     ldunifrf(p, 8);
-    ldunifrf(p, 10);
     ldunifrf(p, 22);
-    ldunifrf(p, 2); /* batches - 1: the batch-index mask (1 batch: its tidx field is not 0) */
+    ldunifrf(p, 2); /* batches - 1: the batch-number mask */
+    ldunifrf(p, 19); /* slots - 1 */
     op(p, HS_QPU_A_EIDX, R(1), X, X);
     op(p, HS_QPU_A_SHL, R(0), R(1), I(2)); /* r0 = 4l */
     op(p, HS_QPU_A_SUB, R(2), R(1), I(1));
     op(p, HS_QPU_A_ASR, RF(5), R(2), I(15)); /* lane 0: ~0; others: 0 */
-    op(p, HS_QPU_A_TIDX, R(2), X, X);
-    op(p, HS_QPU_A_SHR, R(2), R(2), I(2));
-    op(p, HS_QPU_A_BAND, RF(9), R(2), RF(2)); /* batch */
+    op(p, HS_QPU_A_ASR, R(3), R(2), I(2));   /* lane 0: -1; lanes 1..4: 0; others: > 0 */
+    mov(p, RF(13), I(0));
+    op(p, HS_QPU_A_SUB, RF(13), RF(13), R(3));
+    op(p, HS_QPU_A_ASR, RF(13), RF(13), I(15)); /* lanes 5..15: ~0; others: 0 */
+    op(p, HS_QPU_A_BOR, R(3), RF(13), RF(5));
+    op(p, HS_QPU_A_ADD, RF(18), R(3), I(1)); /* lanes 1..4: 1; others: 0 */
+    flags(p, HS_QPU_A_SUB, R(3), R(1), I(3), HS_QPU_PF_PUSHZ);
+    mov(p, RF(20), I(0));
+    hs_qpu_alu l3 = hs_qpu_a(HS_QPU_A_MOV, RF(20), I(-1), X); /* lane 3: ~0; others: 0 */
+    l3.ac = HS_QPU_COND_IFA;
+    emit(p, l3);
+    op(p, HS_QPU_A_BAND, RF(9), RF(9), RF(2)); /* batch (not the thread index: see hs_v3d.h) */
     op(p, HS_QPU_A_SHL, R(2), RF(9), I(8));
     op(p, HS_QPU_A_ADD, RF(1), RF(1), R(2));
     op(p, HS_QPU_A_ADD, RF(6), RF(6), R(2));
@@ -132,31 +164,44 @@ static int build(hs_qpu_prog* p) {
     mov(p, R(2), I(1));
     op(p, HS_QPU_A_SHL, RF(17), R(2), I(6)); /* 64 */
     op(p, HS_QPU_A_SHL, RF(41), R(2), I(9)); /* 512: slot size */
-    op(p, HS_QPU_A_ADD, RF(15), RF(6), RF(17));
-    op(p, HS_QPU_A_ADD, RF(16), RF(15), RF(17));
+    op(p, HS_QPU_A_ADD, RF(16), RF(6), RF(17));
+    op(p, HS_QPU_A_ADD, RF(16), RF(16), RF(17));
     op(p, HS_QPU_A_ADD, RF(43), RF(22), RF(22));
-    load(p, RF(6), RF(4));
-    load(p, RF(15), R(3));
-    op(p, HS_QPU_A_ADD, RF(11), RF(7), R(3));
+    load(p, RF(1), R(3)); /* the last request this batch acknowledged */
+    op(p, HS_QPU_A_ADD, RF(4), R(3), I(1));
+    op(p, HS_QPU_A_BAND, R(3), R(3), RF(19));
+    op(p, HS_QPU_A_SHL, R(3), R(3), I(9));
+    op(p, HS_QPU_A_ADD, RF(11), RF(7), R(3)); /* request n is in slot (n - 1) mod slots */
+    op(p, HS_QPU_A_BAND, R(1), RF(4), RF(5));
+    op(p, HS_QPU_A_BOR, RF(12), R(1), RF(18));
     load(p, RF(16), RF(14));
+    load(p, RF(6), R(1));
 
-    int poll = hs_qpu_label_new(p), done = hs_qpu_label_new(p), quit = hs_qpu_label_new(p);
+    int poll = hs_qpu_label_new(p), done = hs_qpu_label_new(p);
     int l_gather = hs_qpu_label_new(p), l_gstatic = hs_qpu_label_new(p), l_gpub = hs_qpu_label_new(p);
     int l_chain = hs_qpu_label_new(p), l_stop = hs_qpu_label_new(p), l_ack = hs_qpu_label_new(p);
     int l_cl = hs_qpu_label_new(p), l_hl = hs_qpu_label_new(p);
-    flags(p, HS_QPU_A_MOV, R(1), RF(4), X, HS_QPU_PF_PUSHZ); /* next sequence 0: stopped */
-    br(p, HS_QPU_B_A0, quit, 0);
+    flags(p, HS_QPU_A_MOV, R(1), R(1), X, HS_QPU_PF_PUSHZ); /* stop flag set: end at once */
+    br(p, HS_QPU_B_NA0, done, 0);
 
-    /* poll until M >= next sequence (lane 0 decides) or the budget runs out */
+    /* poll while M < next sequence (lane 0) and no yield word (lanes 1..3)
+     * is set, until the budget runs out */
     hs_qpu_label_bind(p, poll);
     op2(p, RF(0));
     load(p, RF(0), R(0));
     flags(p, HS_QPU_A_SUB, RF(3), RF(3), I(1), HS_QPU_PF_PUSHZ);
     hs_qpu_branch(p, HS_QPU_B_A0, done, 0, 0);
+    op(p, HS_QPU_A_SUB, R(1), R(0), RF(12));
+    flags(p, HS_QPU_A_BOR, R(1), R(1), RF(13), HS_QPU_PF_PUSHN);
+    nop(p);
+    br(p, HS_QPU_B_ALLA, poll, 0);
+    /* no request: a yield word ended the poll */
     op(p, HS_QPU_A_SUB, R(1), R(0), RF(4));
     flags(p, HS_QPU_A_BAND, R(1), R(1), RF(5), HS_QPU_PF_PUSHN);
-    nop(p);
-    br(p, HS_QPU_B_ANYA, poll, 0);
+    br(p, HS_QPU_B_ANYA, done, 0);
+    /* a request is pending: it is served unless the lease is too old (word 3) */
+    flags(p, HS_QPU_A_BAND, R(1), R(0), RF(20), HS_QPU_PF_PUSHZ);
+    br(p, HS_QPU_B_ANYNA, done, 0);
 
     /* the request: 8 lines, one value each (replicated across lanes) */
     mov(p, R(1), RF(11));
@@ -242,12 +287,13 @@ static int build(hs_qpu_prog* p) {
     publish(p);
     br(p, HS_QPU_B_ALWAYS, l_ack, 0);
 
-    /* stop: acknowledge, then store next sequence 0 so queued leases quit */
+    /* stop: acknowledge, then set the stop flag so queued leases end at once */
     hs_qpu_label_bind(p, l_stop);
     store(p, RF(1), RF(4));
     tmuwt(p);
     op2(p, RF(1));
-    mov(p, RF(4), I(0));
+    mov(p, R(2), I(1));
+    store(p, RF(6), R(2));
     br(p, HS_QPU_B_ALWAYS, done, 0);
 
     /* acknowledge and move to the next request */
@@ -257,28 +303,29 @@ static int build(hs_qpu_prog* p) {
     op2(p, RF(1));
     budget_sub(p, I(1));
     op(p, HS_QPU_A_ADD, RF(4), RF(4), I(1));
+    op(p, HS_QPU_A_BAND, R(1), RF(4), RF(5));
+    op(p, HS_QPU_A_BOR, RF(12), R(1), RF(18));
     op(p, HS_QPU_A_ADD, RF(11), RF(11), RF(41));
     flags(p, HS_QPU_A_SUB, R(1), RF(11), RF(8), HS_QPU_PF_PUSHZ);
     hs_qpu_alu w = hs_qpu_a(HS_QPU_A_MOV, RF(11), RF(7), X);
     w.ac = HS_QPU_COND_IFA;
     emit(p, w);
-    flags(p, HS_QPU_A_SUB, RF(10), RF(10), I(1), HS_QPU_PF_PUSHZ);
-    hs_qpu_branch(p, HS_QPU_B_A0, done, 0, 0);
+    /* The lease ends where the ring wraps. Within one job no batch then reads
+     * a slot index for two different requests, and the host does not rewrite
+     * a slot before every batch acknowledged its request: a slot the GPU
+     * cached in this job is never stale, whichever batch cached it. */
+    hs_qpu_branch(p, HS_QPU_B_A0, done, 0, 0); /* the ring wrapped: end the lease */
     flags(p, HS_QPU_A_SUB, R(1), RF(3), I(1), HS_QPU_PF_PUSHN); /* delay slot: budget <= 0 */
     nop(p);
     nop(p);
     br(p, HS_QPU_B_A0, done, 0);
     br(p, HS_QPU_B_ALWAYS, poll, 0);
 
-    /* lease end: store the state the next lease starts from */
+    /* lease end: count it (every lease that is not killed passes here) */
     hs_qpu_label_bind(p, done);
-    store(p, RF(6), RF(4));
-    op(p, HS_QPU_A_SUB, R(1), RF(11), RF(7));
-    store(p, RF(15), R(1));
     op(p, HS_QPU_A_ADD, RF(14), RF(14), I(1));
     store(p, RF(16), RF(14));
     tmuwt(p);
-    hs_qpu_label_bind(p, quit);
     hs_qpu_emit_end(p);
     return hs_qpu_prog_finish(p);
 }
@@ -304,9 +351,131 @@ static void fill_line(hs_mailbox* mb, uint32_t off, uint32_t v) {
     volatile uint32_t* w = ctl32(mb, off);
     for (int l = 0; l < 16; l++) w[l] = v;
 }
+static uint32_t ack_of(const hs_mailbox* mb, uint32_t b) { return ctl32(mb, OFF_ACK + 256 * b)[0]; }
 
 uint32_t hs_mailbox_leases_done(const hs_mailbox* mb, uint32_t b) {
     return ctl32(mb, OFF_STATE + 256 * b + 128)[0];
+}
+/* leases every batch finished: finished jobs, as long as none was killed */
+static uint32_t jobs_done(const hs_mailbox* mb) {
+    uint32_t m = hs_mailbox_leases_done(mb, 0);
+    for (uint32_t b = 1; b < mb->batches; b++) {
+        uint32_t c = hs_mailbox_leases_done(mb, b);
+        if ((int32_t)(c - m) < 0) m = c;
+    }
+    return m;
+}
+
+/* ---- watchdog: the time bound on a lease, and the idle stop. It reads the
+ * GPU-side lease counters and the caller's activity counter, and writes yield
+ * words 2 and 3. The caller's thread only ever clears word 2 (present). ---- */
+static void* wd_main(void* arg) {
+    hs_mailbox* mb = arg;
+    cpu_set_t all; /* not the caller's (possibly pinned, spinning) CPU */
+    memset(&all, 0xFF, sizeof all);
+    sched_setaffinity(0, sizeof all, &all);
+    pthread_mutex_lock(&mb->wd_mu);
+    for (;;) {
+        while (atomic_load(&mb->wd_state) == WD_PARKED && !atomic_load(&mb->wd_quit))
+            pthread_cond_wait(&mb->wd_cv, &mb->wd_mu);
+        if (atomic_load(&mb->wd_quit)) break;
+        pthread_mutex_unlock(&mb->wd_mu);
+        uint64_t t_act = now_ns(), t_change = t_act;
+        uint32_t act0 = atomic_load(&mb->wd_act), j0 = jobs_done(mb), idle_ticks = 0;
+        int aging = 0; /* yield word 3 is set */
+        for (;;) {
+            struct timespec ts = {0, WD_TICK_NS};
+            nanosleep(&ts, NULL);
+            if (atomic_load(&mb->wd_quit)) break;
+            uint64_t t = now_ns();
+            uint32_t a = atomic_load(&mb->wd_act), j = jobs_done(mb);
+            int was_idle = atomic_load(&mb->wd_state) == WD_IDLE;
+            if (a != act0) act0 = a, t_act = t; /* the caller sent or waited since the last tick */
+            if (j != j0 || (was_idle && t_act == t)) { /* a job ended on every batch; or back from idle */
+                j0 = j, t_change = t;
+                if (aging) {
+                    ctl32(mb, OFF_M)[3] = 0;
+                    barrier();
+                    aging = 0;
+                }
+            }
+            int idle = t - t_act > mb->idle_ns;
+            if (idle != was_idle) {
+                ctl32(mb, OFF_M)[2] = (uint32_t)idle;
+                barrier();
+                atomic_store(&mb->wd_state, idle ? WD_IDLE : WD_RUN);
+                if (idle) {
+                    atomic_fetch_add(&mb->wd_idle_yields, 1);
+                    if (atomic_load(&mb->wd_act) != act0) { /* it returned while we decided */
+                        ctl32(mb, OFF_M)[2] = 0;
+                        barrier();
+                        atomic_store(&mb->wd_state, WD_RUN);
+                        idle = 0;
+                    }
+                }
+            }
+            if (!aging && !idle && t - t_change > mb->max_lease_ns) {
+                /* No job has ended for max_lease: every batch ends its lease
+                 * at its next poll. Held until the job has ended on every
+                 * batch (beside a renderer the batches do not all run at
+                 * once), watched closely at first so the next job can run. */
+                ctl32(mb, OFF_M)[3] = 1;
+                barrier();
+                aging = 1;
+                atomic_fetch_add(&mb->wd_age_yields, 1);
+                for (int i = 0; i < 60 && jobs_done(mb) == j0 && !atomic_load(&mb->wd_quit); i++) {
+                    struct timespec w = {0, 20000};
+                    nanosleep(&w, NULL);
+                }
+                if (jobs_done(mb) != j0) {
+                    ctl32(mb, OFF_M)[3] = 0;
+                    barrier();
+                    aging = 0;
+                    j0 = jobs_done(mb), t_change = now_ns();
+                }
+            }
+            idle_ticks = idle ? idle_ticks + 1 : 0;
+            /* Drained: sleep until the caller returns. The BO wait is only made
+             * here, with the caller away: with a zero timeout it still blocks
+             * for about 2 ms while a job runs (measured). */
+            if (idle_ticks >= 4 && !hs_v3d_bo_wait(mb->dev, &mb->ctl, 0)) {
+                pthread_mutex_lock(&mb->wd_mu);
+                atomic_store(&mb->wd_state, WD_PARKED);
+                if (atomic_load(&mb->wd_act) != act0) { /* it returned meanwhile: stay awake */
+                    atomic_store(&mb->wd_state, WD_IDLE);
+                    pthread_mutex_unlock(&mb->wd_mu);
+                    idle_ticks = 0;
+                    continue;
+                }
+                ctl32(mb, OFF_M)[2] = ctl32(mb, OFF_M)[3] = 0; /* nothing is queued: nothing to yield */
+                barrier();
+                goto parked;
+            }
+        }
+        pthread_mutex_lock(&mb->wd_mu);
+    parked:;
+    }
+    pthread_mutex_unlock(&mb->wd_mu);
+    return NULL;
+}
+/* The caller is here (sending or waiting). The activity counter is written
+ * before the state is read, and the watchdog writes PARKED before it re-reads
+ * the counter: one of the two always sees the other. */
+static void present(hs_mailbox* mb) {
+    if (!mb->wd_started) return;
+    atomic_fetch_add(&mb->wd_act, 1);
+    int st = atomic_load(&mb->wd_state);
+    if (st == WD_RUN) return;
+    ctl32(mb, OFF_M)[2] = 0; /* back from idle: do not wait a watchdog tick for the yield to clear */
+    barrier();
+    if (st == WD_PARKED) {
+        pthread_mutex_lock(&mb->wd_mu);
+        if (atomic_load(&mb->wd_state) == WD_PARKED) {
+            atomic_store(&mb->wd_state, WD_RUN);
+            pthread_cond_signal(&mb->wd_cv);
+        }
+        pthread_mutex_unlock(&mb->wd_mu);
+    }
 }
 
 static int dispatch(hs_mailbox* mb, uint32_t code, uint32_t unif_gpu, uint32_t batches) {
@@ -314,8 +483,12 @@ static int dispatch(hs_mailbox* mb, uint32_t code, uint32_t unif_gpu, uint32_t b
     return hs_v3d_dispatch(mb->dev, &d);
 }
 static int top_up(hs_mailbox* mb) {
-    uint32_t ended = hs_mailbox_leases_done(mb, 0);
-    while (mb->submitted - ended < mb->qdepth) {
+    /* the usual case, one read. Signed: after a killed lease batch 0's count
+     * can be ahead of the jobs that finished on every batch. */
+    if ((int32_t)(mb->submitted - hs_mailbox_leases_done(mb, 0)) >= (int32_t)mb->qdepth) return 0;
+    uint32_t ended = jobs_done(mb);
+    if ((int32_t)(mb->submitted - ended) < 0) mb->submitted = ended;
+    while ((int32_t)(mb->submitted - ended) < (int32_t)mb->qdepth) {
         int e = dispatch(mb, mb->prog, mb->unif.gpu, mb->batches);
         if (e) return e;
         mb->submitted++;
@@ -325,14 +498,21 @@ static int top_up(hs_mailbox* mb) {
 
 int hs_mailbox_start(hs_mailbox* mb, hs_v3d* dev, const hs_mailbox_cfg* cfg) {
     memset(mb, 0, sizeof(*mb));
-    if (!cfg || (cfg->batches != 1 && cfg->batches != 8) || cfg->nbos > 13 || (cfg->nbos && !cfg->bos))
+    if (!dev || !cfg || (cfg->batches != 1 && cfg->batches != 8) || cfg->nbos > HS_MB_MAX_BOS || (cfg->nbos && !cfg->bos))
         return -EINVAL;
+    uint32_t budget = cfg->budget ? cfg->budget : 30000, qdepth = cfg->qdepth ? cfg->qdepth : 2;
+    uint32_t slots = cfg->slots ? cfg->slots : 256;
+    if (budget < 2 || budget > HS_MB_MAX_BUDGET || qdepth > 8 || slots < 2 || slots > 65536 || (slots & (slots - 1)))
+        return -EINVAL;
+    for (uint32_t i = 0; i < cfg->nbos; i++)
+        if (!cfg->bos[i] || !cfg->bos[i]->map) return -EINVAL;
     mb->dev = dev;
     mb->batches = cfg->batches;
-    mb->budget = cfg->budget ? cfg->budget : 100000;
-    mb->qdepth = cfg->qdepth ? cfg->qdepth : 2;
-    mb->slots = cfg->slots ? cfg->slots : 256;
-    if (mb->budget < 2 || mb->budget > 4000000 || mb->qdepth > 8 || mb->slots < 2 || mb->slots > 65536) return -EINVAL;
+    mb->budget = budget;
+    mb->qdepth = qdepth;
+    mb->slots = slots;
+    mb->idle_ns = (uint64_t)(cfg->idle_us ? cfg->idle_us : 2000) * 1000;
+    mb->max_lease_ns = (uint64_t)(cfg->max_lease_us ? cfg->max_lease_us : 50000) * 1000;
     size_t nunif = HEADER + (size_t)mb->budget + MAX_UNITS + 256;
     int e;
     if ((e = hs_v3d_bo_new(dev, &mb->code, 16 << 10)) || (e = hs_v3d_bo_new(dev, &mb->unif, nunif * 4)) ||
@@ -343,9 +523,14 @@ int hs_mailbox_start(hs_mailbox* mb, hs_v3d* dev, const hs_mailbox_cfg* cfg) {
     mb->handles[0] = mb->code.handle;
     mb->handles[1] = mb->unif.handle;
     mb->handles[2] = mb->ctl.handle;
-    for (uint32_t i = 0; i < cfg->nbos; i++) mb->handles[3 + i] = cfg->bos[i];
+    for (uint32_t i = 0; i < cfg->nbos; i++) {
+        mb->handles[3 + i] = cfg->bos[i]->handle;
+        mb->bo_lo[i] = cfg->bos[i]->gpu;
+        mb->bo_hi[i] = (uint64_t)cfg->bos[i]->gpu + cfg->bos[i]->size;
+    }
+    mb->nbos = cfg->nbos;
     mb->nhandles = 3 + cfg->nbos;
-    static uint64_t buf[2048];
+    uint64_t buf[2048];
     hs_qpu_prog p;
     hs_qpu_prog_init(&p, buf, 2048);
     int n = build(&p);
@@ -368,12 +553,11 @@ int hs_mailbox_start(hs_mailbox* mb, hs_v3d* dev, const hs_mailbox_cfg* cfg) {
     u[3] = mb->ctl.gpu + OFF_STATE;
     u[4] = mb->ctl.gpu + OFF_SLOTS;
     u[5] = mb->ctl.gpu + OFF_SLOTS + mb->slots * SLOT_BYTES;
-    u[6] = mb->slots;
-    u[7] = 64 * mb->batches;
-    u[8] = mb->batches - 1;
+    u[6] = 64 * mb->batches;
+    u[7] = mb->batches - 1;
+    u[8] = mb->slots - 1;
     for (size_t i = HEADER; i < nunif; i++) u[i] = 0xFFFFFF80u | 2u << 3 | 7u; /* per-lane op 2, 32-bit */
     memset((void*)mb->ctl.map, 0, mb->ctl.size);
-    for (uint32_t b = 0; b < mb->batches; b++) fill_line(mb, OFF_STATE + 256 * b, 1);
     ctl32(mb, OFF_WARM)[0] = 37500; /* ~1 ms: the GPU clock drops after idle (HARDWARE_MAP) */
     barrier();
     if ((e = dispatch(mb, warm, mb->ctl.gpu + OFF_WARM, 1)) ||
@@ -381,48 +565,138 @@ int hs_mailbox_start(hs_mailbox* mb, hs_v3d* dev, const hs_mailbox_cfg* cfg) {
         hs_mailbox_free(mb);
         return e;
     }
+    if (!cfg->watchdog_off) {
+        pthread_mutex_init(&mb->wd_mu, NULL);
+        pthread_cond_init(&mb->wd_cv, NULL);
+        atomic_store(&mb->wd_state, WD_PARKED);
+        if ((e = pthread_create(&mb->wd_thread, NULL, wd_main, mb))) {
+            pthread_mutex_destroy(&mb->wd_mu);
+            pthread_cond_destroy(&mb->wd_cv);
+            hs_mailbox_free(mb);
+            return -e;
+        }
+        mb->wd_started = 1;
+    }
     mb->running = 1;
     return 0;
 }
 
-int64_t hs_mailbox_send(hs_mailbox* mb, uint32_t opc, const uint32_t a[7]) {
-    if (mb->seq - mb->done_seq >= mb->slots) return -EBUSY;
+/* [addr, addr + bytes) lies inside one BO the mailbox's jobs hold */
+static int covered(const hs_mailbox* mb, uint32_t addr, uint64_t bytes) {
+    for (uint32_t i = 0; i < mb->nbos; i++)
+        if (addr >= mb->bo_lo[i] && (uint64_t)addr + bytes <= mb->bo_hi[i]) return 1;
+    return 0;
+}
+static int overlap(uint32_t a, uint64_t an, uint32_t b, uint64_t bn) {
+    return (uint64_t)a < (uint64_t)b + bn && (uint64_t)b < (uint64_t)a + an;
+}
+static int valid(const hs_mailbox* mb, uint32_t opc, const uint32_t a[7]) {
+    static const uint32_t zero[7];
+    if (!a) a = zero;
+    if (opc == HS_MB_OP_ECHO) return 1;
+    if (opc == HS_MB_OP_GATHER) {
+        uint64_t n = a[0], bytes = n * 64 * mb->batches;
+        uint64_t tbytes = (uint64_t)a[5] * 4;
+        if (a[4] > 1 || a[6] || n > HS_MB_MAX_GATHER_CHUNKS) return 0;
+        if (!n) return 1;
+        if (((a[1] | a[2] | a[3]) & 3) || !a[5]) return 0;
+        if (!covered(mb, a[1], bytes) || !covered(mb, a[3], bytes) || !covered(mb, a[2], tbytes)) return 0;
+        return !overlap(a[1], bytes, a[3], bytes) && !overlap(a[2], tbytes, a[3], bytes);
+    }
+    if (opc == HS_MB_OP_CHAIN) {
+        uint64_t n = a[0], bytes = n * 128 * mb->batches;
+        if (a[2] || !a[4] || a[4] > 16384 || n * ((uint64_t)a[4] + 4) + 4 > MAX_UNITS) return 0;
+        if (!n) return 1;
+        if ((a[1] | a[3]) & 3) return 0;
+        if (!covered(mb, a[1], bytes) || !covered(mb, a[3], bytes)) return 0;
+        return !overlap(a[1], bytes, a[3], bytes);
+    }
+    return 0; /* HS_MB_OP_STOP goes through hs_mailbox_stop */
+}
+
+/* the newest request every batch has acknowledged */
+static void refresh_done(hs_mailbox* mb) {
+    uint32_t m = ack_of(mb, 0);
+    for (uint32_t b = 1; b < mb->batches; b++) {
+        uint32_t c = ack_of(mb, b);
+        if ((int32_t)(c - m) < 0) m = c;
+    }
+    if ((int32_t)(m - mb->done_seq) > 0 && (int32_t)(m - mb->seq) <= 0) mb->done_seq = m;
+}
+
+static int64_t send_raw(hs_mailbox* mb, uint32_t opc, const uint32_t a[7]) {
+    if (!mb->dev) return -EINVAL;
+    if (mb->stop_sent) return -EBUSY; /* a stop is under way: finish it with hs_mailbox_stop */
+    if (mb->seq - mb->done_seq >= mb->slots) {
+        refresh_done(mb);
+        if (mb->seq - mb->done_seq >= mb->slots) return -EBUSY;
+    }
     uint32_t n = mb->seq + 1;
-    if (!n) return -EOVERFLOW;
-    if (!mb->running) { /* restart after a stop: queued leases are gone */
-        for (uint32_t b = 0; b < mb->batches; b++) {
-            fill_line(mb, OFF_STATE + 256 * b, n);
-            fill_line(mb, OFF_STATE + 256 * b + 64, ((n - 1) % mb->slots) * SLOT_BYTES);
-        }
-        mb->submitted = hs_mailbox_leases_done(mb, 0);
+    if (!mb->running) { /* restart: hs_mailbox_stop returned 0, so no lease is left from before it */
+        for (uint32_t b = 0; b < mb->batches; b++) fill_line(mb, OFF_STATE + 256 * b, 0);
+        mb->submitted = jobs_done(mb);
         mb->running = 1;
     }
-    uint32_t slot = OFF_SLOTS + ((n - 1) % mb->slots) * SLOT_BYTES;
+    uint32_t slot = OFF_SLOTS + ((n - 1) & (mb->slots - 1)) * SLOT_BYTES;
     fill_line(mb, slot, opc);
     for (int j = 0; j < 7; j++) fill_line(mb, slot + 64 * (1 + j), a ? a[j] : 0);
+    if (mb->yielding) ctl32(mb, OFF_M)[1] = 0, mb->yielding = 0;
     barrier();
+    present(mb);
+    int e = top_up(mb); /* before the request is published: a failure here sends nothing */
+    if (e) return e;
     ctl32(mb, OFF_M)[0] = n;
     barrier();
     mb->seq = n;
-    int e = top_up(mb);
-    return e ? e : (int64_t)n;
+    return (int64_t)n;
+}
+
+int64_t hs_mailbox_send(hs_mailbox* mb, uint32_t opc, const uint32_t a[7]) {
+    if (!mb->dev || !valid(mb, opc, a)) return -EINVAL;
+    return send_raw(mb, opc, a);
 }
 
 int hs_mailbox_wait(hs_mailbox* mb, uint32_t seq, uint64_t timeout_ns) {
-    uint64_t t0 = now_ns(), t;
+    if (!mb->dev || (int32_t)(seq - mb->seq) > 0) return -EINVAL; /* never sent */
+    uint64_t t0 = now_ns(), t = t0, t_partial = 0, t_check = t0;
     uint32_t lease0 = hs_mailbox_leases_done(mb, 0);
     for (uint32_t spin = 0;; spin++) {
-        uint32_t b = 0;
-        while (b < mb->batches && (int32_t)(ctl32(mb, OFF_ACK + 256 * b)[0] - seq) >= 0) b++;
-        if (b == mb->batches) break;
+        uint32_t acked = 0;
+        for (uint32_t b = 0; b < mb->batches; b++) acked += (int32_t)(ack_of(mb, b) - seq) >= 0;
+        if (acked == mb->batches) break;
         if ((spin & 63) == 63) {
+            t = now_ns();
+            present(mb);
             int e = top_up(mb);
             if (e) return e;
-            if ((t = now_ns()) - t0 > timeout_ns) return -ETIME;
+            /* Some batches served it and the rest have not started: measured
+             * beside a renderer, batches run one after another, and a batch
+             * polling for the next request holds the others back. */
+            if (!acked) t_partial = 0;
+            else if (!t_partial) t_partial = t;
+            else if (!mb->yielding && t - t_partial > STALL_NS) {
+                ctl32(mb, OFF_M)[1] = 1;
+                barrier();
+                mb->yielding = 1;
+                mb->stall_yields++;
+            }
+            if (t - t_check > LOST_CHECK_NS) { /* no job left but leases counted as queued: they were killed */
+                t_check = t;
+                if (!hs_v3d_bo_wait(mb->dev, &mb->ctl, 0)) {
+                    uint32_t d = jobs_done(mb);
+                    if (mb->submitted != d) mb->submitted = d, mb->lost_leases++;
+                    if ((e = top_up(mb))) return e;
+                }
+            }
+            if (t - t0 > timeout_ns) return -ETIME;
         }
     }
-    t = now_ns();
-    if (t - t0 > 20000) mb->waits_over_20us++;
+    if (mb->yielding) {
+        ctl32(mb, OFF_M)[1] = 0;
+        barrier();
+        mb->yielding = 0;
+    }
+    if (now_ns() - t0 > 20000) mb->waits_over_20us++;
     if (hs_mailbox_leases_done(mb, 0) != lease0) mb->handovers_seen++;
     if ((int32_t)(seq - mb->done_seq) > 0) mb->done_seq = seq;
     return 0;
@@ -436,43 +710,81 @@ static int call(hs_mailbox* mb, uint32_t opc, const uint32_t a[7]) {
 
 int hs_mailbox_echo(hs_mailbox* mb) { return call(mb, HS_MB_OP_ECHO, NULL); }
 
-int hs_mailbox_gather(hs_mailbox* mb, uint32_t idx_gpu, uint32_t table_gpu, uint32_t out_gpu, uint32_t elements,
-                      int table_changes) {
+int hs_mailbox_gather(hs_mailbox* mb, uint32_t idx_gpu, uint32_t table_gpu, uint32_t table_elements, uint32_t out_gpu,
+                      uint32_t elements, int table_changes) {
     uint32_t per = 16 * mb->batches;
-    if (elements % per || ((idx_gpu | table_gpu | out_gpu) & 3)) return -EINVAL;
-    uint32_t chunks = elements / per;
-    if ((uint64_t)chunks * (table_changes ? 3 : 2) + 4 > MAX_UNITS) return -EINVAL;
-    uint32_t a[7] = {chunks, idx_gpu, table_gpu, out_gpu, table_changes ? 1u : 0u, 0, 0};
+    if (!mb->dev || elements % per) return -EINVAL;
+    uint32_t a[7] = {elements / per, idx_gpu, table_gpu, out_gpu, table_changes ? 1u : 0u, table_elements, 0};
     return call(mb, HS_MB_OP_GATHER, a);
 }
 
 int hs_mailbox_chain(hs_mailbox* mb, uint32_t in_gpu, uint32_t out_gpu, uint32_t elements, uint32_t k, float c1,
                      float c0) {
     uint32_t per = 32 * mb->batches;
-    if (elements % per || k < 4 || k % 4 || k > 65536 || ((in_gpu | out_gpu) & 3)) return -EINVAL;
-    uint32_t pairs = elements / per;
-    if ((uint64_t)pairs * (k / 4 + 4) + 4 > MAX_UNITS) return -EINVAL;
+    if (!mb->dev || elements % per || k % 4) return -EINVAL;
     uint32_t c1b, c0b;
     memcpy(&c1b, &c1, 4);
     memcpy(&c0b, &c0, 4);
-    uint32_t a[7] = {pairs, in_gpu, 0, out_gpu, k / 4, c1b, c0b};
+    uint32_t a[7] = {elements / per, in_gpu, 0, out_gpu, k / 4, c1b, c0b};
     return call(mb, HS_MB_OP_CHAIN, a);
 }
 
 int hs_mailbox_stop(hs_mailbox* mb) {
-    if (!mb->running) return 0;
-    int e = call(mb, HS_MB_OP_STOP, NULL);
-    int w = hs_v3d_bo_wait(mb->dev, &mb->ctl, 5000000000ull);
+    if (!mb->dev || !mb->running) return 0;
+    const uint64_t tmo = 1000000000ull;
+    int e;
+    if (!mb->stop_acked) {
+        if (!mb->stop_sent) { /* a stop request is sent once: after it, leases end without polling */
+            if (mb->seq != mb->done_seq && (e = hs_mailbox_wait(mb, mb->seq, tmo))) return e;
+            int64_t n = send_raw(mb, HS_MB_OP_STOP, NULL);
+            if (n < 0) return (int)n;
+            mb->stop_sent = 1;
+            if (mb->test_stop_fail_once) { /* tests: as if the wait below had timed out */
+                mb->test_stop_fail_once = 0;
+                return -ETIME;
+            }
+        }
+        if ((e = hs_mailbox_wait(mb, mb->seq, tmo))) return e;
+        mb->stop_acked = 1;
+    }
+    if ((e = hs_v3d_bo_wait(mb->dev, &mb->ctl, 5000000000ull))) return e;
+    mb->stop_sent = mb->stop_acked = 0;
     mb->running = 0;
-    return e ? e : w;
+    return 0;
 }
 
 void hs_mailbox_free(hs_mailbox* mb) {
     if (mb->dev) {
         if (mb->running) hs_mailbox_stop(mb);
+        if (mb->wd_started) {
+            pthread_mutex_lock(&mb->wd_mu);
+            atomic_store(&mb->wd_quit, 1);
+            pthread_cond_signal(&mb->wd_cv);
+            pthread_mutex_unlock(&mb->wd_mu);
+            pthread_join(mb->wd_thread, NULL);
+            pthread_mutex_destroy(&mb->wd_mu);
+            pthread_cond_destroy(&mb->wd_cv);
+        }
+        if (mb->ctl.map) ctl32(mb, OFF_M)[1] = ctl32(mb, OFF_M)[3] = 1; /* leases a failed stop left: end now */
         hs_v3d_bo_free(mb->dev, &mb->code);
         hs_v3d_bo_free(mb->dev, &mb->unif);
         hs_v3d_bo_free(mb->dev, &mb->ctl);
     }
     memset(mb, 0, sizeof(*mb));
+}
+
+int hs_mailbox_test_seek(hs_mailbox* mb, uint32_t seq) {
+    if (!mb->dev || mb->running || hs_v3d_bo_wait(mb->dev, &mb->ctl, 0)) return -EBUSY;
+    for (uint32_t b = 0; b < mb->batches; b++) fill_line(mb, OFF_ACK + 256 * b, seq);
+    ctl32(mb, OFF_M)[0] = seq;
+    barrier();
+    mb->seq = mb->done_seq = seq;
+    return 0;
+}
+
+void hs_mailbox_test_count_lease(hs_mailbox* mb, uint32_t b) {
+    volatile uint32_t* w = ctl32(mb, OFF_STATE + 256 * b + 128);
+    uint32_t v = w[0] + 1;
+    for (int l = 0; l < 16; l++) w[l] = v;
+    barrier();
 }

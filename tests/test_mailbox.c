@@ -4,7 +4,7 @@
  *       latency, median per size: mailbox (warm leases), mailbox cold (a stop
  *       before each request: what one job with this program costs), the
  *       shipped gather as one job (hs_v3d_dispatch), the CPU (1 thread, and 4
- *       threads with a spinning pool; NEON FMA for the chain).
+ *       threads with a spinning pool; the fastest NEON chain found).
  * Run inside the GPU lock. Output: JSON lines; exit 1 on any wrong word.
  */
 #define _GNU_SOURCE
@@ -63,10 +63,10 @@ static void check(const char* what, uint32_t batches, uint32_t n, int bad, int r
 static void correctness(void) {
     uint32_t* T = (uint32_t*)bt.map;
     for (uint32_t i = 0; i < TABLE_N; i++) T[i] = i * 2654435761u ^ 0x5A5A5A5Au;
-    uint32_t bos[5] = {bt.handle, bi.handle, bo.handle, bx.handle, by.handle};
+    const hs_v3d_bo* bos[5] = {&bt, &bi, &bo, &bx, &by};
     for (uint32_t batches = 1; batches <= 8; batches += 7) {
         hs_mailbox mb;
-        hs_mailbox_cfg cfg = {batches, 0, 0, 0, bos, 5};
+        hs_mailbox_cfg cfg = {.batches = batches, .bos = bos, .nbos = 5};
         int e = hs_mailbox_start(&mb, &dev, &cfg);
         if (e) die("hs_mailbox_start", e);
         /* echo */
@@ -77,7 +77,7 @@ static void correctness(void) {
         static const uint32_t sizes[] = {128, 1024, 8192, 65536};
         for (int s = 0; s < 4; s++) {
             uint32_t n = sizes[s];
-            if (n % (16 * batches)) continue;
+            if (n % (16 * batches) || n > 16 * batches * HS_MB_MAX_GATHER_CHUNKS) continue;
             int bad = 0;
             for (int rep = 0; rep < 20; rep++) {
                 uint32_t* ix = (uint32_t*)bi.map;
@@ -86,7 +86,7 @@ static void correctness(void) {
                     ix[i] = rnd() % TABLE_N;
                     out[i] = 0xDEADBEEF;
                 }
-                rc = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, bo.gpu, n, 0);
+                rc = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, TABLE_N, bo.gpu, n, 0);
                 if (rc) break;
                 for (uint32_t i = 0; i < n; i++) bad += out[i] != T[ix[i]];
             }
@@ -99,7 +99,7 @@ static void correctness(void) {
             for (int rep = 0; rep < 20 && !rc; rep++) {
                 for (uint32_t i = 0; i < n; i++) ix[i] = i * 7 % 4096; /* a small, hot region */
                 for (uint32_t i = 0; i < 4096; i++) T[i] = rnd();
-                rc = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, bo.gpu, n, 1);
+                rc = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, TABLE_N, bo.gpu, n, 1);
                 for (uint32_t i = 0; i < n; i++) bad += out[i] != T[ix[i]];
             }
             check("gather x20, table rewritten each time, table_changes=1", batches, n, bad, rc);
@@ -141,7 +141,7 @@ static void correctness(void) {
         uint32_t* out = (uint32_t*)bo.map;
         int bad = 0;
         for (uint32_t i = 0; i < 1024; i++) ix[i] = rnd() % TABLE_N;
-        int rc3 = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, bo.gpu, 1024, 0);
+        int rc3 = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, TABLE_N, bo.gpu, 1024, 0);
         for (uint32_t i = 0; i < 1024; i++) bad += out[i] != T[ix[i]];
         check("stop, then echo and gather", batches, 1024, bad, rc ? rc : rc2 ? rc2 : rc3);
         /* across lease hand-overs: 3 s of spaced requests */
@@ -153,7 +153,7 @@ static void correctness(void) {
             rc = 0;
             while (now_ns() < t_end && !rc) {
                 for (uint32_t i = 0; i < 256; i++) ix[i] = rnd() % TABLE_N;
-                rc = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, bo.gpu, 256 - 256 % (16 * batches), 0);
+                rc = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, TABLE_N, bo.gpu, 256 - 256 % (16 * batches), 0);
                 for (uint32_t i = 0; i < 256 - 256 % (16 * batches); i++) bad += out[i] != T[ix[i]];
                 reqs++;
                 uint64_t g = now_ns() + 200000;
@@ -167,9 +167,9 @@ static void correctness(void) {
             if (bad || rc || leases < 10) failures++;
         }
         /* argument refusals */
-        int r1 = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, bo.gpu, 8, 0);
+        int r1 = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, TABLE_N, bo.gpu, 8, 0);
         int r2 = hs_mailbox_chain(&mb, bx.gpu, by.gpu, 4096, 6, 1.f, 0.f);
-        int r3 = hs_mailbox_gather(&mb, bi.gpu + 2, bt.gpu, bo.gpu, 1024, 0);
+        int r3 = hs_mailbox_gather(&mb, bi.gpu + 2, bt.gpu, TABLE_N, bo.gpu, 1024, 0);
         check("refuses bad sizes/alignment", batches, 0, !(r1 == -EINVAL && r2 == -EINVAL && r3 == -EINVAL), 0);
         hs_mailbox_free(&mb);
     }
@@ -179,13 +179,18 @@ static void correctness(void) {
 static void cpu_gather(const uint32_t* T, const uint32_t* ix, uint32_t* out, uint32_t a, uint32_t b) {
     for (uint32_t i = a; i < b; i++) out[i] = T[ix[i]];
 }
-static void cpu_chain_neon(const float* x, float* y, uint32_t a, uint32_t b, uint32_t k, float c1, float c0) {
+/* The fastest CPU chain found (tools/p0_5_chain_cpu): multiply and add kept
+ * separate, 8 vectors. The fused form (vfmaq) is slower on the Cortex-A72
+ * (5.1 against 7.2 GFLOPS per core) and rounds differently from the GPU. */
+__attribute__((noinline)) static void cpu_chain_neon(const float* x, float* y, uint32_t a, uint32_t b, uint32_t k,
+                                                     float c1, float c0) {
     float32x4_t vc1 = vdupq_n_f32(c1), vc0 = vdupq_n_f32(c0);
     for (uint32_t i = a; i < b; i += 32) {
         float32x4_t v[8];
         for (int j = 0; j < 8; j++) v[j] = vld1q_f32(x + i + 4 * j);
-        for (uint32_t t = 0; t < k; t++)
-            for (int j = 0; j < 8; j++) v[j] = vfmaq_f32(vc0, v[j], vc1);
+        for (uint32_t t = 0; t < k; t++) {
+            _Pragma("GCC unroll 8") for (int j = 0; j < 8; j++) v[j] = vaddq_f32(vmulq_f32(v[j], vc1), vc0);
+        }
         for (int j = 0; j < 8; j++) vst1q_f32(y + i + 4 * j, v[j]);
     }
 }
@@ -258,7 +263,7 @@ static void bench(int rounds) {
     memcpy(cT, T, TABLE_N * 4);
     memcpy(cI, ix, MAXE * 4);
     for (uint32_t i = 0; i < MAXE; i++) cx[i] = ((float*)bx.map)[i] = (float)(i % 1000) / 1000.f;
-    uint32_t bos[5] = {bt.handle, bi.handle, bo.handle, bx.handle, by.handle};
+    const hs_v3d_bo* bos[5] = {&bt, &bi, &bo, &bx, &by};
     /* the shipped gather as one job */
     hs_v3d_bo code, unif;
     if (hs_v3d_bo_new(&dev, &code, 64 << 10) || hs_v3d_bo_new(&dev, &unif, 4096)) die("bo", EIO);
@@ -278,7 +283,7 @@ static void bench(int rounds) {
     for (int round = 0; round < rounds; round++) {
         for (uint32_t batches = 1; batches <= 8; batches += 7) {
             hs_mailbox mb;
-            hs_mailbox_cfg cfg = {batches, 0, 0, 0, bos, 5};
+            hs_mailbox_cfg cfg = {.batches = batches, .bos = bos, .nbos = 5};
             if (hs_mailbox_start(&mb, &dev, &cfg)) die("start", EIO);
             double v[REPS];
             for (int i = 0; i < REPS; i++) {
@@ -290,11 +295,11 @@ static void bench(int rounds) {
                    med(v, REPS));
             for (int s = 0; s < 5; s++) {
                 uint32_t n = gsz[s];
-                if (n % (16 * batches) || (uint64_t)(n / (16 * batches)) * 2 + 4 > 65536) continue;
+                if (n % (16 * batches) || n > 16 * batches * HS_MB_MAX_GATHER_CHUNKS) continue;
                 double w[REPS], c[REPS];
                 for (int i = 0; i < REPS; i++) {
                     uint64_t a = now_ns();
-                    int rc = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, bo.gpu, n, 0);
+                    int rc = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, TABLE_N, bo.gpu, n, 0);
                     w[i] = (now_ns() - a) / 1e3;
                     if (rc) die("gather", rc);
                 }
@@ -303,7 +308,7 @@ static void bench(int rounds) {
                 for (int i = 0; i < 21; i++) {
                     hs_mailbox_stop(&mb);
                     uint64_t a = now_ns();
-                    hs_mailbox_gather(&mb, bi.gpu, bt.gpu, bo.gpu, n, 0);
+                    hs_mailbox_gather(&mb, bi.gpu, bt.gpu, TABLE_N, bo.gpu, n, 0);
                     c[i] = (now_ns() - a) / 1e3;
                 }
                 printf("{\"bench\":\"gather\",\"round\":%d,\"batches\":%u,\"elements\":%u,\"mailbox_us\":%.2f,"
@@ -382,9 +387,15 @@ static void bench(int rounds) {
                     w4[i] = (now_ns() - a) / 1e3;
                 }
                 double m1 = med(w1, reps), m4 = med(w4, reps);
+                int bad = 0;
+                for (uint32_t i = 0; i < n; i += n / 64) {
+                    float r = chain_ref(cx[i], k, 0.999f, 0.001f);
+                    bad += memcmp(&r, &cy[i], 4) != 0;
+                }
                 printf("{\"bench\":\"chain_cpu\",\"round\":%d,\"elements\":%u,\"k\":%u,\"cpu1_us\":%.2f,\"cpu4_us\":%.2f,"
-                       "\"cpu4_gflops\":%.2f}\n",
-                       round, n, k, m1, m4, 2.0 * n * k / (m4 * 1e3));
+                       "\"cpu4_gflops\":%.2f,\"wrong\":%d}\n",
+                       round, n, k, m1, m4, 2.0 * n * k / (m4 * 1e3), bad);
+                if (bad) failures++;
             }
     }
 }

@@ -228,8 +228,9 @@ using kernel UAPI headers only:
 - dispatch a compute job.
 
 The dispatch accepts only 1 or 8 batches. That is the measured
-configuration: workgroup counts 1, workgroup size 16, 16 per supergroup,
-CFG4 = batches − 1.
+configuration: workgroup counts batches × 1 × 1 (1 × 1 × 1 until
+2026-11-17; see the batch-number correction below), workgroup size 16,
+16 per supergroup, CFG4 = batches − 1.
 
 `src/hs_qpu_kernels.c` holds the programs NeoGPU ships, built with hs_qpu:
 - `hs_qpu_kernel_gather`: 1 or 8 batches, with 1, 2, 4 or 8 loads in flight.
@@ -337,8 +338,14 @@ variant 5, same harness:
   runs.
 - The perfmon counter named "cache hit" counts memory transactions; the AXI
   byte counters (40, 41) are the reliable measure of traffic.
-- This kernel's `(tidx >> 2) & 15` batch index is not 0..B−1 for 2 or 4
-  batches, which is why hs_v3d accepts only the measured 1 and 8.
+- Corrected 2026-11-17 (HARDWARE_HANDOFF_P0.md, P0-5): until then this
+  kernel took its batch number from the QPU thread index,
+  `(tidx >> 2) & 15`. That is only one value per batch while nothing else
+  uses the GPU. Beside a renderer the 8-batch gather wrote wrong words in
+  3,273 of 3,279 jobs. The kernel now reads the number the hardware presets
+  in `rf0` (the workgroup x, with workgroup counts batches × 1 × 1): every
+  batch got its own number in 79,177 of 79,177 jobs beside the renderer.
+  hs_v3d still accepts only the measured 1 and 8 batches.
 - "Whole 256-byte lines at k ≥ 4" assumes idx and out are 256-byte aligned.
   BO addresses are page-aligned; an offset into a BO is the caller's to
   align.

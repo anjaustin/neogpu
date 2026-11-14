@@ -275,10 +275,15 @@ tools/tmuop_probe: tools/tmuop_probe.c src/hs_qpu.o src/hs_v3d.o
 # hs_mailbox on the GPU: correctness (default) or `bench` (run inside the GPU lock).
 # -ffp-contract=off keeps the CPU reference of the chain op unfused, as the GPU computes it.
 tests/test_mailbox: tests/test_mailbox.c src/hs_mailbox.o src/hs_qpu.o src/hs_qpu_kernels.o src/hs_v3d.o include/hs_mailbox.h
-	$(CC) -O2 -Wall -Wextra -ffp-contract=off -march=armv8-a+simd -Iinclude $< src/hs_mailbox.o src/hs_qpu.o src/hs_qpu_kernels.o src/hs_v3d.o -lpthread -o $@
+	$(CC) -O3 -mcpu=cortex-a72 -Wall -Wextra -ffp-contract=off -Iinclude $< src/hs_mailbox.o src/hs_qpu.o src/hs_qpu_kernels.o src/hs_v3d.o -lpthread -o $@
+tests/redteam-p0-5/rt_mailbox: tests/redteam-p0-5/rt_mailbox.c src/hs_mailbox.o src/hs_qpu.o src/hs_qpu_kernels.o src/hs_v3d.o include/hs_mailbox.h
+	$(CC) -O2 -Wall -Wextra -ffp-contract=off -Iinclude $< src/hs_mailbox.o src/hs_qpu.o src/hs_qpu_kernels.o src/hs_v3d.o -lpthread -o $@
 src/hs_mailbox.o: src/hs_mailbox.c include/hs_mailbox.h include/hs_qpu.h include/hs_v3d.h
 	$(CC) -O2 -Wall -Wextra -Iinclude -c $< -o $@
 tools/p0_5_mailbox_probe: tools/p0_5_mailbox_probe.c src/hs_qpu.o src/hs_v3d.o
+	$(CC) -O2 -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_v3d.o -o $@
+# what identifies a compute batch: thread index against the preset registers (P0-5 red team)
+tools/p0_5_batch_id_probe: tools/p0_5_batch_id_probe.c src/hs_qpu.o src/hs_v3d.o
 	$(CC) -O2 -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_v3d.o -o $@
 # the fastest CPU chain found, to compare hs_mailbox against
 tools/p0_5_chain_cpu: tools/p0_5_chain_cpu.c
@@ -415,8 +420,8 @@ clean:
 	rm -f tests/test_evdev
 	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/test_present_scaled tests/p0_3_plane_inventory tests/p0_3_hvs_probe tests/p0_3_writeback_check tests/redteam-p0-3/fail_atomic.so tests/redteam-p0-3/memstress tests/redteam-p0-3/rt_scaled tests/redteam-p0-3/rt_wb_edge tests/panel_mode_probe tests/test_text_render
 	rm -f tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe tests/present_cost_probe tests/p0_1_redteam_probe tests/p0_1_redteam2_newest tests/redteam-hold-cutoff/probe tests/redteam-hold-cutoff/gate_mut tests/redteam-hold-cutoff/gate_mut2 tests/redteam-hold-cutoff/gate_mut2.c tests/redteam-hold-cutoff/gate_orig neogpu_kworker_rt
-	rm -f $(HWPROBES) tools/gather_anom tools/tmuop_probe tools/p0_5_mailbox_probe tools/p0_5_mailbox_work tools/p0_5_chain_cpu tests/test_mailbox src/hs_mailbox.o tools/bench_vs_mesa tests/test_qpu_encode tests/test_v3d_compute tests/test_v3d_runtime
-	rm -rf build/qpu
+	rm -f $(HWPROBES) tools/gather_anom tools/tmuop_probe tools/p0_5_mailbox_probe tools/p0_5_mailbox_work tools/p0_5_chain_cpu tools/p0_5_batch_id_probe tests/test_mailbox tests/redteam-p0-5/rt_mailbox src/hs_mailbox.o tools/bench_vs_mesa tests/test_qpu_encode tests/test_v3d_compute tests/test_v3d_runtime
+	rm -rf build/qpu tests/redteam-p0-5/mutants
 	rm -f bench_legacy tests/test_headless_scalar
 	rm -f tests/test_tool_sanitize tests/test_tool_tsan
 	rm -f $(HS_OBJ) $(HS_DEPS) $(HS_TARGET) tests/*.o tests/test_01_clear tests/test_02_triangle tests/test_03_instancing tests/test_04_blending tests/test_05_cube3d tests/test_06_raycast tests/test_07_message_triangle tests/test_08_raycast_orbit neogpu_tool neogpu_pong neogpu_pong_ai neogpu_capture_demo neogpu_procgame

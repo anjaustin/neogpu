@@ -116,7 +116,7 @@ int hs_v3d_dispatch(hs_v3d* dev, const hs_v3d_dispatch_desc* d) {
     const uint32_t wg_size = 16, wgs_per_sg = 16;
     struct drm_v3d_submit_csd s;
     memset(&s, 0, sizeof(s));
-    s.cfg[0] = 1u << 16; /* workgroup counts x, y, z: 1 */
+    s.cfg[0] = d->batches << 16; /* workgroup counts: x = batches (rf0 presets the batch number), y = z = 1 */
     s.cfg[1] = 1u << 16;
     s.cfg[2] = 1u << 16;
     /* the supergroup field is 4 bits, 16 encoded as 0 (masked as Mesa does;

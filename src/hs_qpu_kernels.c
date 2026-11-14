@@ -35,14 +35,12 @@ int hs_qpu_kernel_gather(hs_qpu_prog* p, int batches, int k) {
     if ((batches != 1 && batches != 8) || (k != 1 && k != 2 && k != 4 && k != 8)) return HS_QPU_E_OPERAND;
     /* rf0 passes, rf1 idx address, rf2 table, rf3 out; rf4 stride, rf5 batch,
      * rf6 per-pass skip */
+    /* The batch number is what the hardware presets in rf0 (workgroup x, see
+     * hs_v3d_dispatch), read before the uniforms overwrite rf0. Not the QPU
+     * thread index: that repeats between batches when the GPU is shared. */
+    if (batches != 1) emit(p, hs_qpu_a(HS_QPU_A_BAND, RF(5), RF(0), I(15)));
     for (int i = 0; i < 4; i++) ldunifrf(p, i);
-    if (batches == 1) {
-        emit(p, hs_qpu_a(HS_QPU_A_MOV, RF(5), I(0), X));
-    } else {
-        emit(p, hs_qpu_a(HS_QPU_A_TIDX, R(0), X, X));
-        emit(p, hs_qpu_a(HS_QPU_A_SHR, R(0), R(0), I(2)));
-        emit(p, hs_qpu_a(HS_QPU_A_BAND, RF(5), R(0), I(15)));
-    }
+    if (batches == 1) emit(p, hs_qpu_a(HS_QPU_A_MOV, RF(5), I(0), X));
     /* Layout: in pass q, batch b's load i reads
      *   base + (q * batches + b) * 64k + 64i + 4 * lane,
      * so each batch owns a contiguous 64k-byte run per pass. With k >= 4 it
