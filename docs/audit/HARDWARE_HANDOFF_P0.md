@@ -26,7 +26,7 @@ So the gains lie in hardware blocks that NeoGPU does not use yet.
 | P0-2 | One draw plus one `glBufferData` per glyph (`hs_text.c`) | One instanced draw, with quads built by the GPU's vertex stage | **Measured (P0-1 red team):** about 16 µs of CPU per draw with this pattern. 100 draws give 614 FPS with the GPU 13% busy, so text-heavy frames are CPU-bound | Next |
 | P0-3 | The GPU renders every layer at full panel resolution into one plane | HVS planes: static layers composed at scanout, and upscaling from a lower render resolution | 0.68 ns per pixel of fill, measured (COST_BREAKDOWN §8). Unknown: HVS blend and scale cost | **Shelved 2026-11-16.** Watched on the panel, the scaled image looked progressively more pixelated, not like a native render: a quality trade, not a speed-up. `hs_graphics_init_scaled` is out of the public API (behind `HS_GRAPHICS_SHELVED_SCALED`, kept for the tests). Kept: the plane-reset fix, the layer measurements and the tests. Reconstruction upscaling (adaptive edge refinement, temporal) was proposed and is shelved too. Before shelving: **Scaling made (opt-in):** `hs_graphics_init_scaled` renders at a reduced size and the HVS scales it at scanout. test_08 runs 1.76× faster at 600×360 and 3.9× at 400×240, on the panel. HVS composition and scaling cost no frame time on this panel (they do use memory bandwidth). Layers and sprites: measured capable, not built (no current user with a GPU cost to save). **Red team found and fixed:** takeover (native too) inherited a previous client's plane alpha, filter and blend mode, and native takeover left stray overlays on. The test now kills 14 of 14 mutants |
 | P0-4 | Capture: `glReadPixels`, then a CPU swizzle and flip, then a write | The writeback connector (the frame actually scanned out); the H.264 encoder for recording | Unknown: current cost | Not started |
-| P0-5 | Each GPU message is a job (~37 µs floor) | A persistent QPU mailbox | 0.76 µs RTT, 110–138× Mesa (VS_MESA.md) | Not started |
+| P0-5 | Each GPU message is a job (~37 µs floor) | A persistent QPU mailbox | 0.76 µs RTT, 110–138× Mesa (VS_MESA.md) | **Built and measured; not red-teamed, not committed as shipped (2026-11-16).** `hs_mailbox` passes its 26 checks on 1 and 8 batches. Messages cost 1.4–3.1 µs, against 64–71 µs for a job. **It wins in one regime:** arithmetic-deep work (4,096 steps per element) runs 1.24–1.31× faster than all 4 CPU cores, bit-exact. For gathers and for shallow arithmetic the CPU wins at every size tested. Costs: a resident poller takes 3.4–3.6% from a Mesa renderer, and a lease is not bounded in time under contention |
 | P0-6 | Mesa's start-up (`gbm_create_device` 79.5 ms) | A direct V3D compute → KMS scanout path for scenes compute can render | Direct cold start 0.47 ms, measured. Unknown: sharing a v3d BO with vc4 | Not started |
 | P0-7 | Texture uploads | The TFU (raster to tiled, mipmaps) | No streaming-texture user today | Not started |
 
@@ -521,3 +521,167 @@ full-resolution HUD over a scaled scene.
 - Kernel-worker CPU for atomic commits.
 - What the DSI panel shows after the HVS (writeback reaches only CRTC 0).
 - `hs_backend_gles` has no way to request a scaled render size yet.
+
+## P0-5: persistent QPU mailbox (built, wins on deep arithmetic only)
+
+Probe: `tools/p0_5_mailbox_probe.c` (`make tools/p0_5_mailbox_probe`). Raw
+outputs on the Pi: `tests/evidence-p0-5-20261116/`. The probe runs a resident
+QPU program as a chain of "leases": each is one CSD job that polls a sequence
+word with TMU op 2, sums a payload read from a ring, publishes the result with
+op 2, and ends after a poll budget or a message cap, well under the ~1 s job
+reset. The next lease is already queued and starts from the state the
+previous one stored. Every payload is checked in all 16 lanes.
+
+**Payload coherence: the GPU fetches 256-byte blocks.** A ring slot the GPU
+has not read during this lease is seen correctly with a plain load, but only
+when slots are 256 bytes:
+
+| slot size | wrong payloads (of 1000) |
+|---|---|
+| 64 B | 749 |
+| 128 B | 499 |
+| 256 B | 0 |
+| 512 B | 0 |
+| 64 B, op 2 before each load | 0 |
+
+Reading one slot pulls its 256-byte block into the GPU's cache, so the next
+slots in that block are stale when their messages arrive. Two correct
+recipes: fresh 256-byte slots with plain loads (no slot reused within a
+lease), or op 2 on each word before loading it.
+
+**Alone on the GPU (10 s runs, 7.3 M messages, 0 lost, 0 wrong, 0 resets):**
+
+| recipe | RTT p50 | p99 | p99.9 | rate |
+|---|---|---|---|---|
+| 64-word payload, fresh 256 B slots | 1.50 µs | 1.83 µs | 6.24 µs | 332 k/s |
+| 16-word payload, op 2 reload | 1.37 µs | 1.67 µs | 6.26 µs | 430 k/s |
+
+- A lease of 300,000 polls lasts ~95 ms.
+- **Lease hand-over:** a message that arrives between leases waits for one to
+  end and the next to start: 52–182 µs, about once every 100 ms. Nearly
+  every message over 20 µs crossed a hand-over (810 of 989, 974 of 1081).
+- For comparison, a job round trip is 22–75 µs on NeoGPU's direct path and
+  83.9–105.1 µs on Mesa (VS_MESA.md).
+
+**Beside a Mesa renderer** (`test_08` offscreen at 800×480, GPU-bound;
+baseline 110.7 FPS in every round):
+
+| poller | test_08 FPS | mailbox p50 | p99 | lease | resets |
+|---|---|---|---|---|---|
+| none | 110.7 | | | | |
+| idle leases, no messages (2 rounds) | 106.7 | | | ~290 ms | 0 |
+| polls back to back, messages every 100 µs (2 rounds) | 106.9 | 17.4 µs | 36.3 µs | | 0 |
+| ~1 µs ALU wait between polls | 106.8 | 14.0 µs | 36.1 µs | 87 ms | 0 |
+| ~1 µs wait with a thread switch per step | 109.9 | 38.7 µs | 179 µs | 283 ms | 0 |
+| ~10 µs ALU wait | 100.6 | 22.7 µs | 46.3 µs | 64 ms | 0 |
+| ~10 µs wait with thread switches | 110.4 | 46.8 µs | 1162 µs | 1300 ms | **2**, 1 message lost |
+
+What this means:
+- A resident poller costs a GPU-bound renderer 3.4–3.6%.
+- While Mesa keeps the GPU busy, the mailbox's latency rises ~12×, to
+  14–18 µs median. That is still below a job round trip, but far from 1.5 µs:
+  the poller only runs when the renderer's shader threads yield.
+- Thread switches in the wait give the renderer its time back, but they
+  starve the poller. Its lease grew past the ~1 s reset and the GPU was
+  reset twice (207 total now, from 205). **A lease bounded by a poll count
+  is not bounded in time under contention.** A shipped mailbox must keep
+  every lease far under the reset under the worst contention it can meet,
+  or have a time bound measured to hold.
+
+### Does a message that triggers work beat the CPU and a GPU job?
+
+`tools/p0_5_mailbox_work.c` runs the same gather three ways, 200 trials per
+size, every output word checked (0 wrong, 0 lost, 0 resets in every row;
+`work.jsonl`, `work2.jsonl`):
+- **cpu:** one Cortex-A72 core, data in ordinary memory;
+- **job:** `hs_qpu_kernel_gather` through `hs_v3d_dispatch` and a wait
+  (8 batches, k = 8 from 1024 elements; 1 batch, k = 1 below), data already
+  in the BO;
+- **mailbox:** a message to a resident lease (1 batch, k = 1) that gathers
+  and publishes each output line with op 2, data already in the BO.
+
+Median time in µs:
+
+| elements | sequential idx, 64 MiB table: cpu / job / mailbox | random idx, 512 KiB: cpu / job / mailbox | random idx, 64 MiB: cpu / job / mailbox |
+|---|---|---|---|
+| 16 | 0.20 / 71.0 / 2.11 | 0.56 / 70.8 / 2.39 | 0.56 / 71.2 / 2.57 |
+| 64 | 0.32 / 71.2 / 3.20 | 1.30 / 71.7 / 4.43 | 2.04 / 69.9 / 5.57 |
+| 256 | 0.67 / 69.7 / 8.26 | 1.91 / 78.8 / 13.2 | 6.63 / 82.9 / 18.5 |
+| 1,024 | 2.15 / 63.7 / 28.4 | 5.22 / 87.4 / 48.2 | 28.1 / 102 / 69.4 |
+| 4,096 | 5.91 / 67.8 / 110 | 21.7 / 130 / 190 | 116 / 210 / 276 |
+| 16,384 | 20.7 / 88.6 / 435 | 100 / 313 / 755 | 521 / 660 / 1102 |
+| 65,536 | 89.2 / 195 / 1734 | 445 / 1001 / 3012 | 2250 / 2281 / 4409 |
+
+Sequential indices into a 512 KiB table matched the 64 MiB column within 10%.
+A reduction (per-lane sums, a 16-word result, indices written before the
+leases, so no reloads and no output to publish) took 1.69 µs at 16 elements
+and 2313 µs at 65,536, against 0.63 and 408 µs on the CPU.
+
+What this means:
+- **The mailbox beats a job on small messages:** 27–34× at 16 elements, and
+  still ahead at 1,024. A job costs 64–71 µs before it does any work.
+- **The CPU beats both at every size here.** At these sizes the data sits in
+  the CPU's caches. The mailbox's 1.4 µs round trip alone is more than the
+  CPU needs for 256 sequential elements.
+- **A faster mailbox kernel would not change that.** The job runs the
+  shipped kernel at 8 batches and k = 8. Between 16,384 and 65,536 elements
+  it costs 2.2 ns per element on sequential indices, against the CPU's
+  1.4 ns, and 33 ns against 35 ns on random indices into 64 MiB. A mailbox
+  can save the job's fixed cost, not its per-element cost.
+- The GPU's measured gather win (612.8 against 245.2 M/s, VS_MESA.md) is at
+  64 MiB of sequential traffic, where a job's fixed cost is 1% of the run.
+
+**For gathers the mailbox does not beat the CPU at any size.**
+
+### Arithmetic: `hs_mailbox` on 8 batches against 4 CPU cores
+
+`include/hs_mailbox.h`, `src/hs_mailbox.c` and `tests/test_mailbox.c` are a
+library form of the lease chain: 1 or 8 batches, echo, gather, a float
+"chain" op (y = x; k times: y = y · c1 + c0) and a stop message. The
+leases drain when the caller stops sending, so an unused mailbox costs a
+renderer nothing. `tests/test_mailbox` passes 26 checks with 0 wrong words,
+the chain bit-exact against the CPU (`test_mailbox_3_verify.jsonl`,
+`test_mailbox_4_rerun.jsonl`).
+
+The CPU side is `tools/p0_5_chain_cpu.c`: NEON, 8–24 vectors held in
+registers, 1 and 4 cores (a spinning pool), fused and unfused, every output
+checked. The fastest was the unfused multiply and add (the same arithmetic
+as the GPU): 7.2 GFLOPS on one core and 28.7 on four, flat from 8 to 16
+vectors. The fused form reached 5.1 and 20.4: GCC wraps each `fmla` in two
+register copies. An earlier baseline in `tests/test_mailbox bench` (fused,
+`-O2`) reached only 17.6 on four cores, so its figures are not used here.
+
+Median time in µs (mailbox: `bench_2_rerun.jsonl`, 3 rounds; CPU:
+`chain_cpu_nofuse.jsonl`, 21 reps; 0 resets):
+
+| elements × steps | mailbox, 8 batches | CPU, 4 cores | CPU, 1 core | mailbox vs 4 cores |
+|---|---|---|---|---|
+| 256 × 16 | 4.67 | 0.78 | 1.30 | 0.17× |
+| 256 × 256 | 7.82 | 5.09 | 18.4 | 0.65× |
+| 256 × 4,096 | 59.1 | 73.4 | 291 | **1.24×** |
+| 4,096 × 16 | 21.1 | 5.37 | 19.5 | 0.25× |
+| 4,096 × 256 | 70.8 | 73.8 | 293 | 1.04× |
+| 4,096 × 4,096 | 890 | 1170 | 4683 | **1.31×** |
+| 65,536 × 16 | 295 | 78.2 | 311 | 0.27× |
+| 65,536 × 256 | 1096 | 1180 | 4720 | 1.08× |
+
+- The GPU peaks at 37.7 GFLOPS (8 batches) against the CPU's 28.7 (4 cores).
+- The mailbox needs deep work to get there: at 16 steps per element it does
+  1.8–7.1 GFLOPS, because each 32-element block pays its loads, its store
+  and its publish.
+- The mailbox's caller spins one core while it waits; the CPU figure uses
+  all four.
+- An echo costs 1.93 µs on 1 batch and 3.07 µs on 8.
+
+**Where this leaves P0-5:**
+- The mailbox is a real GPU arithmetic path at microsecond latency, worth
+  1.2–1.3× all four CPU cores on deep per-element arithmetic and nothing on
+  gathers or shallow work.
+- It has not been red-teamed. Known open points: a lease is bounded by a
+  poll count, not by time (see the 2 resets above), a long request has no
+  bound against the ~1 s reset that was measured here, and the coexistence
+  figures are for the probe, not for `hs_mailbox` on 8 batches.
+- Nothing in NeoGPU calls it yet.
+
+Not measured: a job-based chain kernel (no such kernel exists), any renderer
+other than `test_08`, and CPU code hand-written in assembly.

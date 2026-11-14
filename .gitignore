@@ -94,4 +94,8 @@ neogpu_kworker_rt
 /tools/hwprobe_mailbox
 /tools/gather_anom
 /tools/tmuop_probe
+/tools/p0_5_mailbox_probe
+/tools/p0_5_mailbox_work
+/tools/p0_5_chain_cpu
+/tests/test_mailbox
 /tools/bench_vs_mesa
