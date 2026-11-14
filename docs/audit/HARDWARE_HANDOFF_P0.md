@@ -1248,3 +1248,51 @@ comparison used).
 - Displayed output. Everything here is offscreen or `test_08`'s frame rate;
   no cancelled frame was looked at on the panel.
 - The mailbox with a real NeoGPU workload: nothing calls it yet.
+
+### Can the message be the arithmetic? (P0-5), 2026-11-17
+
+Evidence: `tests/evidence-p0-5-inline-20261117/`. `tools/p0_5_inline_probe`
+is a resident program like the mailbox's, in which the request block holds
+the operands (32 per batch, read once with plain loads) and the
+acknowledgement block holds the results (published with op 2 beside the
+sequence number). No buffers are pointed at. It is a probe, alone on the
+GPU: no yield words, stop flag, watchdog or thread switches in its loop.
+The work is the chain (k steps of y = y * c1 + c0), bit-exact in every
+checked message (32 of 2,000 per row, 0 wrong).
+
+Round trip as the caller sees it, median of 2,000, in µs. "Mailbox" is
+`hs_mailbox_chain` with one pair per batch and the caller copying its
+operands in and its results out, as the inline form does by construction
+(mean; `mailbox_chain_one_pair.txt`):
+
+| 1 batch, 32 elements | k = 4 | 16 | 64 | 256 | 1,024 | 4,096 |
+|---|---|---|---|---|---|---|
+| inline message | 2.24 | 2.39 | 3.04 | 5.59 | 15.83 | 56.80 |
+| mailbox chain, caller copies | 3.27 | 3.32 | 4.14 | 6.70 | 17.45 | 60.57 |
+| one CPU core | 0.09 | 0.20 | 0.63 | 2.35 | 9.17 | 36.48 |
+
+| 8 batches, 256 elements | k = 4 | 16 | 64 | 256 | 1,024 | 4,096 |
+|---|---|---|---|---|---|---|
+| inline message | 4.93 | 5.11 | 5.80 | 8.35 | 18.61 | 59.56 |
+| mailbox chain, caller copies | 6.89 | 7.10 | 7.87 | 10.38 | 21.15 | 65.05 |
+| mailbox chain, buffers left in place | 4.97 | 5.15 | 5.88 | 8.39 | 19.27 | 63.20 |
+| one CPU core | 0.41 | 1.26 | 4.76 | 18.41 | 73.04 | 291.50 |
+| four CPU cores (`final_bench.txt`) | | 0.81 | | 5.04 | | 73.33 |
+
+- **It works, and it saves a fixed amount:** 1.0–1.1 µs per request on 1
+  batch and 2.0 µs on 8 (up to 3.8 µs at k = 4,096, where the mailbox's
+  chain also pays for its thread switches and the probe has none). That is
+  about 30 % of a small request and 6–8 % of a deep one.
+- **An inline message with no arithmetic costs 2.26 µs on 1 batch and
+  5.0 µs on 8**, against 2.1 and 3.2 µs for an empty mailbox message: on 8
+  batches the caller writes 304 words and reads 256 back through uncached
+  memory, 1.8 µs.
+- **It does not change who wins.** On 1 batch one CPU core is faster at
+  every k measured. On 8 batches both forms lose to one core at k = 64 and
+  beat it at k = 256; against four cores both lose at k = 256 and win at
+  k = 4,096 (1.23× inline, 1.13× mailbox with copies).
+- A caller that can leave its data in GPU buffers (the third row) already
+  gets the inline form's cost from the existing chain request.
+- Not built into `hs_mailbox`: a slot holds 8 lines, and 8 batches need 19
+  (the probe uses 2,048-byte blocks). Not measured beside a renderer, and
+  the op-carrying TMU writes (atomic add and the like) were not tried.

@@ -933,6 +933,9 @@ static void chainload(uint32_t batches, double seconds, uint32_t pairs, uint32_t
     start(&mb, batches, 0, 0);
     uint32_t n = 32 * batches * pairs;
     int rc = 0, bad = 0;
+    int copy = !!getenv("RT_COPY");
+    static float cx[MAXE], cy[MAXE];
+    for (uint32_t i = 0; i < n && i < MAXE; i++) cx[i] = (float)(rnd() % 1000000) / 1e6f;
     uint64_t reqs = 0, checked = 0, t0 = now_ns(), busy = 0, mx = 0;
     while (now_ns() - t0 < (uint64_t)(seconds * 1e9) && !rc) {
         uint64_t t = now_ns(), d;
@@ -941,7 +944,10 @@ static void chainload(uint32_t batches, double seconds, uint32_t pairs, uint32_t
             d = (uint64_t)(last_call_ms * 1e6);
             checked++;
         } else {
+            /* RT_COPY: the caller also copies its operands in and the results out, as an inline message would */
+            if (copy) memcpy(bx.map, cx, n * 4);
             rc = hs_mailbox_chain(&mb, bx.gpu, by.gpu, n, k, 0.9995f, 0.0007f);
+            if (copy) memcpy(cy, by.map, n * 4);
             d = now_ns() - t;
         }
         busy += d;
@@ -954,10 +960,10 @@ static void chainload(uint32_t batches, double seconds, uint32_t pairs, uint32_t
     }
     int ok = !rc && !bad && !mb.lost_leases;
     printf("{\"chainload\":true,\"batches\":%u,\"pairs_per_batch\":%u,\"k\":%u,\"gap_us\":%u,\"ok\":%s,\"requests\":%llu,\"checked\":%llu,\"rc\":%d,"
-           "\"wrong\":%d,\"gpu_share_of_time\":%.3f,\"request_ms\":{\"mean\":%.3f,\"max\":%.3f},\"leases\":%u,\"age_yields\":%llu,\"longest_job_ms\":%.2f}\n",
+           "\"wrong\":%d,\"gpu_share_of_time\":%.3f,\"request_ms\":{\"mean\":%.3f,\"max\":%.3f},\"request_us_mean\":%.2f,\"caller_copies\":%s,\"leases\":%u,\"age_yields\":%llu,\"longest_job_ms\":%.2f}\n",
            batches, pairs, k, gap_us, ok ? "true" : "false", (unsigned long long)reqs, (unsigned long long)checked, rc, bad,
            (double)busy / (double)(now_ns() - t0), busy / 1e6 / (double)(reqs ? reqs : 1),
-           mx / 1e6, hs_mailbox_leases_done(&mb, 0), (unsigned long long)atomic_load(&mb.wd_age_yields),
+           mx / 1e6, busy / 1e3 / (double)(reqs ? reqs : 1), copy ? "true" : "false", hs_mailbox_leases_done(&mb, 0), (unsigned long long)atomic_load(&mb.wd_age_yields),
            atomic_load(&mb.wd_job_gap_max_ns) / 1e6);
     if (!ok) failures++;
     hs_mailbox_free(&mb);
