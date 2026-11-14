@@ -103,6 +103,8 @@ typedef enum {
     HS_QPU_A_TIDX, HS_QPU_A_EIDX, HS_QPU_A_LR, HS_QPU_A_VFLA, HS_QPU_A_VFLNA, HS_QPU_A_VFLB,
     HS_QPU_A_VFLNB, HS_QPU_A_MSF, HS_QPU_A_REVF, HS_QPU_A_IID, HS_QPU_A_SAMPID, HS_QPU_A_BARRIERID,
     HS_QPU_A_TMUWT, HS_QPU_A_VPMWT,
+    /* special functions, one float source: 1/x, 1/sqrt(x), sin (see hs_qpu.c) */
+    HS_QPU_A_RECIP, HS_QPU_A_RSQRT, HS_QPU_A_SIN,
     HS_QPU_A_COUNT
 } hs_qpu_add_op;
 

@@ -98,6 +98,13 @@ static const op_desc ADD_OPS[HS_QPU_A_COUNT] = {
     [HS_QPU_A_SAMPID] = {"sampid", 187, K_NONE, 3, 2},
     [HS_QPU_A_BARRIERID] = {"barrierid", 187, K_NONE, 4, 2},
     [HS_QPU_A_TMUWT] = {"tmuwt", 187, K_NONE, 5, 2},
+    /* special functions: add-ALU operations with a destination on V3D 4.2
+     * (encodings read from Mesa's compiled code for tests/test_08, checked
+     * on the hardware by tools/p0_6_sfu_probe). Writing x to the magic
+     * registers 48..53 does nothing here. */
+    [HS_QPU_A_RECIP] = {"recip", 186, K_ONE, 0, 5},
+    [HS_QPU_A_RSQRT] = {"rsqrt", 188, K_ONE, 0, 3},
+    [HS_QPU_A_SIN] = {"sin", 188, K_ONE, 0, 6},
     [HS_QPU_A_VPMWT] = {"vpmwt", 187, K_NONE, 6, 2},
 };
 

@@ -106,3 +106,9 @@ neogpu_kworker_rt
 /tools/p0_5_spin_probe
 /tools/p0_5_gl_probe
 /tools/p0_5_inline_probe
+/tools/p0_6_scanout_probe
+/tools/p0_6_present_probe
+/tools/p0_6_sfu_probe
+/tools/p0_6_scene_probe
+/tools/p0_6_unifa_probe
+/tools/p0_6_shade_probe

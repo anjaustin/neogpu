@@ -21,7 +21,9 @@
  * on), or one summary line with <seconds>s.
  */
 #define _GNU_SOURCE
+#include <drm/v3d_drm.h>
 #include <errno.h>
+#include <sys/ioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,6 +98,18 @@ static int build(hs_qpu_prog* p, int variant) {
     return hs_qpu_prog_finish(p);
 }
 
+/* hs_v3d_dispatch takes 1, 2, 4 or 8 batches. Other counts (up to 16: the
+ * batch number is 4 bits) go to the kernel directly, with the same
+ * configuration words, to measure how many batches run at once. */
+static int dispatch_raw(hs_v3d* dev, uint32_t prog, uint32_t unif_gpu, uint32_t batches, const uint32_t* h, uint32_t nh) {
+    struct drm_v3d_submit_csd s;
+    memset(&s, 0, sizeof s);
+    s.cfg[0] = batches << 16, s.cfg[1] = 1u << 16, s.cfg[2] = 1u << 16, s.cfg[3] = 0xF010, s.cfg[4] = batches - 1;
+    s.cfg[5] = prog, s.cfg[6] = unif_gpu;
+    s.bo_handles = (uint64_t)(uintptr_t)h, s.bo_handle_count = nh;
+    return ioctl(dev->fd, DRM_IOCTL_V3D_SUBMIT_CSD, &s) ? -errno : 0;
+}
+
 static uint64_t now_ns(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC_RAW, &t);
@@ -103,7 +117,8 @@ static uint64_t now_ns(void) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 4) return fprintf(stderr, "usage: %s <variant 0..3> <iterations> <batches 1|8> [repeats]\n", argv[0]), 2;
+    if (argc < 4 || atoi(argv[3]) < 1 || atoi(argv[3]) > 16)
+        return fprintf(stderr, "usage: %s <variant 0..4> <iterations> <batches 1..16> [repeats | <seconds>s] [stretch]\n", argv[0]), 2;
     int variant = atoi(argv[1]), repeats = argc > 4 ? atoi(argv[4]) : 1;
     double seconds = argc > 4 && strchr(argv[4], 's') ? atof(argv[4]) : 0;
     uint32_t stretch = argc > 5 ? (uint32_t)strtoul(argv[5], NULL, 0) : 1;
@@ -130,14 +145,15 @@ int main(int argc, char** argv) {
     int jobs = 0;
     for (int r = 0; r < repeats; r++) {
         uint64_t t = now_ns();
-        int e = hs_v3d_dispatch(&dev, &d);
+        int std = batches == 1 || batches == 2 || batches == 4 || batches == 8;
+        int e = std ? hs_v3d_dispatch(&dev, &d) : dispatch_raw(&dev, prog, unif.gpu, batches, h, 3);
         if (!e) e = hs_v3d_bo_wait(&dev, &code, 30000000000ull);
         uint64_t dt = now_ns() - t;
         double ms = dt / 1e6;
         sum += dt, jobs++;
         if (dt > mx) mx = dt;
         if (seconds <= 0 || e) {
-            char tid[160] = "";
+            char tid[320] = "";
             int o = 0;
             for (uint32_t b = 0; b < batches; b++)
                 o += snprintf(tid + o, sizeof tid - (size_t)o, "%s%u", b ? "," : "", ((uint32_t*)data.map)[64 + 16 * b]);

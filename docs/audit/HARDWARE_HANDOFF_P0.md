@@ -27,7 +27,7 @@ So the gains lie in hardware blocks that NeoGPU does not use yet.
 | P0-3 | The GPU renders every layer at full panel resolution into one plane | HVS planes: static layers composed at scanout, and upscaling from a lower render resolution | 0.68 ns per pixel of fill, measured (COST_BREAKDOWN §8). Unknown: HVS blend and scale cost | **Shelved 2026-11-16.** Watched on the panel, the scaled image looked progressively more pixelated, not like a native render: a quality trade, not a speed-up. `hs_graphics_init_scaled` is out of the public API (behind `HS_GRAPHICS_SHELVED_SCALED`, kept for the tests). Kept: the plane-reset fix, the layer measurements and the tests. Reconstruction upscaling (adaptive edge refinement, temporal) was proposed and is shelved too. Before shelving: **Scaling made (opt-in):** `hs_graphics_init_scaled` renders at a reduced size and the HVS scales it at scanout. test_08 runs 1.76× faster at 600×360 and 3.9× at 400×240, on the panel. HVS composition and scaling cost no frame time on this panel (they do use memory bandwidth). Layers and sprites: measured capable, not built (no current user with a GPU cost to save). **Red team found and fixed:** takeover (native too) inherited a previous client's plane alpha, filter and blend mode, and native takeover left stray overlays on. The test now kills 14 of 14 mutants |
 | P0-4 | Capture: `glReadPixels`, then a CPU swizzle and flip, then a write | The writeback connector (the frame actually scanned out); the H.264 encoder for recording | Unknown: current cost | Not started |
 | P0-5 | Each GPU message is a job (~37 µs floor) | A persistent QPU mailbox | 0.76 µs RTT, 110–138× Mesa (VS_MESA.md) | **Built, red-teamed and hardened (2026-11-17); nothing in NeoGPU calls it yet.** Messages cost 2.1–3.3 µs, against 64–71 µs for a job. **It wins in one regime:** arithmetic-deep work (4,096 steps per element) runs 1.21–1.27× faster than all 4 CPU cores, bit-exact (1.24–1.31× before the chain loop was given thread switches so that it cannot stop a renderer). For gathers and for shallow arithmetic the CPU wins at every size tested. The red team found a defect in shipped code: every 8-batch program took its batch number from the QPU thread index and wrote wrong words beside a renderer (gather kernel: 3,273 of 3,279 jobs); fixed, 0 of 3,206 after. Costs while the mailbox is in use: 2–3% of a Mesa renderer on 1 batch, 34–40% on 8; nothing once the caller has been quiet for 2 ms |
-| P0-6 | Mesa's start-up (`gbm_create_device` 79.5 ms) | A direct V3D compute → KMS scanout path for scenes compute can render | Direct cold start 0.47 ms, measured. Unknown: sharing a v3d BO with vc4 | Not started |
+| P0-6 | Mesa's start-up (`gbm_create_device` 79.5 ms) | A direct V3D compute → KMS scanout path for scenes compute can render | Direct cold start 0.47 ms, measured. Unknown: sharing a v3d BO with vc4 | **Started 2026-11-17: the path exists, no scene yet.** A buffer vc4 allocates can be imported into v3d and filled by a compute job (the reverse is refused). A test pattern rendered by QPU compute alone is flipped at 60 Hz with no Mesa in the process: 0.37 ms per frame, no late flip, both buffers and the display controller's own capture of the frame checked. The two probes were red-teamed (11 findings fixed, 18 cases, 9 of 9 mutants). Reciprocal and reciprocal square root measured: within 1 ulp, one instruction each. **The scene, stage 1 (primary rays, flat colours):** a hand-assembled kernel renders it in 2.66 ms per frame on 8 batches, identical to a CPU reference except 1–3 edge pixels in 200 frames. **The whole scene** (shading, shadows, one reflection): 725 instructions per 16 pixels, 15.6 ms per frame (64 FPS), about 7 of 384,000 pixels per frame off the CPU reference. **That is 1.72× slower than Mesa (110 FPS)**: the kernel runs everything for every pixel, and half the pixels are sky. Next: skip work per 16 pixels and per region (plan step 5); plan in `P0_6_PLAN.md` |
 | P0-7 | Texture uploads | The TFU (raster to tiled, mipmaps) | No streaming-texture user today | Not started |
 
 **Rules for every item:**
@@ -1296,3 +1296,251 @@ operands in and its results out, as the inline form does by construction
 - Not built into `hs_mailbox`: a slot holds 8 lines, and 8 batches need 19
   (the probe uses 2,048-byte blocks). Not measured beside a renderer, and
   the op-carrying TMU writes (atomic add and the like) were not tried.
+
+## P0-6: QPU compute to KMS without Mesa (started)
+
+Evidence: `tests/evidence-p0-6-20261117/`. Nothing here is a renderer yet:
+these are the measurements a compute renderer has to stand on.
+
+**Success condition.** A scene rendered by QPU compute alone, no Mesa in the
+process, shown on the panel through KMS, checked pixel by pixel against a
+CPU reference, with its frame rate measured against the same scene through
+Mesa (`test_08`: 110 FPS). Invariants: the display is held only while a test
+runs and restored after; the existing tests keep passing.
+
+### Can one buffer be written by the QPUs and scanned out? (`tools/p0_6_scanout_probe`, `scanout_probe.txt`)
+
+| direction | result |
+|---|---|
+| vc4 dumb buffer → PRIME → v3d handle → GPU address | works; a compute job filled it, 0 of 384,000 pixels wrong (read back through vc4's own mapping); vc4 accepts it as a framebuffer |
+| v3d buffer → PRIME → vc4 | refused at import: `EIO` |
+
+Raw ioctls only: no Mesa, no libdrm. The buffer is plain raster XRGB8888
+with a pitch of 4 × width, so a TMU store of 16 words writes 16 pixels.
+
+### How fast can compute write pixels? (`fill_rate.txt`)
+
+One job fills 800 × 480; best of 20, job submit and wait included:
+
+| a `tmuwt` after every | 1 batch | 2 | 4 | 8 |
+|---|---|---|---|---|
+| store | 1.65 ms | 0.88 ms | 0.50 ms | 0.38 ms |
+| 2 stores | 1.01 ms | 0.56 ms | 0.37 ms | 0.37 ms |
+| 4 stores | 0.65 ms | 0.41 ms | 0.36 ms | 0.36 ms |
+| 8 stores | 0.52 ms | 0.37 ms | 0.36 ms | 0.36 ms |
+| 20 stores | 0.43 ms | 0.37 ms | 0.36 ms | 0.36 ms |
+
+- The floor is 0.36 ms per frame, 0.94 ns per pixel, reached from 2 batches
+  up: writing pixels is not what limits a compute renderer at 60 or 110 FPS.
+- Stores do not need a `tmuwt` each: every pixel was correct with one after
+  20 stores.
+
+### First frames on the panel (`tools/p0_6_present_probe`, `present.txt`)
+
+Two vc4 dumb buffers, one compute job per frame, a page flip per refresh.
+The process contains no Mesa, EGL or GBM (libdrm for the modeset calls).
+The image is a test pattern whose every pixel the CPU can predict.
+
+| 10 s on the DSI panel (800×480 at 60 Hz) | 1 batch | 8 batches (2 runs) |
+|---|---|---|
+| frames | 602 | 602, 602 |
+| render time per frame, median / p99 | 0.692 / 0.706 ms | 0.365–0.366 / 0.386–0.396 ms |
+| flip interval, median / max | 16.646 / 16.648 ms | 16.646 / 16.650 ms |
+| intervals over 1.5 refreshes | 0 | 0 |
+| frames checked, wrong pixels | 21, 0 | 21, 0 each |
+| process start to first frame on the CRTC | 52.7 ms | 49.4, 45.0 ms |
+| display restored, HVS underruns, GPU resets | yes, 0, 0 | yes, 0, 0 |
+
+- The slowest render of each run, 12–16 ms, is the first job after the GPU
+  sat idle (its runtime resume, as measured before).
+- The start-up figure includes that wake-up and the modeset. It was not
+  split further, and Mesa's start on the same path was not re-measured
+  here (79.5 ms for `gbm_create_device` alone, earlier).
+
+### What the scene will cost
+
+- Mesa's fragment shader for `test_08` compiles to **959 instructions, no
+  loops** (`V3D_DEBUG=shaderdb`, `mesa_shaderdb_test08.txt`), and Mesa
+  renders it at 110 FPS: 23.7 ns of all-QPU time per pixel.
+- A compute kernel for the same scene must average that or less per pixel
+  to tie. It is free to do what a fragment shader here does not: branch per
+  16-pixel vector, skip work no lane needs, and take per-region work lists
+  from the CPU through the mailbox.
+
+### Red team of the two probes, 2026-11-17 (`tests/evidence-p0-6-redteam-20261117/`)
+
+An independent read of the code and my own found these; all fixed, each
+with a case or an injected fault that shows the fix is tested:
+
+| # | finding | fix |
+|---|---|---|
+| 1 | The display probe checked only even frames at the default interval, so **buffer 1 was never checked**: the "0 wrong in 21 frames" above covered one buffer | frames n and n+1 are checked together; a run that used both buffers and checked one fails |
+| 2 | No error path after taking the display restored it, and signals skipped the restore | one exit path; SIGINT and SIGTERM stop the loop and restore |
+| 3 | A saved CRTC that was off would have been "restored" with a zeroed mode | it is turned off again instead |
+| 4 | The exit status ignored a failed restore | it does not |
+| 5 | Takeover did not reset planes a previous client left changed (the P0-3 finding, repeated) | overlays on the CRTC are turned off and the primary plane's alpha, blend mode, filter and rotation set to defaults, as `hs_graphics` does |
+| 6 | Neither probe could see a write outside the frame | 16 guard rows above and below, marked and checked; the framebuffer object covers the visible rows only |
+| 7 | Reading the buffer's memory cannot show what the display composes from the framebuffer object | the last frame is composed once more by the display controller into a capture buffer (writeback) and compared |
+| 8 | The check sat between render and flip, so its 9–11 ms counted against the flip | checks run after the flip |
+| 9 | The first-frame time included a full-frame check; the frame rate counted one frame too many | both corrected |
+| 10 | `batches` 0 or a zero `wait_every` divided by zero; a skipped fill exited 0 | arguments validated; a skipped fill fails |
+| 11 | The 24-bit multiply in the pattern would diverge from the CPU after about 11 hours | the frame term is masked on both sides |
+
+- `tests/redteam-p0-6/present_cases.sh`: **18 of 18 cases pass**
+  (`present_cases.txt`). They cover 1, 2, 4 and 8 batches; every frame
+  checked; five injected faults that must be reported (wrong frame number,
+  a fault in frames 2–11 only, one loop pass too many, a framebuffer that
+  starts at the guard rows); SIGINT, SIGTERM and SIGKILL; a second copy
+  refused while the first holds the display; bad arguments; and plane
+  properties a previous client left dirty. After every case the kernel's
+  dump of CRTCs and planes is the same as before it.
+- `tests/redteam-p0-6/mutants.sh`: **9 of 9 mutants caught**, control passes
+  (`mutants.txt`). Two earlier rounds are kept: 0 of 8 (my harness passed
+  the mutant's path in an environment variable that `sudo` drops, so the
+  real probe was tested every time) and 7 of 9 (the memory check and the
+  capture covered for each other until each got a fault only it can see).
+- The capture and the panel agree: with the framebuffer starting at the
+  guard rows the user saw the guard marker as a coloured band above the
+  pattern, and the capture reported it.
+- After the fixes, same panel: 60 Hz, render 0.366 ms, flip interval
+  16.646 ms median and 16.649 ms max, both buffers checked, capture of the
+  last frame 0 of 384,000 pixels wrong, first frame on the CRTC 28–46 ms
+  after `main` starts.
+- Not changed: on SIGKILL the probe cannot restore anything; the kernel
+  gave the console back (state unchanged in that case too).
+
+### The special functions (`tools/p0_6_sfu_probe`, `sfu.txt`; plan step 1)
+
+On this hardware reciprocal, reciprocal square root and sin are add-ALU
+operations with a destination. Their encodings were read from Mesa's
+compiled code for `test_08` (`mesa_fs_test08_qpu.txt`) and added to
+`hs_qpu` as `HS_QPU_A_RECIP`, `HS_QPU_A_RSQRT` and `HS_QPU_A_SIN`. A first
+version of the probe wrote x to the magic registers 48–53 and read r4, as
+older V3D versions do: that does nothing here
+(`sfu_magic_registers_do_nothing.txt`).
+
+| 320,000 random inputs, 2^-10..2^10 | exact | within 1 ulp | largest relative error |
+|---|---|---|---|
+| `recip` against a correctly rounded 1/x | 309,981 (96.9 %) | all | 1.19e-07 |
+| `rsqrt` against a correctly rounded 1/sqrt(x) | 313,305 (97.9 %) | all | 1.19e-07 |
+
+- Cost: one instruction slot. Used by the very next instruction, a call
+  costs 5.33 ns more than a move in its place (one instruction time);
+  used one or more instructions later it costs nothing extra.
+- Special values: 1/0 = inf, 1/-0 = -inf, 1/denormal = inf;
+  rsqrt(negative) = **0**, not NaN; rsqrt(0) = inf.
+- `sin` is sin(pi * x) for |x| up to 0.5 and saturates at ±1 beyond (0.25
+  gives 0.7071, 1 gives 1). The scene does not need it on the GPU.
+- Gate of step 1: met. The rounding rule behind the 1-ulp differences was
+  not identified, so the CPU reference will be compared with a tolerance of
+  one colour step and the exact-match count reported.
+
+### The scene, stage 1: primary rays (`tools/p0_6_scene_probe`, `scene_stage1*.txt`; plan steps 2 and 3)
+
+A hand-assembled compute kernel casts one ray per pixel against the six
+spheres and the ground of `test_08` and writes a flat colour for the
+nearest hit (the sphere's albedo, the ground's checker) or the sky. No
+shading, shadows or reflection yet. One job per frame; 16 pixels per pass
+of the inner loop, **134 instructions per pass**, one thread switch per
+pass; scene constants in registers. The reference is the same operations in
+the same order in C. Offscreen (a plain buffer).
+
+| 200 frames across the orbit, 800×480 | 1 batch | 2 | 4 | 8 |
+|---|---|---|---|---|
+| frame time (best) | 20.08 ms | 10.11 ms | 5.14 ms | **2.66 ms** |
+| pixels equal to the reference, of 76,800,000 | all but 3 | all but 3 | all but 1 | all but 2 |
+| the others | at an object edge | at an edge | at an edge | at an edge |
+
+- **Correct:** bit-identical to the CPU reference except 1–3 pixels in 200
+  frames, each on an edge between two objects (where a 1-ulp difference in
+  the square root decides which is nearer).
+- **Cost:** 2.66 ms per frame on 8 batches, 6.9 ns of all-QPU time per
+  pixel, and it scales with batches (7.5× from 1 to 8). Mesa's full shader
+  for this scene takes 23.7 ns per pixel. Stage 1 is the smaller part of
+  that shader, so this is not yet a comparison.
+- Parts of the 8-batch frame (`scene_stage1_cost_parts.txt`): no spheres
+  and no ground 0.88 ms; the ground 0.26 ms; six spheres 1.56 ms (0.26 ms
+  each, 16 instructions); the thread switch per pass 0.34 ms.
+- **A special-function operation whose destination is an accumulator hangs
+  the QPU.** The first version wrote `rsqrt` and `recip` results to r0–r2:
+  every job ran until the kernel reset it and wrote nothing. With
+  register-file destinations (all twelve in Mesa's compiled code are) it
+  runs. Five unplanned resets (256 → 261): four from running four frames of
+  an untested kernel instead of one, and one from a wrong first guess
+  (stores left un-waited across a thread switch, which is not the cause:
+  50 un-waited stores are fine, `fill_wait_every_large.txt`).
+- Seen once, not explained: in the first job after those resets, lanes 0–3
+  of the last batch wrote nothing (12,000 pixels left untouched, the other
+  372,000 exact). It did not recur in 800 frames.
+- Timings taken outside `wrap.sh` (without the performance governor) were
+  5–7 times longer for the same job. Not investigated; every number here is
+  under the governor, as the rules require.
+
+### The scene, whole: shading, shadows, reflection (`tools/p0_6_shade_probe`, `shade_all.txt`; plan step 4)
+
+The complete `test_08` picture as one straight-line kernel: per 16 pixels a
+ray, a trace of the six spheres and the ground, the shading of the nearest
+hit with a shadow test against the six spheres, then the reflected ray
+through the same trace and shade, the mix and the pack to 8 bits. Every lane
+runs everything; results are selected at the end. Nothing is skipped yet.
+The frame was looked at (`scene_s1r1_f0_gpu.ppm`): spheres with highlights,
+their shadows on the checkered ground, reflections in each sphere and in
+the ground, the sky gradient.
+
+| 8 batches, 800×480, 60 frames checked, then 32 jobs back to back | instructions per 16 pixels | frame time (median) | FPS | pixels differing, of 23,040,000 |
+|---|---|---|---|---|
+| shading only | 277 | 4.90 ms | 204 | 251, all by one colour step |
+| + shadows | 367 | 6.35 ms | 158 | 251, all by one step |
+| + reflection, no shadows | 545 | 10.30 ms | 97 | 434 |
+| **the whole scene** | **725** | **15.63 ms** | **64.0** | **432** (313 by one step; largest 17) |
+| Mesa, same scene, on the panel | 959 | 9.1 ms | 110 | |
+
+- **Correct:** about 7 pixels per frame differ from the CPU reference, at
+  edges of objects, shadows or reflections, where a 1-ulp difference in a
+  square root or reciprocal decides. Each stage ran correctly the first
+  time it ran. The image is the kernel's arithmetic, not Mesa's: the
+  difference from Mesa's image is not measured.
+- **Speed: the straight port is 1.72 times slower than Mesa** (40.7 against
+  23.7 ns of all-QPU time per pixel), with fewer instructions. Mesa's
+  shader does not execute all of its 959 for every pixel; this kernel
+  executes all 725 for every pixel, the sky included.
+- It scales with batches: 131.3 / 65.8 / 33.0 / 15.6 ms on 1 / 2 / 4 / 8.
+- 192,000 of the 384,000 pixels are sky, 131,900 ground and 60,100 sphere
+  (t = 1). That is the room step 5 has: the sky needs a few dozen
+  instructions, not 725.
+
+**Hardware facts met on the way:**
+
+- **Only 8 batches run at once.** A job of 9 to 16 batches takes exactly
+  twice as long as one of 8 (`batches_over_8.txt`): compute has 8 QPUs, the
+  same ones Mesa's shaders use.
+- **A second, rewindable uniform stream** (`tools/p0_6_unifa_probe`,
+  `unifa.txt`): write an address to `unifa`, and `ldunifa` (to r5) or
+  `ldunifarf` (to a register) reads successive words from it. At least 3
+  other instructions must follow the write before the first read (0, 1 or 2
+  give garbage for every read); r5 is usable in the next instruction; it
+  survives a thread switch (alone on the GPU); a write and four reads per
+  pass cost nothing measurable. It cannot ride on an instruction that has a
+  small immediate. The whole-scene kernel takes its 204 constants per pass
+  this way and keeps the registers for the work.
+- **Instruction cache: a loop over 512 instructions (4 KiB) costs more.**
+  Padding the pass with nops: 5.3 ns per extra instruction up to 467, then
+  about 12 ns per instruction for the next 200, and 7.3 ns from there on
+  (`shade_pad.txt`). The whole-scene pass is 725.
+- **The special-function unit is shared.** 100 extra `rsqrt` calls per pass
+  cost 5.3 ns each on 1 batch and 14.7 ns each on 8. Infinities, NaNs,
+  negative inputs and 1/0 cost the same as ordinary values
+  (`shade_pad_kinds.txt`).
+- **A measurement trap:** timed between reference computations, every job
+  was 10 ms slower: the CPU reference of the whole scene takes long enough
+  for the GPU to go idle, and the next job pays the wake-up. Frame times
+  above are from jobs back to back (`shade_all_timed_with_gpu_wakeups.txt`
+  keeps the wrong ones).
+
+**Not measured:** the compute path beside another display client; tearing
+or pacing above 60 FPS (the probe waits for each flip); the whole scene on
+the panel, or its difference from Mesa's image; the unifa stream and this
+kernel beside a renderer (a real thread switch); `exp`,
+`log` and `rsqrt2` (their encodings are not in Mesa's output for this
+shader, and none was guessed); why the special-function result cannot go
+to an accumulator; the lost lanes after a reset.
