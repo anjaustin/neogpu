@@ -103,3 +103,5 @@ neogpu_kworker_rt
 /tests/redteam-p0-5/mutants/
 /tools/p0_5_batch_id_probe
 /tools/p0_5_batch_cache_probe
+/tools/p0_5_spin_probe
+/tools/p0_5_gl_probe

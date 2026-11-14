@@ -45,6 +45,7 @@ enum {
     SLOT_BYTES = 512, /* 8 lines; a multiple of the GPU's 256-byte fetch */
     MAX_UNITS = HS_MB_MAX_UNITS,
     HEADER = 9,
+    NO_STRETCH = 255,
     STALL_NS = 300000,     /* a request some batches acknowledged and others have not: yield */
     LOST_CHECK_NS = 20000000, /* the check blocks ~2 ms while a job runs: only on a long stall */
     WD_TICK_NS = 1000000,
@@ -126,7 +127,7 @@ static void chain_i2(hs_qpu_prog* p) {
     emit(p, hs_qpu_m(hs_qpu_a(HS_QPU_A_FADD, RF(37), R(1), R(3)), HS_QPU_M_FMUL, R(0), RF(36), R(2)));
 }
 
-static int build(hs_qpu_prog* p) {
+static int build(hs_qpu_prog* p, uint32_t stretch_log2) {
     hs_qpu_prog_rules(p, 0); /* TMUAU and multi-load forms are outside the checker; forms measured in P0-5 */
     mov(p, RF(9), RF(0)); /* the hardware's batch number (workgroup x), before rf0 is overwritten */
     ldunifrf(p, 0);
@@ -164,6 +165,7 @@ static int build(hs_qpu_prog* p) {
     mov(p, R(2), I(1));
     op(p, HS_QPU_A_SHL, RF(17), R(2), I(6)); /* 64 */
     op(p, HS_QPU_A_SHL, RF(41), R(2), I(9)); /* 512: slot size */
+    if (stretch_log2 != NO_STRETCH) op(p, HS_QPU_A_SHL, RF(46), R(2), I((int)stretch_log2)); /* chain iterations per stretch */
     op(p, HS_QPU_A_ADD, RF(16), RF(6), RF(17));
     op(p, HS_QPU_A_ADD, RF(16), RF(16), RF(17));
     op(p, HS_QPU_A_ADD, RF(43), RF(22), RF(22));
@@ -262,17 +264,45 @@ static int build(hs_qpu_prog* p) {
     mov(p, R(2), RF(30));
     mov(p, R(3), RF(31));
     emit(p, hs_qpu_m(hs_qpu_a(HS_QPU_A_MOV, RF(38), RF(29), X), HS_QPU_M_FMUL, R(0), RF(36), R(2)));
+    /* A compute job lets a renderer's jobs run only at its thread switches
+     * (measured: tools/p0_5_spin_probe). The k steps therefore run in
+     * stretches of rf46 iterations (4 steps each) with a switch after each:
+     * rf38 iterations left, rf44 this stretch's. */
+    int l_st = hs_qpu_label_new(p);
+    if (stretch_log2 != NO_STRETCH) {
+        hs_qpu_label_bind(p, l_st);
+        op(p, HS_QPU_A_UMIN, RF(44), RF(38), RF(46));
+        op(p, HS_QPU_A_SUB, RF(38), RF(38), RF(44));
+    }
+    hs_qpu_reg count = stretch_log2 != NO_STRETCH ? RF(44) : RF(38);
     hs_qpu_label_bind(p, l_hl);
     chain_i1(p);
     chain_i2(p);
     chain_i1(p);
     chain_i2(p);
     chain_i1(p);
-    flags(p, HS_QPU_A_SUB, RF(38), RF(38), I(1), HS_QPU_PF_PUSHZ);
+    flags(p, HS_QPU_A_SUB, count, count, I(1), HS_QPU_PF_PUSHZ);
     hs_qpu_branch(p, HS_QPU_B_NA0, l_hl, 0, 0);
     chain_i2(p); /* delay slots: run on both paths */
     chain_i1(p);
     chain_i2(p);
+    if (stretch_log2 != NO_STRETCH) { /* more steps left: switch threads, then the next stretch */
+        int l_last = hs_qpu_label_new(p);
+        flags(p, HS_QPU_A_SUB, RF(45), RF(38), I(0), HS_QPU_PF_PUSHZ);
+        br(p, HS_QPU_B_A0, l_last, 0);
+        emit(p, hs_qpu_s(hs_qpu_alu_nop(), HS_QPU_SIG_THRSW, X));
+        nop(p);
+        nop(p);
+        /* A switch that really runs another thread does not keep r0..r3
+         * (measured beside a renderer: every checked result wrong without
+         * these three; alone the switch changes nothing). Reload c1 and c0
+         * and redo the multiply that was pending in r0. */
+        hs_qpu_branch(p, HS_QPU_B_ALWAYS, l_st, 0, 0);
+        mov(p, R(2), RF(30));
+        mov(p, R(3), RF(31));
+        emit(p, hs_qpu_m(hs_qpu_alu_nop(), HS_QPU_M_FMUL, R(0), RF(36), R(2)));
+        hs_qpu_label_bind(p, l_last);
+    }
     store(p, RF(34), RF(36));
     op(p, HS_QPU_A_ADD, R(1), RF(34), RF(22));
     store(p, R(1), RF(37));
@@ -508,7 +538,7 @@ static int top_up(hs_mailbox* mb) {
 
 int hs_mailbox_start(hs_mailbox* mb, hs_v3d* dev, const hs_mailbox_cfg* cfg) {
     memset(mb, 0, sizeof(*mb));
-    if (!dev || !cfg || (cfg->batches != 1 && cfg->batches != 8) || cfg->nbos > HS_MB_MAX_BOS || (cfg->nbos && !cfg->bos))
+    if (!dev || !cfg || (cfg->batches != 1 && cfg->batches != 2 && cfg->batches != 4 && cfg->batches != 8) || cfg->nbos > HS_MB_MAX_BOS || (cfg->nbos && !cfg->bos))
         return -EINVAL;
     uint32_t budget = cfg->budget ? cfg->budget : 30000, qdepth = cfg->qdepth ? cfg->qdepth : 2;
     uint32_t slots = cfg->slots ? cfg->slots : 256;
@@ -516,6 +546,11 @@ int hs_mailbox_start(hs_mailbox* mb, hs_v3d* dev, const hs_mailbox_cfg* cfg) {
         return -EINVAL;
     for (uint32_t i = 0; i < cfg->nbos; i++)
         if (!cfg->bos[i] || !cfg->bos[i]->map) return -EINVAL;
+    uint32_t stretch = cfg->chain_stretch ? cfg->chain_stretch : HS_MB_CHAIN_STRETCH_DEFAULT, stretch_log2 = NO_STRETCH;
+    if (stretch != HS_MB_CHAIN_NO_SWITCH) {
+        if (stretch > 32768 || (stretch & (stretch - 1))) return -EINVAL;
+        stretch_log2 = (uint32_t)__builtin_ctz(stretch);
+    }
     mb->dev = dev;
     mb->batches = cfg->batches;
     mb->budget = budget;
@@ -543,7 +578,7 @@ int hs_mailbox_start(hs_mailbox* mb, hs_v3d* dev, const hs_mailbox_cfg* cfg) {
     uint64_t buf[2048];
     hs_qpu_prog p;
     hs_qpu_prog_init(&p, buf, 2048);
-    int n = build(&p);
+    int n = build(&p, stretch_log2);
     if (n < 0 || !(mb->prog = hs_v3d_load(&mb->code, 0, buf, (uint32_t)n))) {
         hs_mailbox_free(mb);
         return -EIO;

@@ -112,7 +112,7 @@ uint32_t hs_v3d_load(hs_v3d_bo* code, size_t off, const uint64_t* prog, uint32_t
 }
 
 int hs_v3d_dispatch(hs_v3d* dev, const hs_v3d_dispatch_desc* d) {
-    if ((d->batches != 1 && d->batches != 8) || !d->code_gpu || !d->bos || !d->nbos) return -EINVAL;
+    if ((d->batches != 1 && d->batches != 2 && d->batches != 4 && d->batches != 8) || !d->code_gpu || !d->bos || !d->nbos) return -EINVAL;
     const uint32_t wg_size = 16, wgs_per_sg = 16;
     struct drm_v3d_submit_csd s;
     memset(&s, 0, sizeof(s));

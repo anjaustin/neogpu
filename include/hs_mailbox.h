@@ -14,7 +14,7 @@
  * - Data the CPU changes between requests (indices, inputs, a changing gather
  *   table) is reloaded with op 2 per 16-word load; results are published with
  *   op 2 per 64-byte line before the GPU acknowledges.
- * - With batches = 8 the request runs on all 8 batches (every QPU); each
+ * - With batches > 1 the request runs on every batch (8: every QPU); each
  *   acknowledges separately.
  * - A batch's published acknowledgement is its only durable state. A lease
  *   the kernel kills is resumed by the next one at the first unacknowledged
@@ -37,9 +37,25 @@
  *   behind the leases, or 20-27 ms with the watchdog off).
  * - One request is not interruptible; send bounds its size (see below).
  * - While in use the mailbox shares the QPUs with any renderer. Measured
- *   beside a GPU-bound Mesa renderer at 110 FPS, one request every 100 us:
- *   107-108 FPS on 1 batch, 67-73 FPS on 8. Use 8 batches when the GPU is
- *   otherwise free, or in bursts. A caller quiet for idle_us costs nothing.
+ *   beside a GPU-bound Mesa renderer at 110 FPS, one echo or gather every
+ *   100 us: 107-108 FPS on 1 batch, 67-73 FPS on 8. Use 8 batches when the
+ *   GPU is otherwise free, or in bursts. A caller quiet for idle_us costs
+ *   nothing.
+ * - A compute job lets a renderer's jobs run only at its thread switches
+ *   (measured: an arithmetic-only job stopped a GPU-bound renderer for as
+ *   long as it ran). Polls and gathers switch at every load. A chain switches
+ *   every `chain_stretch` loop iterations (default 128, about 7 us): beside
+ *   that renderer, k = 65536 requests back to back left it 103 of 110 FPS on
+ *   1 batch and took 1.38 ms each (0.92 ms alone). With
+ *   HS_MB_CHAIN_NO_SWITCH the same load left the renderer 37 FPS with frames
+ *   up to 61 ms apart; alone it is 2 % faster.
+ * - A job that hangs is killed by the kernel about 1.0 s after it starts,
+ *   and the kernel may blame another client's job instead: with a lease
+ *   hung beside a renderer it cancelled the renderer's job in 9 of 13 runs,
+ *   and with a renderer's job hung it cancelled a lease first in 4 of 4.
+ *   The mailbox recovered with no wrong result every time; a request then
+ *   took up to 2.0 s. send's size limits are what keep a request from
+ *   hanging.
  * - The first request after the GPU has been idle for more than ~100 ms
  *   takes about 10 ms (the device's runtime resume), as any job does.
  *
@@ -69,10 +85,12 @@ enum {
     HS_MB_MAX_BUDGET = 250000, /* an idle lease alone: 0.32 us (1 batch) to 0.44 us (8) per poll */
     HS_MB_MAX_UNITS = 65536,   /* budget units one chain request may take per batch */
     HS_MB_MAX_GATHER_CHUNKS = 512, /* 16-element chunks per batch in one gather request */
+    HS_MB_CHAIN_STRETCH_DEFAULT = 128, /* see hs_mailbox_cfg.chain_stretch */
 };
+#define HS_MB_CHAIN_NO_SWITCH 0xFFFFFFFFu
 
 typedef struct {
-    uint32_t batches;      /* 1 or 8 */
+    uint32_t batches;      /* 1, 2, 4 or 8 */
     uint32_t budget;       /* polls per lease, 2..HS_MB_MAX_BUDGET; 0: 30000 */
     uint32_t qdepth;       /* leases kept queued, at most 8; 0: 2 */
     uint32_t slots;        /* request slots, a power of two 2..65536; 0: 256 */
@@ -81,6 +99,8 @@ typedef struct {
     uint32_t idle_us;      /* leases end this long after the last send/wait; 0: 2000 */
     uint32_t max_lease_us; /* a lease older than this is ended; 0: 50000 */
     int watchdog_off;      /* 1: no watchdog thread (tests; only the budget ends a lease) */
+    uint32_t chain_stretch; /* chain steps / 4 between two thread switches: a power of two 1..32768;
+                               0: HS_MB_CHAIN_STRETCH_DEFAULT; HS_MB_CHAIN_NO_SWITCH: none (see above) */
 } hs_mailbox_cfg;
 
 typedef struct {

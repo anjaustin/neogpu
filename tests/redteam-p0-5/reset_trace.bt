@@ -1,0 +1,62 @@
+#!/usr/bin/env bpftrace
+/* P0-5: the kernel's side of a V3D timeout and reset, one line per event
+ * (ns since start). Run as root beside the workload:
+ *   sudo bpftrace tests/redteam-p0-5/reset_trace.bt > trace.txt
+ * CL (renderer) events are high-rate; summarise with reset_trace.py. */
+BEGIN { @t0 = nsecs; printf("# t_ns event pid comm detail\n"); }
+
+tracepoint:v3d:v3d_submit_csd_ioctl { printf("%llu csd_ioctl %d %s\n", nsecs - @t0, pid, comm); }
+tracepoint:v3d:v3d_submit_cl_ioctl  { printf("%llu cl_ioctl %d %s\n", nsecs - @t0, pid, comm); }
+tracepoint:v3d:v3d_submit_csd { printf("%llu csd_hw_start %d %s seqno=%llu\n", nsecs - @t0, pid, comm, args->seqno); }
+tracepoint:v3d:v3d_csd_irq    { printf("%llu csd_irq %d %s seqno=%llu\n", nsecs - @t0, pid, comm, args->seqno); }
+tracepoint:v3d:v3d_submit_cl  { printf("%llu cl_hw_start %d %s render=%d seqno=%llu\n", nsecs - @t0, pid, comm, args->is_render, args->seqno); }
+tracepoint:v3d:v3d_bcl_irq    { printf("%llu bcl_irq %d %s seqno=%llu\n", nsecs - @t0, pid, comm, args->seqno); }
+tracepoint:v3d:v3d_rcl_irq    { printf("%llu rcl_irq %d %s seqno=%llu\n", nsecs - @t0, pid, comm, args->seqno); }
+tracepoint:v3d:v3d_reset_begin { printf("%llu reset_begin %d %s\n", nsecs - @t0, pid, comm); }
+tracepoint:v3d:v3d_reset_end   { printf("%llu reset_end %d %s\n", nsecs - @t0, pid, comm); }
+
+kprobe:v3d_csd_job_timedout {
+    $j = (struct v3d_csd_job *)arg0;
+    @csd_to[tid] = arg0;
+    printf("%llu csd_timedout_enter %d %s job=%p timedout_batches_before=%u\n", nsecs - @t0, pid, comm, arg0, $j->timedout_batches);
+}
+kretprobe:v3d_csd_job_timedout /@csd_to[tid]/ {
+    $j = (struct v3d_csd_job *)@csd_to[tid];
+    printf("%llu csd_timedout_exit %d %s job=%p stat=%d timedout_batches_after=%u\n", nsecs - @t0, pid, comm, @csd_to[tid], retval, $j->timedout_batches);
+    delete(@csd_to[tid]);
+}
+kprobe:v3d_render_job_timedout { printf("%llu render_timedout_enter %d %s job=%p\n", nsecs - @t0, pid, comm, arg0); }
+kretprobe:v3d_render_job_timedout { printf("%llu render_timedout_exit %d %s stat=%d\n", nsecs - @t0, pid, comm, retval); }
+kprobe:v3d_bin_job_timedout { printf("%llu bin_timedout_enter %d %s job=%p\n", nsecs - @t0, pid, comm, arg0); }
+kretprobe:v3d_bin_job_timedout { printf("%llu bin_timedout_exit %d %s stat=%d\n", nsecs - @t0, pid, comm, retval); }
+
+/* which jobs the kernel starts (or skips) on the hardware, with their state */
+kprobe:v3d_csd_job_run {
+    $j = (struct v3d_csd_job *)arg0;
+    @run[tid] = arg0;
+    printf("%llu csd_run_enter %d %s job=%p karma=%d fence_error=%d\n", nsecs - @t0, pid, comm, arg0,
+           $j->base.base.karma.counter, $j->base.base.s_fence->finished.error);
+}
+kretprobe:v3d_csd_job_run /@run[tid]/ {
+    printf("%llu csd_run_exit %d %s job=%p hw_fence=%p\n", nsecs - @t0, pid, comm, @run[tid], retval);
+    delete(@run[tid]);
+}
+kprobe:v3d_render_job_run {
+    $j = (struct v3d_render_job *)arg0;
+    @rrun[tid] = arg0;
+    @rkarma[tid] = $j->base.base.karma.counter;
+    @rerr[tid] = $j->base.base.s_fence->finished.error;
+}
+kretprobe:v3d_render_job_run /@rrun[tid]/ {
+    printf("%llu render_run %d %s job=%p karma=%d fence_error=%d hw_fence=%p\n", nsecs - @t0, pid, comm, @rrun[tid], @rkarma[tid], @rerr[tid], retval);
+    delete(@rrun[tid]); delete(@rkarma[tid]); delete(@rerr[tid]);
+}
+kprobe:v3d_bin_job_run {
+    $j = (struct v3d_bin_job *)arg0;
+    printf("%llu bin_run %d %s job=%p karma=%d fence_error=%d\n", nsecs - @t0, pid, comm, arg0,
+           $j->base.base.karma.counter, $j->base.base.s_fence->finished.error);
+}
+kprobe:drm_sched_resubmit_jobs { printf("%llu resubmit_jobs %d %s sched=%p\n", nsecs - @t0, pid, comm, arg0); }
+kprobe:drm_sched_increase_karma { printf("%llu increase_karma %d %s job=%p\n", nsecs - @t0, pid, comm, arg0); }
+kprobe:v3d_job_free, kprobe:v3d_render_job_free { printf("%llu job_free %d %s job=%p\n", nsecs - @t0, pid, comm, arg0); }
+END { clear(@t0); clear(@csd_to); clear(@run); clear(@rrun); clear(@rkarma); clear(@rerr); }

@@ -26,7 +26,7 @@ So the gains lie in hardware blocks that NeoGPU does not use yet.
 | P0-2 | One draw plus one `glBufferData` per glyph (`hs_text.c`) | One instanced draw, with quads built by the GPU's vertex stage | **Measured (P0-1 red team):** about 16 µs of CPU per draw with this pattern. 100 draws give 614 FPS with the GPU 13% busy, so text-heavy frames are CPU-bound | Next |
 | P0-3 | The GPU renders every layer at full panel resolution into one plane | HVS planes: static layers composed at scanout, and upscaling from a lower render resolution | 0.68 ns per pixel of fill, measured (COST_BREAKDOWN §8). Unknown: HVS blend and scale cost | **Shelved 2026-11-16.** Watched on the panel, the scaled image looked progressively more pixelated, not like a native render: a quality trade, not a speed-up. `hs_graphics_init_scaled` is out of the public API (behind `HS_GRAPHICS_SHELVED_SCALED`, kept for the tests). Kept: the plane-reset fix, the layer measurements and the tests. Reconstruction upscaling (adaptive edge refinement, temporal) was proposed and is shelved too. Before shelving: **Scaling made (opt-in):** `hs_graphics_init_scaled` renders at a reduced size and the HVS scales it at scanout. test_08 runs 1.76× faster at 600×360 and 3.9× at 400×240, on the panel. HVS composition and scaling cost no frame time on this panel (they do use memory bandwidth). Layers and sprites: measured capable, not built (no current user with a GPU cost to save). **Red team found and fixed:** takeover (native too) inherited a previous client's plane alpha, filter and blend mode, and native takeover left stray overlays on. The test now kills 14 of 14 mutants |
 | P0-4 | Capture: `glReadPixels`, then a CPU swizzle and flip, then a write | The writeback connector (the frame actually scanned out); the H.264 encoder for recording | Unknown: current cost | Not started |
-| P0-5 | Each GPU message is a job (~37 µs floor) | A persistent QPU mailbox | 0.76 µs RTT, 110–138× Mesa (VS_MESA.md) | **Built, red-teamed and hardened (2026-11-17); nothing in NeoGPU calls it yet.** Messages cost 2.1–3.3 µs, against 64–71 µs for a job. **It wins in one regime:** arithmetic-deep work (4,096 steps per element) runs 1.24–1.31× faster than all 4 CPU cores, bit-exact. For gathers and for shallow arithmetic the CPU wins at every size tested. The red team found a defect in shipped code: every 8-batch program took its batch number from the QPU thread index and wrote wrong words beside a renderer (gather kernel: 3,273 of 3,279 jobs); fixed, 0 of 3,206 after. Costs while the mailbox is in use: 2–3% of a Mesa renderer on 1 batch, 34–40% on 8; nothing once the caller has been quiet for 2 ms |
+| P0-5 | Each GPU message is a job (~37 µs floor) | A persistent QPU mailbox | 0.76 µs RTT, 110–138× Mesa (VS_MESA.md) | **Built, red-teamed and hardened (2026-11-17); nothing in NeoGPU calls it yet.** Messages cost 2.1–3.3 µs, against 64–71 µs for a job. **It wins in one regime:** arithmetic-deep work (4,096 steps per element) runs 1.21–1.27× faster than all 4 CPU cores, bit-exact (1.24–1.31× before the chain loop was given thread switches so that it cannot stop a renderer). For gathers and for shallow arithmetic the CPU wins at every size tested. The red team found a defect in shipped code: every 8-batch program took its batch number from the QPU thread index and wrote wrong words beside a renderer (gather kernel: 3,273 of 3,279 jobs); fixed, 0 of 3,206 after. Costs while the mailbox is in use: 2–3% of a Mesa renderer on 1 batch, 34–40% on 8; nothing once the caller has been quiet for 2 ms |
 | P0-6 | Mesa's start-up (`gbm_create_device` 79.5 ms) | A direct V3D compute → KMS scanout path for scenes compute can render | Direct cold start 0.47 ms, measured. Unknown: sharing a v3d BO with vc4 | Not started |
 | P0-7 | Texture uploads | The TFU (raster to tiled, mipmaps) | No streaming-texture user today | Not started |
 
@@ -944,7 +944,8 @@ budget 100,000, `max_lease_us` 20 ms):
 - On 1 batch with the largest gathers the longest job was 24.3 ms beside
   the renderer and 20.6 ms alone.
 
-Not measured:
+Not measured at that point (the first two and part of the third are in the
+next section):
 - A reset while a renderer is running, and what the renderer sees of it.
 - The lost-lease path against a kernel that really drops queued jobs (this
   kernel did not).
@@ -952,3 +953,298 @@ Not measured:
   kernel (none exists); CPU code hand-written in assembly.
 - Gather indices are not checked by the library: an index outside the table
   reads whatever that GPU address holds.
+
+### Bedrock: resets, lost leases and what compute costs a renderer (P0-5), 2026-11-17
+
+Evidence: `tests/evidence-p0-5-bedrock-20261117/`. Kernel 7.0.0-1023-raspi;
+its `v3d_sched.c` and the scheduler's `sched_main.c` were read
+(raspberrypi/linux `rpi-7.0.y`) and every step below was then seen in a
+trace: `tests/redteam-p0-5/reset_trace.bt` records the kernel's V3D events,
+`reset_trace.py` summarises a trace. GPU resets this round: 211 → 240, 23
+planned and 6 not (see "Unplanned resets").
+
+**1. How the kernel times a job out** (`reset1_q2.trace`, `reset8_q2.trace`).
+
+- Each queue (bin, render, compute, ...) runs one job at a time on the
+  hardware and has its own 500 ms timer, started when the job starts.
+- First expiry of a compute job, 501–503 ms after its start: the handler
+  reads the hardware's batch counter, sees it differ from the 0 the job
+  struct starts with (the counter read 0xFFFFFFFF on 1 and on 8 batches),
+  and re-arms. Every compute job gets this pass once.
+- Second expiry, 1,004–1,006 ms after the start: the counter is unchanged,
+  so the GPU is reset. A compute job is therefore killed about 1.0 s after
+  it starts if no batch finished in its second 500 ms, whatever it was doing.
+- The reset itself took 35–55 µs in 20 of the 25 resets summarised and
+  12.4–17.5 ms in the other 5.
+  The whole handler took about 0.55 ms.
+- The job the handler ran for is marked guilty, its fence gets `-ECANCELED`,
+  and the kernel does not run it again. Jobs in flight on the other queues
+  are run again from their start. Jobs still queued are untouched: only one
+  job per queue is on the hardware, and this driver gives the scheduler no
+  per-client guilty flag.
+
+**2. The lost-lease path, against the real kernel** (`reset1_q1.*`,
+`reset8_q1.*`). With `qdepth` 1 there is no second lease queued, so when the
+kernel kills the lease nothing is left to run.
+
+| qdepth 1, lease killed mid-request | 1 batch | 8 batches |
+|---|---|---|
+| `lost_leases` counted by the library | 1 | 1 |
+| reset to the replacement lease's submit | 13.0 ms | 13.8 ms |
+| all four requests acknowledged after | 1,020.9 ms | 1,021.3 ms |
+| wrong words (killed request, queued gathers, 4,000 after) | 0 | 0 |
+
+- The 13 ms is the library's 20 ms lost-lease check period.
+- With `qdepth` 2 (the default) the queued lease started 0.10–0.13 ms after
+  the reset and `lost_leases` stayed 0.
+- After a kill the watchdog's yield word is still set, so the first leases
+  end at once until its next 1 ms tick: 1 to 13 leases of a few µs each
+  were counted. Harmless, bounded by the tick.
+
+**3. A lease hangs while a renderer runs** (`coexist_reset*`,
+`coexist_rep_*`; 13 runs: 7 on 1 batch, 6 on 8; `test_08` at 110 FPS).
+
+| what happened | result |
+|---|---|
+| render jobs finished while the lease hung | 0, in all 13 runs |
+| longest time without a finished render job | 1,017–1,023 ms |
+| which job the kernel blamed and cancelled | **the renderer's: 9 runs; the lease: 4 runs** |
+| first render job finished after the reset | 12.4 ms later |
+| renderer afterwards | 108–112 jobs/s, exit code 0, `PASS` |
+| the mailbox's results in all 13 runs | 0 wrong, all acknowledged after 1,004–1,022 ms |
+| display underruns | 0 |
+
+- The renderer's bin and render jobs were stuck from the moment the hang
+  began. Their timers run too, and whichever queue's second expiry comes
+  first is blamed. The renderer's job had usually started first.
+- When the renderer is blamed its render job is cancelled (the kernel calls
+  the run function, which returns no fence: that frame is never drawn), the
+  renderer's reset counter goes up, and the hung lease is **run again from
+  its start** by the kernel. In these runs the request had been shortened
+  by then, so the re-run lease finished it: the "same job runs twice" case,
+  9 of 9 correct.
+- A compute job that truly never ends (`hang_coexist_*`, 4 runs,
+  `p0_5_spin_probe` variant 0): 1 reset in 2 runs (job gone after 1,006 and
+  1,010 ms), 2 resets in 2 runs (renderer blamed first; job gone after
+  1,524 ms, because the re-run job keeps its old counter reading and is
+  killed at its first expiry).
+- Not explained: in those two runs the renderer worked during the re-run
+  job's 0.5 s (10, 60, 94 jobs/s in three 0.5 s windows), although the same
+  job froze it completely before the reset.
+
+**4. The cause of the freeze: a compute job gives way to a renderer only at
+thread switches** (`tools/p0_5_spin_probe`, `spin_coexist*`, `stretch_*`).
+One compute job, loop body varied, beside `test_08`:
+
+| loop body | per iteration alone | beside the renderer | render jobs meanwhile |
+|---|---|---|---|
+| arithmetic only | 32.1 ns | 32.0 ns | **0 in 250 ms** (4 of 4 jobs) |
+| arithmetic + TMU store + `tmuwt` | 64.1 ns | 64.1 ns | **0 in 250 ms** (4 of 4 jobs) |
+| arithmetic + thread switch | 138.8 ns | 1,933–1,945 ns | 108–111 per s (full speed) |
+| arithmetic + TMU load (has a thread switch) | 96.1 ns | over 1,570 ns (killed at 1 s) | not measured |
+
+- The same on 1 batch and on 8: one 16-lane batch without a thread switch
+  stopped all of `test_08`'s rendering. (With a lighter renderer it is all
+  or nothing per job: see the next section.)
+- Without thread switches the compute job runs at full speed and the
+  renderer gets nothing. With one in every iteration the renderer runs at
+  full speed and the compute job is 14 times slower.
+- Between those: `stretch` arithmetic-only iterations (32 ns each) between
+  two thread switches, 20 ms jobs back to back for 5 s (`stretch_b1.txt`,
+  `stretch_b8.txt`):
+
+| stretch between thread switches | compute slowdown (1 / 8 batches) | render jobs per s, 1 batch | 8 batches | longest gap, 1 / 8 batches |
+|---|---|---|---|---|
+| 0.03 µs | 12.0× / 12.4× | 110.2 | 106.9 | 9 / 15 ms |
+| 0.13 µs | 8.9× / 9.2× | 109.9 | 103.7 | 9 / 15 ms |
+| 0.5 µs | 4.7× / 4.8× | 109.4 | 94.5 | 9 / 15 ms |
+| 2 µs | 2.4× / 2.3× | 106.3 | 69.2 | 9 / 17 ms |
+| 8 µs | 1.43× / 1.61× | 100.5 | 43.9 | 10 / 33 ms |
+| 33 µs | 1.10× / 1.09× | 87.1 | 10.0 | 12 / 102 ms |
+| 131 µs | 1.02× / 1.02× | 53.4 | 3.2 | 19 / 321 ms |
+| 524 µs | 1.003× / 1.004× | 20.0 | 1.4 | 54 / 787 ms |
+
+- A second renderer, `test_05_cube3d` (19.7 render jobs per s, not
+  GPU-bound; `cube/stretch_b1.txt`): its rate stayed 19.6–19.8 at every
+  stretch and the compute job was not slowed; only its longest gap grew,
+  from 51 ms to 60 ms (131 µs) and 74 ms (524 µs).
+
+**5. What this means for `hs_mailbox`** (`chainload_*`). Polls and gathers
+switch threads at every load. A chain request does not: each pair of chunks
+runs its k steps with no thread switch (one switch per pair).
+
+| chain requests back to back, beside `test_08` | longest stretch | renderer, 1 batch | 8 batches |
+|---|---|---|---|
+| 1,024 pairs per batch, k = 232 | 3.7 µs | 104 FPS | 60–104 |
+| 1 pair, k = 4,096 | 59 µs | 88–90 | not measured |
+| 1 pair, k = 65,536 (the largest k) | 0.90 ms | **36–38, frames up to 61 ms apart** | 66–84, up to 29 ms apart |
+
+- 110 FPS without the mailbox. One request in 64 was checked against the
+  CPU, all correct; the mailbox was busy 77–86 % of the time on 1 batch and
+  44–53 % on 8 (the caller's thread limits it there).
+- The request with short stretches took 7.2 ms beside the renderer against
+  3.7 ms alone: the renderer takes its turn at every pair.
+- The earlier "107–108 FPS on 1 batch" was measured with echoes and gathers.
+  It does not hold for chain requests with a large k.
+- Changed in the next section: the chain loop now switches threads every
+  128 iterations, after the cost was measured in the chain kernel itself.
+
+**Unplanned resets.** Six of the 29 resets were my probe jobs: sized to
+250 ms alone, the thread-switching bodies ran 14× slower beside the renderer
+and passed 1 s. The script now sizes them for the slow case; the TMU-load
+body was killed again at that size, so its speed beside a renderer is only
+a lower bound.
+
+**Gates:** build 0 warnings, `check-sources` 0, `rt_mailbox cases` 47 of 47
+(`final_cases.txt`). The library's code is unchanged this round; its header
+comment was corrected.
+
+Left unmeasured at that point, and measured in the next section: what a
+cancelled frame holds and what GL reports; why the re-run compute job did
+not freeze the renderer; a hang in a renderer's own job; a chain kernel with
+thread switches; 2 and 4 batches.
+
+### Bedrock, second round: the open list closed (P0-5), 2026-11-17
+
+Evidence: `tests/evidence-p0-5-bedrock2-20261117/`. New tool:
+`tools/p0_5_gl_probe`, an offscreen GLES renderer (render node, no display)
+that fills each frame with its own colour, reads every frame back, compares
+every pixel and asks GL for the reset status. GPU resets this round:
+240 → 256, 15 planned and 1 not (below).
+
+**1. What a renderer is left with when the kernel cancels its job**
+(`gl_hang.txt`; `gl_probe` at 512×512, 89 FPS, beside a compute job that
+never ends; 4 runs).
+
+| | renderer blamed (2 runs) | compute job blamed (2 runs) |
+|---|---|---|
+| the frame in flight | **partly drawn**: 106,496 and 258,048 of 262,144 pixels new, the rest the previous frame | complete and correct |
+| that frame took | 1,015 and 1,017 ms | 20 and 24 ms |
+| GL reset status | guilty | innocent |
+| every GL call afterwards | fails with `GL_CONTEXT_LOST` | fails with `GL_CONTEXT_LOST` |
+
+- The cancelled frame is torn at tile boundaries (both counts are multiples
+  of 4,096, a 64×64 tile): the tiles finished before the reset are new.
+- `gl_probe` asks for a robust context that is lost on reset. Such a
+  renderer loses its context after **any** GPU reset, guilty or not, and has
+  to rebuild it. `test_08` does not ask, and kept rendering (previous
+  section).
+
+**2. The freeze is all or nothing per job, and depends on where the batch
+lands** (`flight.txt`, `tidx.txt`; one 250 ms arithmetic-only job at a time).
+
+| renderer | 1 batch: jobs that froze it | 8 batches |
+|---|---|---|
+| `test_08` (GPU-bound) | 21 of 21 (previous section) | every job |
+| `gl_probe` 1024×1024, 121 ms frames | 12 of 12 | 11 of 11 |
+| `gl_probe` 512×512, 10 ms frames, idle between | **5 of 12, then 17 of 30** | 12 of 12 |
+
+- A job that froze the renderer let 0 render jobs start or finish. A job
+  that did not let it run at full speed (20–22 render jobs in 250 ms).
+  Nothing in between.
+- Whether a render job was on the hardware when the compute job started
+  does not decide it (true in both groups). The batch's QPU thread index
+  does not decide it either: index 28 froze in 1 of 5 jobs, 29 in 2 of 4,
+  31 in 4 of 4, 12 in 0 of 4.
+- This answers the open point of the previous section: a job the kernel
+  runs again after a reset starts on an idle GPU, and it can land clear of
+  the renderer.
+- On 8 batches beside the light renderer the compute job itself took 250,
+  499 or 749 ms for 250 ms of work: batches wait for each other. One such
+  job passed 1 s and was reset: the unplanned reset of this round.
+- Interpretation, not measured: a QPU runs two threads and hands over only
+  at a thread switch, so a batch without switches blocks whatever else has
+  a thread on its QPU. The measurements above are consistent with that and
+  do not prove it.
+- A TMU load per iteration beside `test_08`: 1,674–1,945 ns per iteration
+  (96 ns alone), renderer at 110.4 FPS (`tmu_load_beside.txt`).
+
+**3. The renderer's own job hangs while the mailbox is in use**
+(`renderer_hangs.txt`; `gl_probe` with one frame whose shader loops 10^8
+times per pixel; `rt_mailbox foreign` without its own hung job; 4 runs).
+
+| | 1 batch (2 runs) | 8 batches (2 runs) |
+|---|---|---|
+| resets until the hung render job was cancelled | 3 and 2 | 2 and 2 |
+| jobs the kernel blamed first | **the mailbox's lease**, 4 of 4 runs | |
+| longest mailbox request | 2,021 and 1,508 ms | 1,496 and 1,523 ms |
+| requests over 100 ms | 1 per run | 1 per run |
+| requests sent, wrong words | 227,679 and 250,335; 0 | 40,338 and 40,546; 0 |
+| lost leases counted | 1 and 0 | 0 |
+
+- A hung render job stops the lease too, so the lease's timer expires and
+  the kernel cancels the lease and runs the hung render job **again**. Only
+  when the render job's own timer comes first is it cancelled.
+- The mailbox recovered every time with no wrong word. The watchdog cannot
+  help here: the lease is not running, so it cannot see the yield.
+
+**4. A chain loop with thread switches: built, wrong, fixed, adopted**
+(`chain_stretch_*`). `hs_mailbox_cfg.chain_stretch` sets how many loop
+iterations (4 steps each) run between two switches;
+`HS_MB_CHAIN_NO_SWITCH` keeps the earlier loop.
+
+- **A thread switch that really runs another thread does not keep the
+  accumulators r0–r3.** The first version was bit-exact alone at every
+  setting and wrong beside `test_08` at every setting: 1,216 to 2,176 wrong
+  words per run, nearly every checked element
+  (`chain_stretch_beside_accumulators_lost.txt`). The loop now reloads c1
+  and c0 and redoes the pending multiply after each switch: 0 wrong in all
+  10 runs. Registers rf0–rf63 are kept (the whole program depends on it).
+- Alone, 1 batch, mean request time:
+
+| stretch | 1 pair, k = 65,536 | 1,024 pairs, k = 232 | 16 pairs, k = 4,096 |
+|---|---|---|---|
+| no switches | 0.900 ms | 3.745 ms | 0.908 ms |
+| 64 | 0.941 (+4.6 %) | 3.781 | 0.946 |
+| **128 (default)** | **0.921 (+2.3 %)** | **3.784 (+1.0 %)** | **0.927 (+2.1 %)** |
+| 256 | 0.910 (+1.1 %) | 3.784 | 0.915 |
+| 512 | 0.905 (+0.6 %) | 3.781 | 0.910 |
+
+- Beside `test_08`, k = 65,536 back to back for 5 s:
+
+| stretch | 1 batch: render jobs per s | longest gap | request | 8 batches: render jobs per s | request |
+|---|---|---|---|---|---|
+| no switches | 37.0 | 61.2 ms | 0.925 ms | 74.9 | 2.51 ms |
+| 64 | 105.7 | 9.6 ms | 1.838 ms | 89.0 | 2.58 ms |
+| **128** | **102.8** | **10.0 ms** | **1.382 ms** | **88.4** | **2.27 ms** |
+| 256 | 100.2 | 10.3 ms | 1.153 ms | 88.0 | 2.29 ms |
+| 512 | 95.0 | 11.1 ms | 1.044 ms | 87.3 | 2.29 ms |
+
+- Against 4 CPU cores with the default (`final_bench.txt`, 8 batches,
+  k = 4,096): 60.5 µs against 73.3 µs for 256 elements (1.21×, was 1.24×)
+  and 922 µs against 1,171 µs for 4,096 (1.27×, was 1.31×). Echo: 2.14 µs
+  on 1 batch, 3.24 µs on 8, unchanged.
+
+**5. 2 and 4 batches** (`cases_b2.txt`, `cases_b4.txt`,
+`batches_2_4_beside.txt`). `hs_v3d_dispatch` and `hs_mailbox_start` now
+accept 1, 2, 4 and 8.
+
+| | 2 batches | 4 batches |
+|---|---|---|
+| adversarial cases | 25 of 25 | 25 of 25 |
+| beside `test_08`: soak, chain load, gathers always in flight, echoes | 0 wrong, all rc 0 | 0 wrong, all rc 0 |
+| renderer during those four loads | 107.6 / 104.2 / 99.9 / 106.3 FPS | 105.1 / 102.9 / 96.4 / 93.7 FPS |
+| longest job with gathers always in flight (limit 20 ms) | 24.4 ms | 25.8 ms |
+
+- The job-based gather kernel (`hs_qpu_kernel_gather`) still takes 1 or 8
+  only: it was not run on 2 or 4.
+
+**Tests.** A new case, "chain step counts around the stretch boundaries"
+(12 step counts, bit-exact), and two mutants: `m20` drops the reload after
+the switch and is caught only beside the renderer (1,536 wrong words;
+alone nothing notices), `m21` stops clamping the last stretch. Mutants: 20
+of 20 caught, control passes (`final_mutants.txt`). Cases: 24 on 1 batch,
+25 on 2, 4 and 8, 0 failures. `tests/test_mailbox` passes. Build 0
+warnings, `check-sources` 0.
+
+**Dropped from the open list, as not worth a measurement:** a job-based
+chain kernel (none exists and nothing needs one) and CPU code hand-written
+in assembly (the NEON version reaches 28.6 GFLOPS on 4 cores and is the
+comparison used).
+
+**Still not measured:**
+- Why a batch freezes a renderer in some jobs and not in others: the
+  interpretation in 2 is untested.
+- Displayed output. Everything here is offscreen or `test_08`'s frame rate;
+  no cancelled frame was looked at on the panel.
+- The mailbox with a real NeoGPU workload: nothing calls it yet.

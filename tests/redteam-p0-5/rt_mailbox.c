@@ -11,6 +11,8 @@
  *       a steady caller: latency and the longest lease (env RT_WD_OFF, RT_BUDGET)
  *   rt_mailbox pipe <batches> <seconds> [chunks per batch per request]
  *       requests always in flight: the lease bound under continuous load
+ *   rt_mailbox chainload <batches> <seconds> <pairs per batch> <k> [gap_us]
+ *       chain requests back to back: what a renderer beside them gets
  *   rt_mailbox reset <batches>      a REAL kernel reset of a lease mid-request
  *   rt_mailbox foreign <batches>    a REAL reset caused by another client's hung job
  *       (both add to the GPU reset count: run them alone and on purpose)
@@ -88,6 +90,8 @@ static float chain_ref(float x, uint32_t k, float c1, float c0) {
 static int wd_off;
 static void start(hs_mailbox* mb, uint32_t batches, uint32_t budget, uint32_t slots) {
     hs_mailbox_cfg cfg = {.batches = batches, .budget = budget, .slots = slots, .bos = bos, .nbos = 5, .watchdog_off = wd_off};
+    if (getenv("RT_QDEPTH")) cfg.qdepth = (uint32_t)atoi(getenv("RT_QDEPTH"));
+    if (getenv("RT_STRETCH")) cfg.chain_stretch = (uint32_t)strtoul(getenv("RT_STRETCH"), 0, 0); /* 0xffffffff: no switches */
     int e = hs_mailbox_start(mb, &dev, &cfg);
     if (e) die("hs_mailbox_start", e);
 }
@@ -201,6 +205,12 @@ static void cases(uint32_t batches) {
         rc = hs_mailbox_gather(&mb, bi.gpu, bt.gpu, TABLE_N, bo.gpu, 0, 0);
         int rc2 = hs_mailbox_chain(&mb, bx.gpu, by.gpu, 0, 4, 1.f, 0.f);
         report("zero elements", batches, !rc && !rc2, "\"rc\":%d,\"rc_chain\":%d", rc, rc2);
+        /* the chain runs its steps in stretches of HS_MB_CHAIN_STRETCH_DEFAULT * 4
+         * with a thread switch between: step counts around the boundaries */
+        static const uint32_t ks[] = {4, 8, 508, 512, 516, 1020, 1024, 1028, 2044, 4000, 4096, 4100};
+        int badk = 0, rck = 0;
+        for (unsigned i = 0; i < sizeof ks / sizeof ks[0] && !rck; i++) badk += chain_checked(&mb, per * 3, ks[i], 0, 0, &rck);
+        report("chain step counts around the stretch boundaries", batches, !badk && !rck, "\"wrong\":%d,\"rc\":%d", badk, rck);
     }
     /* a table the mailbox itself wrote, read with table_changes = 0 and 1 */
     for (int tc = 0; tc <= 1; tc++) {
@@ -469,10 +479,12 @@ static void cases(uint32_t batches) {
         int rc2;
         bad += gather_checked(&mb, 1024, 0, 0, &rc2);
         hs_mailbox_free(&mb);
-        hs_mailbox_cfg c[] = {{3, 0, 0, 0, bos, 5, 0, 0, 0},      {1, 0, 0, 0, bos, 14, 0, 0, 0}, {1, 1, 0, 0, bos, 5, 0, 0, 0},
-                              {1, 0, 0, 1, bos, 5, 0, 0, 0},      {1, 0, 9, 0, bos, 5, 0, 0, 0},  {1, 0, 0, 0, NULL, 5, 0, 0, 0},
-                              {1, 0, 0, 3, bos, 5, 0, 0, 0},      {1, 250001, 0, 0, bos, 5, 0, 0, 0},
-                              {1, 4000000, 0, 0, bos, 5, 0, 0, 0}, {1, 0, 0, 131072, bos, 5, 0, 0, 0}};
+        hs_mailbox_cfg c[] = {{3, 0, 0, 0, bos, 5, 0, 0, 0, 0},       {1, 0, 0, 0, bos, 14, 0, 0, 0, 0},
+                              {1, 1, 0, 0, bos, 5, 0, 0, 0, 0},       {1, 0, 0, 1, bos, 5, 0, 0, 0, 0},
+                              {1, 0, 9, 0, bos, 5, 0, 0, 0, 0},       {1, 0, 0, 0, NULL, 5, 0, 0, 0, 0},
+                              {1, 0, 0, 3, bos, 5, 0, 0, 0, 0},       {1, 250001, 0, 0, bos, 5, 0, 0, 0, 0},
+                              {1, 4000000, 0, 0, bos, 5, 0, 0, 0, 0}, {1, 0, 0, 131072, bos, 5, 0, 0, 0, 0},
+                              {1, 0, 0, 0, bos, 5, 0, 0, 0, 3},       {1, 0, 0, 0, bos, 5, 0, 0, 0, 65536}};
         int nc = sizeof c / sizeof c[0], okc = 0;
         for (int i = 0; i < nc; i++) okc += hs_mailbox_start(&mb, &dev, &c[i]) == -EINVAL;
         okc += hs_mailbox_start(&mb, &dev, NULL) == -EINVAL;
@@ -869,8 +881,9 @@ static void foreign_mode(uint32_t batches) {
     uint32_t* out = (uint32_t*)bo.map;
     hs_v3d_dispatch_desc d = {spin, unif.gpu, 1, h, 2, 0};
     uint64_t t0 = now_ns();
-    if ((e = hs_v3d_dispatch(&dev2, &d))) die("spin dispatch", e);
-    uint64_t reqs = 0, slow = 0, lat_max = 0;
+    /* RT_FOREIGN_NOSPIN: no job of our own; something else (a renderer whose job hangs) causes the reset */
+    if (!getenv("RT_FOREIGN_NOSPIN") && (e = hs_v3d_dispatch(&dev2, &d))) die("spin dispatch", e);
+    uint64_t reqs = 0, slow = 0, slow100 = 0, lat_max = 0;
     double spin_gone_ms = 0;
     while (now_ns() - t0 < 8000000000ull && !rc) {
         uint32_t n = 16 * batches * 4;
@@ -888,6 +901,7 @@ static void foreign_mode(uint32_t batches) {
         uint64_t dt = now_ns() - t;
         if (dt > lat_max) lat_max = dt;
         slow += dt > 1000000000ull;
+        slow100 += dt > 100000000ull;
         for (uint32_t i = 0; i < n; i++) bad += out[i] != T[ix[i]];
         reqs++;
         if (!spin_gone_ms && !hs_v3d_bo_wait(&dev2, &code, 0)) spin_gone_ms = (now_ns() - t0) / 1e6;
@@ -897,14 +911,56 @@ static void foreign_mode(uint32_t batches) {
     int ok = !rc && !rc2 && !rc3 && !bad && spin_gone_ms > 0;
     printf("{\"reset\":\"another client's job hangs while the mailbox is in use\",\"batches\":%u,\"ok\":%s,\"requests\":%llu,"
            "\"rc\":%d,\"wrong\":%d,\"longest_request_ms\":%.1f,\"requests_over_1s\":%llu,\"hung_job_gone_after_ms\":%.0f,"
-           "\"lost_leases_counted\":%llu,\"rc_stop\":%d,\"rc_restart\":%d}\n",
+           "\"lost_leases_counted\":%llu,\"rc_stop\":%d,\"rc_restart\":%d,\"requests_over_100ms\":%llu}\n",
            batches, ok ? "true" : "false", (unsigned long long)reqs, rc, bad, lat_max / 1e6, (unsigned long long)slow, spin_gone_ms,
-           (unsigned long long)mb.lost_leases, rc2, rc3);
+           (unsigned long long)mb.lost_leases, rc2, rc3, (unsigned long long)slow100);
     if (!ok) failures++;
     hs_mailbox_free(&mb);
     hs_v3d_bo_free(&dev2, &code);
     hs_v3d_bo_free(&dev2, &unif);
     hs_v3d_close(&dev2);
+}
+
+/* Chain requests back to back for `seconds`: `pairs` pairs of chunks per
+ * batch, k steps each. A chain pair runs its k steps with no thread switch
+ * (one switch per pair, at its loads), and a compute job gives the QPUs to a
+ * renderer only at thread switches (tools/p0_5_spin_probe). Beside a renderer
+ * under reset_trace.bt this measures what the renderer gets. gap_us: pause
+ * between requests (0: none). One request in 64 is checked against the CPU
+ * (checking takes the CPU longer than the request takes the GPU). */
+static void chainload(uint32_t batches, double seconds, uint32_t pairs, uint32_t k, uint32_t gap_us) {
+    hs_mailbox mb;
+    start(&mb, batches, 0, 0);
+    uint32_t n = 32 * batches * pairs;
+    int rc = 0, bad = 0;
+    uint64_t reqs = 0, checked = 0, t0 = now_ns(), busy = 0, mx = 0;
+    while (now_ns() - t0 < (uint64_t)(seconds * 1e9) && !rc) {
+        uint64_t t = now_ns(), d;
+        if (reqs % 64 == 0) {
+            bad += chain_checked(&mb, n, k, 0, 0, &rc);
+            d = (uint64_t)(last_call_ms * 1e6);
+            checked++;
+        } else {
+            rc = hs_mailbox_chain(&mb, bx.gpu, by.gpu, n, k, 0.9995f, 0.0007f);
+            d = now_ns() - t;
+        }
+        busy += d;
+        if (d > mx) mx = d;
+        reqs++;
+        if (gap_us) {
+            struct timespec ts = {0, (long)gap_us * 1000};
+            nanosleep(&ts, NULL);
+        }
+    }
+    int ok = !rc && !bad && !mb.lost_leases;
+    printf("{\"chainload\":true,\"batches\":%u,\"pairs_per_batch\":%u,\"k\":%u,\"gap_us\":%u,\"ok\":%s,\"requests\":%llu,\"checked\":%llu,\"rc\":%d,"
+           "\"wrong\":%d,\"gpu_share_of_time\":%.3f,\"request_ms\":{\"mean\":%.3f,\"max\":%.3f},\"leases\":%u,\"age_yields\":%llu,\"longest_job_ms\":%.2f}\n",
+           batches, pairs, k, gap_us, ok ? "true" : "false", (unsigned long long)reqs, (unsigned long long)checked, rc, bad,
+           (double)busy / (double)(now_ns() - t0), busy / 1e6 / (double)(reqs ? reqs : 1),
+           mx / 1e6, hs_mailbox_leases_done(&mb, 0), (unsigned long long)atomic_load(&mb.wd_age_yields),
+           atomic_load(&mb.wd_job_gap_max_ns) / 1e6);
+    if (!ok) failures++;
+    hs_mailbox_free(&mb);
 }
 
 /* first request after the GPU sat idle: a plain job against the mailbox */
@@ -1031,6 +1087,9 @@ int main(int argc, char** argv) {
         reset_mode((uint32_t)atoi(argv[2]));
     else if (!strcmp(mode, "foreign") && argc > 2)
         foreign_mode((uint32_t)atoi(argv[2]));
+    else if (!strcmp(mode, "chainload") && argc > 5)
+        chainload((uint32_t)atoi(argv[2]), atof(argv[3]), (uint32_t)atoi(argv[4]), (uint32_t)atoi(argv[5]),
+                  argc > 6 ? (uint32_t)atoi(argv[6]) : 0);
     else if (!strcmp(mode, "pipe") && argc > 3)
         pipe_mode((uint32_t)atoi(argv[2]), atof(argv[3]), argc > 4 ? (uint32_t)atoi(argv[4]) : HS_MB_MAX_GATHER_CHUNKS);
     else if (!strcmp(mode, "jobcheck") && argc > 3)

@@ -52,13 +52,13 @@ uint32_t hs_v3d_load(hs_v3d_bo* code, size_t off, const uint64_t* prog, uint32_t
  * batch its own number, and the gather kernel wrote wrong words in 3,273 of
  * 3,279 jobs; with rf0, 79,177 of 79,177 (tools/p0_5_batch_id_probe,
  * docs/audit/HARDWARE_HANDOFF_P0.md P0-5).
- * Only batches = 1 or 8 is accepted: the other counts were never measured. `bos` lists every BO the job touches (code, uniforms, data), so
+ * batches = 1, 2, 4 or 8 is accepted (2 and 4: measured through hs_mailbox only). `bos` lists every BO the job touches (code, uniforms, data), so
  * the kernel can track them. Returns 0 or -errno (-EINVAL for a refused
  * descriptor). */
 typedef struct {
     uint32_t code_gpu;  /* from hs_v3d_load */
     uint32_t unif_gpu;  /* uniform stream */
-    uint32_t batches;   /* 1 or 8 */
+    uint32_t batches;   /* 1, 2, 4 or 8 */
     const uint32_t* bos; /* BO handles */
     uint32_t nbos;
     uint32_t perfmon;   /* 0, or a perfmon id */
