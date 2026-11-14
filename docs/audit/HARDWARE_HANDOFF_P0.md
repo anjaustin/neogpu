@@ -27,7 +27,7 @@ So the gains lie in hardware blocks that NeoGPU does not use yet.
 | P0-3 | The GPU renders every layer at full panel resolution into one plane | HVS planes: static layers composed at scanout, and upscaling from a lower render resolution | 0.68 ns per pixel of fill, measured (COST_BREAKDOWN §8). Unknown: HVS blend and scale cost | **Shelved 2026-11-16.** Watched on the panel, the scaled image looked progressively more pixelated, not like a native render: a quality trade, not a speed-up. `hs_graphics_init_scaled` is out of the public API (behind `HS_GRAPHICS_SHELVED_SCALED`, kept for the tests). Kept: the plane-reset fix, the layer measurements and the tests. Reconstruction upscaling (adaptive edge refinement, temporal) was proposed and is shelved too. Before shelving: **Scaling made (opt-in):** `hs_graphics_init_scaled` renders at a reduced size and the HVS scales it at scanout. test_08 runs 1.76× faster at 600×360 and 3.9× at 400×240, on the panel. HVS composition and scaling cost no frame time on this panel (they do use memory bandwidth). Layers and sprites: measured capable, not built (no current user with a GPU cost to save). **Red team found and fixed:** takeover (native too) inherited a previous client's plane alpha, filter and blend mode, and native takeover left stray overlays on. The test now kills 14 of 14 mutants |
 | P0-4 | Capture: `glReadPixels`, then a CPU swizzle and flip, then a write | The writeback connector (the frame actually scanned out); the H.264 encoder for recording | Unknown: current cost | Not started |
 | P0-5 | Each GPU message is a job (~37 µs floor) | A persistent QPU mailbox | 0.76 µs RTT, 110–138× Mesa (VS_MESA.md) | **Built, red-teamed and hardened (2026-11-17); nothing in NeoGPU calls it yet.** Messages cost 2.1–3.3 µs, against 64–71 µs for a job. **It wins in one regime:** arithmetic-deep work (4,096 steps per element) runs 1.21–1.27× faster than all 4 CPU cores, bit-exact (1.24–1.31× before the chain loop was given thread switches so that it cannot stop a renderer). For gathers and for shallow arithmetic the CPU wins at every size tested. The red team found a defect in shipped code: every 8-batch program took its batch number from the QPU thread index and wrote wrong words beside a renderer (gather kernel: 3,273 of 3,279 jobs); fixed, 0 of 3,206 after. Costs while the mailbox is in use: 2–3% of a Mesa renderer on 1 batch, 34–40% on 8; nothing once the caller has been quiet for 2 ms |
-| P0-6 | Mesa's start-up (`gbm_create_device` 79.5 ms) | A direct V3D compute → KMS scanout path for scenes compute can render | Direct cold start 0.47 ms, measured. Unknown: sharing a v3d BO with vc4 | **Started 2026-11-17; the scene runs on the panel.** A buffer vc4 allocates can be imported into v3d and filled by a compute job (the reverse is refused). A test pattern rendered by QPU compute alone is flipped at 60 Hz with no Mesa in the process: 0.37 ms per frame, no late flip, both buffers and the display controller's own capture of the frame checked. The two probes were red-teamed (11 findings fixed, 18 cases, 9 of 9 mutants). Reciprocal and reciprocal square root measured: within 1 ulp, one instruction each. **The scene, stage 1 (primary rays, flat colours):** a hand-assembled kernel renders it in 2.66 ms per frame on 8 batches, identical to a CPU reference except 1–3 edge pixels in 200 frames. **The whole scene** (shading, shadows, one reflection): 725 instructions per 16 pixels, 15.6 ms per frame (64 FPS), about 7 of 384,000 pixels per frame off the CPU reference. Run straight through it is 1.72× slower than Mesa (110 FPS). **With work skipped where its result is known (sky rows, reflections that hit nothing, ground nothing can reach) the same image, bit for bit, takes 3.87 ms of GPU time plus 0.16 ms of CPU per frame.** Red-teamed twice (11 findings fixed, one of them a wrong pixel in 4 of 200 frames that the first check had passed; 43 cases, 12 faults, 7 of 7 mutants). **On the panel through KMS, no Mesa in the process: 247.9 frames rendered per second against Mesa's 110.0 in the same session, 2.25×; 60.2 flips per second, none late; the frames on the panel checked against the reference and the display controller's capture** (25 cases, 12 of 12 mutants). Next: sphere lists for the long path, the path beside another GPU client; plan in `P0_6_PLAN.md` |
+| P0-6 | Mesa's start-up (`gbm_create_device` 79.5 ms) | A direct V3D compute → KMS scanout path for scenes compute can render | Direct cold start 0.47 ms, measured. Unknown: sharing a v3d BO with vc4 | **Started 2026-11-17; the scene runs on the panel.** A buffer vc4 allocates can be imported into v3d and filled by a compute job (the reverse is refused). A test pattern rendered by QPU compute alone is flipped at 60 Hz with no Mesa in the process: 0.37 ms per frame, no late flip, both buffers and the display controller's own capture of the frame checked. The two probes were red-teamed (11 findings fixed, 18 cases, 9 of 9 mutants). Reciprocal and reciprocal square root measured: within 1 ulp, one instruction each. **The scene, stage 1 (primary rays, flat colours):** a hand-assembled kernel renders it in 2.66 ms per frame on 8 batches, identical to a CPU reference except 1–3 edge pixels in 200 frames. **The whole scene** (shading, shadows, one reflection): 725 instructions per 16 pixels, 15.6 ms per frame (64 FPS), about 7 of 384,000 pixels per frame off the CPU reference. Run straight through it is 1.72× slower than Mesa (110 FPS). **With work skipped where its result is known (sky rows, reflections that hit nothing, ground nothing can reach) the same image, bit for bit, takes 3.87 ms of GPU time plus 0.16 ms of CPU per frame.** Red-teamed twice (11 findings fixed, one of them a wrong pixel in 4 of 200 frames that the first check had passed; 43 cases, 12 faults, 7 of 7 mutants). **On the panel through KMS, no Mesa in the process: 247.9 frames rendered per second against Mesa's 110.0 in the same session, 2.25×; 60.2 flips per second, none late; the frames on the panel checked against the reference and the display controller's capture** (25 cases, 12 of 12 mutants). **With per-region sphere lists (the long path tests about 4.5 spheres per 16 pixels, not 24) the job takes 2.23 ms and the panel shows 444 frames per second, every frame flipped, none dropped: 4.02× Mesa's 110.** The image is bit for bit the one without cuts; beside another GPU client it stays correct and the GPU is shared. Open: one unexplained hardware behaviour met on the way (uniform-stream reads inside a loop at 8 batches), the list builder's 1.7 ms of CPU per frame; plan in `P0_6_PLAN.md` |
 | P0-7 | Texture uploads | The TFU (raster to tiled, mipmaps) | No streaming-texture user today | Not started |
 
 **Rules for every item:**
@@ -1297,7 +1297,7 @@ operands in and its results out, as the inline form does by construction
   (the probe uses 2,048-byte blocks). Not measured beside a renderer, and
   the op-carrying TMU writes (atomic add and the like) were not tried.
 
-## P0-6: QPU compute to KMS without Mesa (the scene runs on the panel, 2.25× Mesa)
+## P0-6: QPU compute to KMS without Mesa (the scene runs on the panel, 4× Mesa)
 
 Evidence: `tests/evidence-p0-6-20261117/`. Nothing here is a renderer yet:
 these are the measurements a compute renderer has to stand on.
@@ -1741,13 +1741,136 @@ GPU resets 261 before and after.
   time in the CPU reference, with the GPU free. Only the frames' validity
   is taken from it.
 
-**Not measured:** how the GPU's time is divided and why the renderer gets
+### Sphere lists for the long path (`tools/p0_6_scene.h`, `tools/p0_6_lists_stats`, `tests/evidence-p0-6-lists-20261117/`; plan step 5, item 3)
+
+The long path tested all six spheres four times per 16 pixels (primary
+ray, shadow of its hit, reflected ray, shadow of that hit): 492 of its 745
+instructions. Measured first, on the CPU, what a region really needs
+(`tools/p0_6_lists_stats`, the reference instrumented per pixel): 1.12
+spheres for the primary rays, 0.11 for the first shadow test, 0.38 for the
+reflected rays, 0.15 for the second shadow test: 40 instructions' worth.
+
+**The lists.** Per frame, for each region on the long path, the CPU builds
+four conservative lists (`region_lists`):
+
+- primary: the cone test of the region sort, per sphere;
+- where the region's rays enter sphere j: a ray at angle ψ from the
+  direction to the centre enters where the normal is at
+  θ(ψ) = asin(D sin ψ / r) − ψ from that direction, at the same azimuth. The
+  region's patch is cut into cells in (ψ, azimuth), one coarse pass and one
+  of 2 × 2 on what the coarse pass let through; a cell's normals lie in a
+  cone, so its reflected rays start in a small ball and lie in a cone (a
+  mirror turns a ray by twice the turn of its normal);
+- shadow of the primary hit: sphere j itself only where a normal of the
+  patch can face away from the light; another sphere only if it reaches
+  the tube of j along the light; the ground patch as in the region sort;
+- reflected rays: each other sphere against the cell's cone;
+- shadow of the reflected hit: the tube of each sphere the reflection can
+  reach, and, when a reflected ray can go down, each sphere whose shadow on
+  the ground (a disc) the cone can point at.
+
+| | primary | shadow 1 | reflected | shadow 2 | sphere-test instructions per 16 pixels |
+|---|---|---|---|---|---|
+| all six, as before | 6 | 6 | 6 | 6 | 492 |
+| the lists (2 × 2 cells) | 1.19 | 0.60 | 1.06 | 1.67 | 93 |
+| what the pixels need | 1.12 | 0.11 | 0.38 | 0.15 | 40 |
+
+**Sound:** no region's list lacked a sphere one of its pixels needs, in
+1,000 frames at 8 batches and 300 frames each at 4, 2 and 1 batches (their
+regions have other shapes), and with 1 and 4 cells per side
+(`soundness.txt`). The tool exits non-zero on the first missing sphere.
+
+**In the kernel.** Two loops (trace, shadow test) replace the 24 unrolled
+sphere tests. With lists, every region has its own block of the constant
+stream: the constants in the order the kernel reads them and, where a list
+goes, the records of its spheres, each preceded by a non-zero word and the
+last followed by zero. The CPU builds one block per distinct set of lists
+per frame and gives each region its block's address beside its class. The
+operations per sphere are those of the unrolled code in the same order.
+
+| 8 batches, 200 frames across the orbit | instructions per 16 pixels (static) | GPU job, median (min–max) | CPU per frame |
+|---|---|---|---|
+| cuts 1–3 (before) | 745 | 3.87 ms (3.63–4.00) | 0.16 ms |
+| with lists, 2 × 2 cells | 403 | 2.23 ms (2.16–2.27) | 1.68 ms |
+| with lists, 1 cell | 403 | 2.31 ms (2.23–2.35) | 1.17 ms |
+
+- **The image is the same, bit for bit:** 0 of 200 frames differ from the
+  run with no cuts at 8 batches; 0 of 48 at 4, 2 and 1 batches, without
+  shadows, without reflection.
+- **The CPU's share is now the larger cost** (1.68 ms against 0.16): a
+  first version with inverse trigonometry in every test took 5.4 ms. A
+  loop that prepares a frame and then renders it would run at 257 FPS, no
+  better than before the lists. So the panel loop is a pipeline: while a
+  job renders, the CPU prepares the next frame in a second set of buffers.
+
+**On the panel** (`panel_final.txt`; every frame flipped at once, none
+dropped; alternating with Mesa's test in the same session):
+
+| 10 s on the panel | frames rendered and flipped per second | frame to frame, median (p99) |
+|---|---|---|
+| Mesa, `test_08` | 110.5, 110.4 | — |
+| QPU compute, before lists | 246.9, 250.8 | 4.05 ms |
+| **QPU compute, with lists** | **444.3, 444.7** | 2.26 ms (2.30) |
+
+**4.02 times Mesa's frame rate.** Per frame: the job 2.24 ms from submit to done, the CPU's 1.68 ms inside that time. The 12 checked frames match the reference in all three buffers, and the capture of the last framebuffer equals its memory.
+
+**Beside the heavy renderer** (26 ms frames; `coexist.txt`): all 200
+frames bit-identical to the run alone, the 12 checked panel frames too, no
+renderer frame wrong. On the panel compute renders 93.5 FPS (21 % of its
+445) and the renderer 34.5 FPS (92 % of its 37.5); before the lists it was
+57.7 and 32.2.
+
+**What went wrong on the way** (4 unplanned GPU resets, 262–265):
+
+1. The first loop pointed the one constant stream at each sphere's record
+   in turn, with the unifa write just before the loop's branch. False
+   shadows, then a hang. I guessed at the cause twice (a write through the
+   multiply output; a fetch on a conditional instruction), ran each guess,
+   and each cost a reset with the same wrong image. The image itself,
+   looked at afterwards, showed which loops failed and where.
+2. **A rule of the hardware, measured in a probe that cannot hang**
+   (`tools/p0_6_unifa_probe branch`, `unifa_branch.txt`): a branch that is
+   **not taken** spoils every later read of the constant stream when the
+   unifa write is one of the 3 instructions before it or in its first
+   delay slot. A taken branch does not. In the second or third delay slot
+   the write is safe on both paths (third slot and two more instructions
+   before the first read).
+3. With the write moved to the second delay slot, and the record addresses
+   read from the first uniform stream inside the loop: right at 1, 2 and 4
+   batches; at 8 batches wrong in batches 0–3 at regular intervals and
+   never in 4–7, and the wrong places moved when instructions were added
+   (`sites.txt`). **Not explained.** The design in use reads nothing from
+   the first stream inside a loop and never writes unifa inside one.
+
+Rules added: an untried loop shape goes through the probe first, where a
+wrong answer cannot hang; after a failure, read the image before changing
+the code.
+
+**Verification** (lists are now the default, `P06_CULL` 15):
+
+- `scene_cases.sh`: 54 cases, 0 failures (`cases.txt`). Added: every
+  combination with lists, 1 and 4 cells, three list faults (the primary
+  list lacks a sphere, the reflected list is empty, the second shadow list
+  is empty: each fails), the exact comparison at every batch count and
+  variant with lists and once without.
+- `scene_mutants.sh`: 7 of 7, control passes (`mutants.txt`). The first run
+  of this round had one failing case and so a failing control: the
+  "constant table overflows" case no longer overflowed, because the kernel
+  with lists has 91 constants where it had 269. The case was wrong, not the
+  guard; it now pads further.
+- `scene_present_cases.sh`: 28 cases, 0 failures; `scene_present_mutants.sh`:
+  13 of 13 (`sp_cases.txt`, `sp_mutants.txt`).
+- `scene_coexist.sh` beside the heavy renderer: 4 of 4 checks.
+- GPU resets 265 before and after all of it; no display underrun.
+
+**Not measured:** why record addresses read in a loop fail in batches 0–3
+(item 3); a write of unifa through the multiply output (blamed wrongly,
+then never tested); the list builder on more than one core; lists closer
+to the floor (the second shadow list is 1.67 against 0.15 needed); how the GPU's time is divided and why the renderer gets
 the larger share (no trace was taken); three or more clients; the compute
 path beside another display client; how the image differs from Mesa's (it matches a
 reference of the kernel's own arithmetic); what the panel shows under
-immediate flips (above); the long path's
-sphere lists (plan step 5, item 3: 612 regions still test six spheres
-three times, 745 instructions, over the 512 mark); `exp`, `log` and
+immediate flips (above); `exp`, `log` and
 `rsqrt2` (their encodings are not in Mesa's output for this shader, and
 none was guessed); why the special-function result cannot go to an
 accumulator; the lost lanes after a reset.

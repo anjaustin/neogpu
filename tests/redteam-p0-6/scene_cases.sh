@@ -58,7 +58,7 @@ run "bad arguments: frames not a number" 2 -- 8 x
 run "bad arguments: cuts 16" 2 P06_CULL=16 -- 8 1
 run "bad arguments: lists without the region sort (cuts 9)" 2 P06_CULL=9 -- 8 1
 run "bad arguments: margin not a number" 2 P06_MARGIN=nan -- 8 1
-run "a constant table that would overflow: refused at build" 3 P06_PAD=1900 P06_PAD_KIND=1 P06_BUILD_ONLY=1 -- 8 1
+run "a constant table that would overflow: refused at build" 3 P06_PAD=2000 P06_PAD_KIND=1 P06_BUILD_ONLY=1 -- 8 1
 # the exact comparison: the cuts change no pixel, for every region shape and variant;
 # and it sees a bound that is a little too tight, which the reference check lets through
 if [ -z "$NOAB" ]; then

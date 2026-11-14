@@ -44,7 +44,11 @@ answer it early.
 - `recip`, `rsqrt` and `sin` write to a register-file entry, never to an
   accumulator (that hangs the QPU).
 - A kernel that has never run is run for one frame first: a hang costs a
-  GPU reset per job.
+  GPU reset per job. A new loop shape is tried in a probe whose loops do
+  not depend on what it reads, before it goes into the kernel.
+- No unifa write in the 3 instructions before a branch that may not be
+  taken, nor in its first delay slot. No read of the first uniform stream
+  inside a loop.
 - Every number in the documents is a measurement. Every check is shown to
   fail when the thing it checks is broken.
 - Existing tests keep passing (`make test`, `check-sources`,
@@ -156,6 +160,19 @@ found a region bound that was wrong in 4 of 200 frames and a check that
 passed it; cut and uncut images are now compared exactly. A new rule from
 it: a cut is verified by exact comparison with the uncut image, not by the
 reference's allowance. Plan as written before the work:
+
+**Item 3 done 2026-11-17 (sphere lists).** Each long-path region tests only
+the spheres on its four lists: 745 → 403 instructions per 16 pixels, the
+job 3.87 → 2.23 ms, the image unchanged bit for bit. The CPU builds the
+lists in 1.7 ms per frame, so the panel loop prepares the next frame while
+a job renders: 444 frames per second on the panel, none dropped, 4.02×
+Mesa. Item 4 (hot paths under 512 instructions) follows from it. Left in
+this step: the lists are 93 instructions' worth where the pixels need 40;
+the list builder is the largest CPU cost. New invariants: a branch not
+taken spoils the constant stream when the unifa write is within 3
+instructions before it or in its first delay slot; nothing is read from
+the first uniform stream inside a loop; an untried loop shape goes through
+a probe that cannot hang first.
 
 Measured starting point: 15.6 ms per frame, 725 instructions for every 16
 pixels; Mesa 9.1 ms. Pixels at t = 1: sky 50 %, ground 34 %, spheres 16 %.
