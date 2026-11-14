@@ -79,6 +79,12 @@ MUTANTS = [
     ("m17_age_yield_soft", "src/hs_mailbox.c",
      "    br(p, HS_QPU_B_ANYNA, done, 0);\n", "    nop(p); /* mutant */\n",
      "pipe 1 6", "the age yield does not end a lease that always has requests pending"),
+    ("m19_per_batch_slot_cap", "src/hs_mailbox.c",
+     ["    load(p, RF(16), RF(14));\n    load(p, RF(6), R(1));\n",
+      "    hs_qpu_branch(p, HS_QPU_B_A0, done, 0, 0); /* the ring wrapped: end the lease */"],
+     ["    load(p, RF(16), RF(14));\n    load(p, RF(6), R(1));\n    op(p, HS_QPU_A_ADD, RF(10), RF(19), I(1));\n",
+      "    flags(p, HS_QPU_A_SUB, RF(10), RF(10), I(1), HS_QPU_PF_PUSHZ);\n    hs_qpu_branch(p, HS_QPU_B_A0, done, 0, 0);"],
+     RT8, "the earlier rule (a lease takes `slots` requests per batch): a slot another batch cached is run stale"),
     ("m13_no_stall_yield", "src/hs_mailbox.c",
      "else if (!mb->yielding && t - t_partial > STALL_NS) {", "else if (0) {",
      BESIDE + " busy 8 6 100 0", "informational: 8 batches beside a renderer without the stall yield (compare p99)"),
@@ -111,11 +117,15 @@ def main():
             src = o + ".c"
             if src == path:
                 text = open(src).read()
-                if text.count(old) != 1:
-                    log(f"{name}: EDIT DID NOT APPLY ({text.count(old)} matches)")
+                edits = list(zip(old, new)) if isinstance(old, list) else [(old, new)]
+                missing = [o for o, _ in edits if text.count(o) != 1]
+                if missing:
+                    log(f"{name}: EDIT DID NOT APPLY ({len(missing)} of {len(edits)} edits)")
                     objs = None
                     break
-                open(f"{d}/mutant.c", "w").write(text.replace(old, new))
+                for o, n_ in edits:
+                    text = text.replace(o, n_)
+                open(f"{d}/mutant.c", "w").write(text)
                 r = sh(f"gcc -O2 -Wall -Wextra -Iinclude -c {d}/mutant.c -o {d}/mutant.o")
                 if r.returncode:
                     log(f"{name}: BUILD FAILED {r.stderr[:300]}")

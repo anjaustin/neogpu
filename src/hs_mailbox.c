@@ -383,6 +383,7 @@ static void* wd_main(void* arg) {
         uint64_t t_act = now_ns(), t_change = t_act;
         uint32_t act0 = atomic_load(&mb->wd_act), j0 = jobs_done(mb), idle_ticks = 0;
         int aging = 0; /* yield word 3 is set */
+        uint64_t t_aged = 0;
         for (;;) {
             struct timespec ts = {0, WD_TICK_NS};
             nanosleep(&ts, NULL);
@@ -392,11 +393,14 @@ static void* wd_main(void* arg) {
             int was_idle = atomic_load(&mb->wd_state) == WD_IDLE;
             if (a != act0) act0 = a, t_act = t; /* the caller sent or waited since the last tick */
             if (j != j0 || (was_idle && t_act == t)) { /* a job ended on every batch; or back from idle */
+                if (j != j0 && !was_idle && t - t_change > atomic_load(&mb->wd_job_gap_max_ns))
+                    atomic_store(&mb->wd_job_gap_max_ns, t - t_change);
                 j0 = j, t_change = t;
                 if (aging) {
                     ctl32(mb, OFF_M)[3] = 0;
                     barrier();
                     aging = 0;
+                    if (t - t_aged > atomic_load(&mb->wd_age_hold_max_ns)) atomic_store(&mb->wd_age_hold_max_ns, t - t_aged);
                 }
             }
             int idle = t - t_act > mb->idle_ns;
@@ -422,6 +426,7 @@ static void* wd_main(void* arg) {
                 ctl32(mb, OFF_M)[3] = 1;
                 barrier();
                 aging = 1;
+                t_aged = now_ns();
                 atomic_fetch_add(&mb->wd_age_yields, 1);
                 for (int i = 0; i < 60 && jobs_done(mb) == j0 && !atomic_load(&mb->wd_quit); i++) {
                     struct timespec w = {0, 20000};
@@ -431,7 +436,12 @@ static void* wd_main(void* arg) {
                     ctl32(mb, OFF_M)[3] = 0;
                     barrier();
                     aging = 0;
-                    j0 = jobs_done(mb), t_change = now_ns();
+                    uint64_t t_end = now_ns();
+                    if (t_end - t_change > atomic_load(&mb->wd_job_gap_max_ns))
+                        atomic_store(&mb->wd_job_gap_max_ns, t_end - t_change);
+                    j0 = jobs_done(mb), t_change = t_end;
+                    if (t_change - t_aged > atomic_load(&mb->wd_age_hold_max_ns))
+                        atomic_store(&mb->wd_age_hold_max_ns, t_change - t_aged);
                 }
             }
             idle_ticks = idle ? idle_ticks + 1 : 0;
@@ -786,5 +796,15 @@ void hs_mailbox_test_count_lease(hs_mailbox* mb, uint32_t b) {
     volatile uint32_t* w = ctl32(mb, OFF_STATE + 256 * b + 128);
     uint32_t v = w[0] + 1;
     for (int l = 0; l < 16; l++) w[l] = v;
+    barrier();
+}
+
+int64_t hs_mailbox_test_send_unchecked(hs_mailbox* mb, uint32_t opc, const uint32_t a[7]) { return send_raw(mb, opc, a); }
+void hs_mailbox_test_patch_request(hs_mailbox* mb, uint32_t seq, uint32_t line, uint32_t v) {
+    fill_line(mb, OFF_SLOTS + ((seq - 1) & (mb->slots - 1)) * SLOT_BYTES + 64 * line, v);
+    barrier();
+}
+void hs_mailbox_test_set_ack(hs_mailbox* mb, uint32_t b, uint32_t seq) {
+    fill_line(mb, OFF_ACK + 256 * b, seq);
     barrier();
 }

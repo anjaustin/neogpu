@@ -108,6 +108,9 @@ typedef struct {
     _Atomic int wd_state, wd_quit;
     _Atomic uint32_t wd_act; /* bumped by every send and wait */
     _Atomic uint64_t wd_idle_yields, wd_age_yields;
+    _Atomic uint64_t wd_age_hold_max_ns; /* longest time from an age yield to the end of its job */
+    _Atomic uint64_t wd_job_gap_max_ns;  /* longest time between two job ends with the caller present,
+                                            as the watchdog saw it (1 ms ticks): the lease length in practice */
 } hs_mailbox;
 
 /* Allocates the buffers, builds the program, runs a ~1 ms GPU warm-up and
@@ -164,5 +167,13 @@ void hs_mailbox_free(hs_mailbox* mb);
 uint32_t hs_mailbox_leases_done(const hs_mailbox* mb, uint32_t b);
 int hs_mailbox_test_seek(hs_mailbox* mb, uint32_t seq);
 void hs_mailbox_test_count_lease(hs_mailbox* mb, uint32_t b);
+/* For tests of failure paths only. send_unchecked skips every check in
+ * hs_mailbox_send (a request the program cannot finish in time gets the GPU
+ * reset by the kernel). patch_request rewrites one 64-byte line of a sent
+ * request's slot (line 0: the op; 1..7: the arguments). set_ack rewrites
+ * batch b's acknowledgement on a stopped mailbox. */
+int64_t hs_mailbox_test_send_unchecked(hs_mailbox* mb, uint32_t op, const uint32_t args[7]);
+void hs_mailbox_test_patch_request(hs_mailbox* mb, uint32_t seq, uint32_t line, uint32_t value);
+void hs_mailbox_test_set_ack(hs_mailbox* mb, uint32_t b, uint32_t seq);
 
 #endif

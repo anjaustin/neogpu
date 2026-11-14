@@ -691,7 +691,8 @@ four winning rows; `final_bench.txt`).
 - **Evidence:** `tests/evidence-p0-5-rt-20261117/` (`before_*` is the
   library at `be3f863`, `final*` the final code, `after*` the rounds
   between).
-- **GPU resets across all of it:** 207 → 207. HVS underruns: 0.
+- **GPU resets across all of it:** 207 → 207. HVS underruns: 0. (The
+  verification further down then caused 4 on purpose.)
 
 **Finding 1, in shipped code: the batch number came from the QPU thread
 index.** Every 8-batch program (the gather kernel and the mailbox) computed
@@ -753,13 +754,16 @@ Four of the largest gathers always in flight, budget 100,000, `max_lease_us`
 
 | longest lease | 1 batch | 8 batches |
 |---|---|---|
-| alone, watchdog | 21.7 ms | 23.8 ms |
+| alone, watchdog | 20.6 ms | 22.4 ms |
 | alone, no watchdog | 56.0 ms | 241 ms |
-| beside `test_08`, watchdog | 27.8 ms | 62.5 ms |
+| beside `test_08`, watchdog | 24.3 ms | 25.9 ms |
 
+- The watchdog rows are the time between two job ends as the watchdog
+  itself measures it (`bound_jobs.txt`, see the verification below). The
+  rows without it are the gap between one batch's lease ends as the caller
+  sees it.
 - The bound is `max_lease_us`, plus one 1 ms tick, plus the requests the
-  batches are running when the yield arrives. Beside the renderer on 8
-  batches that last term was about 40 ms.
+  batches are running when the yield arrives: at most 5.7 ms here.
 
 - Without the thread (a stopped process, or `watchdog_off`) only the poll
   budget ends a lease. At the default budget beside `test_08` the longest
@@ -802,7 +806,7 @@ where that was safe, `before_cases.txt`; each fixed and covered by a case):
 | 13 | the yield was only honoured with no request pending: a caller that kept the ring full held a lease to its budget (241 ms measured on 8 batches) | a third yield word ends the lease with requests pending (table above) |
 | 14 | lease counts that differ between batches (a killed job that only some batches finished) stopped all submission | signed accounting against the jobs finished on every batch |
 | 15 | gather checked only the table's first word against the output | gather takes the table's length; range and overlap are checked in full |
-| 16 | a lease took at most `slots` requests per batch, but a slot one batch had cached could be read by another batch of the same job for a later request | a lease ends where the ring wraps: within a job a slot index means one request for every batch. Not demonstrated on hardware; closed by construction |
+| 16 | a lease took at most `slots` requests per batch, but a slot one batch had cached could be read by another batch of the same job for a later request | a lease ends where the ring wraps: within a job a slot index means one request for every batch. Reproduced and confirmed fixed in the verification below |
 | 17 | the watchdog compared its clock with a time stamped by the caller, and both threads wrote one yield word | the caller bumps a counter; the watchdog times it on its own clock; park and wake use a counter-then-state handshake |
 | 18 | the header promised more than the code did about `max_lease_us` | the header states what is measured above |
 
@@ -841,16 +845,17 @@ where that was safe, `before_cases.txt`; each fixed and covered by a case):
   the runtime resume recorded in VS_MESA.md.
 
 **Do the tests have teeth?** `mutants.py` breaks the library one way at a
-time (`final2_mutants.txt`, `final2_mutants_rerun.txt`): 17 of 17 mutants caught, the unmodified
+time (`final_mutants.txt` in the verification evidence): 18 of 18 mutants caught, the unmodified
 control passes. They cover the size, overlap and table checks, the wrap
 compare, lease replacement and accounting, the watchdog and its age yield,
-the ring-wrap lease end, index reload, result publish, the single stop
-request, and the thread-index batch number in the mailbox and in the gather
-kernel.
+the ring-wrap lease end and the earlier per-batch slot rule, index reload,
+result publish, the single stop request, and the thread-index batch number
+in the mailbox and in the gather kernel.
 
-**Final state** (`final*`):
+**Final state** (`final*`, and `tests/evidence-p0-5-verify-20261117/`
+after the verification below):
 - `tests/test_mailbox`: 26 checks, 0 wrong words.
-- `rt_mailbox cases`: 46 cases on 1 and 8 batches, all pass.
+- `rt_mailbox cases`: 47 cases on 1 and 8 batches, all pass.
 - Soaks of random checked requests, pauses and stops: 60 s alone and 90 s
   beside back-to-back renderer runs, on 1 and 8 batches: 0 wrong, 0 lost
   leases.
@@ -866,13 +871,83 @@ kernel.
   arguments, and it gives the GPU back 2 ms after the caller goes quiet.
 - Nothing in NeoGPU calls it yet.
 
+### Verification of the open points (P0-5), 2026-11-17
+
+The red team left three things unverified. Each was then measured
+(`tests/evidence-p0-5-verify-20261117/`).
+
+**1. A real kernel reset of a lease.** `rt_mailbox reset` sends, past the
+checks, a chain request that needs about 4 s, with three ordinary gathers
+queued behind it. While the lease spins, the test rewrites the request's
+step count in its slot to 4, so a lease that runs it again can finish.
+`rt_mailbox foreign` has a second client submit a job that never ends while
+checked gathers keep flowing (`reset_real.txt`, `reset_foreign.txt`).
+
+| real reset | 1 batch | 8 batches |
+|---|---|---|
+| lease killed mid-request: all four requests acknowledged after | 1,007 ms | 1,014 ms |
+| the killed request's output | the 4-step result, bit-exact | the 4-step result, bit-exact |
+| the three queued gathers, wrong words | 0 | 0 |
+| 4,000 requests, a stop and a restart afterwards | 0 wrong, all rc 0 | 0 wrong, all rc 0 |
+| another client's job hangs: longest request | 1,010 ms | 1,005 ms |
+| the same: requests sent, wrong words | 298,276, 0 | 46,192, 0 |
+
+- GPU resets: 207 → 211, one per run, all four deliberate.
+- The kernel resets a job after 1.0 s without progress and then runs what
+  was queued. The next lease starts from the acknowledgements and runs the
+  killed request again: the request ran twice, which is why outputs may not
+  overlap inputs.
+- The kernel did not drop the queued leases in any of the four runs
+  (`lost_leases` stayed 0). The path that replaces lost leases is still only
+  exercised by the simulated cases.
+- A request that can never finish would be killed and re-run for ever. Only
+  the size limits in `hs_mailbox_send` prevent that.
+
+**2. Is a slot cached by one batch served stale to another?** Yes.
+`tools/p0_5_batch_cache_probe` runs one 8-batch job per trial: some batches
+read a block, the CPU rewrites it, then every batch reads it again
+(`batch_cache.txt`, 300 trials, the same alone and beside `test_08`):
+
+| who read the block before the CPU rewrote it | batches 1–7 then read |
+|---|---|
+| nobody | fresh, 2,100 of 2,100 |
+| batch 0 only | **stale, 2,100 of 2,100** |
+| every batch | stale, 2,100 of 2,100 |
+| batch 0 only, with op 2 before the second load | fresh, 2,100 of 2,100 |
+
+- The read cache belongs to the job, not to the batch or the QPU thread:
+  alone, all 2,100 stale reads were on a different thread from batch 0's.
+- The library fault was then reproduced. The case "a batch one request
+  behind the others, 2 slots" starts batch 0 one request behind, as after a
+  lease it ended early. Under the earlier rule (mutant `m19`) the other 7
+  batches ran the cached older request: 22,400 wrong words, 448 of 512 in
+  each of 50 rounds. With leases ending at the ring wrap: 0
+  (`mutant_old_slot_rule.txt`, `cases8.txt`).
+- No other case caught the earlier rule: the batches only fall out of step
+  when one ends a lease early.
+
+**3. Does the lease bound stretch under the hardest load?** Less than
+reported. The 62.5 ms was the gap between one batch's lease ends as the
+test's thread saw them, and that gap can span two jobs: a batch that ends
+early in one job and late in the next. The watchdog now records the time
+between job ends itself (`bound_jobs.txt`; 4 gathers always in flight,
+budget 100,000, `max_lease_us` 20 ms):
+
+| beside `test_08`, 8 batches | largest gathers | 64 chunks | 1 chunk |
+|---|---|---|---|
+| longest job | 25.9 ms | 6.4 ms | 20.8 ms |
+| longest time from the yield to the job's end | 5.7 ms | no yield needed | 0.6 ms |
+| gap between one batch's lease ends (the earlier measure) | 56.1 ms | 10.2 ms | 21.5 ms |
+
+- The job never ran more than 5.9 ms past the limit. The excess is one
+  1 ms tick plus the requests in progress when the yield arrives.
+- On 1 batch with the largest gathers the longest job was 24.3 ms beside
+  the renderer and 20.6 ms alone.
+
 Not measured:
-- A real kernel reset of a lease. The recovery path was exercised through
-  what the CPU sees afterwards (leases counted as queued that are gone,
-  lease counts that differ between batches), not by making the kernel kill
-  one.
-- Whether a slot cached by one batch is in fact served stale to another
-  (finding 16).
+- A reset while a renderer is running, and what the renderer sees of it.
+- The lost-lease path against a kernel that really drops queued jobs (this
+  kernel did not).
 - Any renderer other than `test_08`; 2 or 4 batches; a job-based chain
   kernel (none exists); CPU code hand-written in assembly.
 - Gather indices are not checked by the library: an index outside the table

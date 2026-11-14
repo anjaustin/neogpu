@@ -102,3 +102,4 @@ neogpu_kworker_rt
 /tests/redteam-p0-5/rt_mailbox
 /tests/redteam-p0-5/mutants/
 /tools/p0_5_batch_id_probe
+/tools/p0_5_batch_cache_probe
