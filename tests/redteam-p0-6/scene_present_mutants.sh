@@ -37,4 +37,5 @@ mk m12_checked_frames_all_at_t0 's/float t = in_checked \? 10\.0f \* \(float\)n_
 # process ends the kernel puts the console back by itself (the SIGKILL case shows it), so the
 # explicit restore only matters when the CRTC was another running client's, which cannot be
 # set up while this probe is DRM master. Measured 2026-11-17: 'no restore' passed all 25 cases.
+mk m13_async_mode_still_drops 's/int wait = in_checked \|\| pacing == 1, now_flip = !in_checked \&\& pacing == 2;/int wait = in_checked || pacing == 1, now_flip = 0;/' "pacing 2 behaves as pacing 0: frames are dropped while a flip is pending"
 echo "p0-6 scene-present mutants caught: $caught; problems (not caught / build / control): $missed" | tee -a $out

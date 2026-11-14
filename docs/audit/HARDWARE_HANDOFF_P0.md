@@ -1678,12 +1678,74 @@ governor:
   `tools/p0_6_kms.h`; that probe's 18 cases and 9 mutants were run again:
   0 failures, 9 of 9 (`present_cases.txt`, `present_mutants.txt`).
 
-**Not measured:** the compute path beside another GPU client (the kernel
-and the second uniform stream across a real thread switch), and beside
-another display client; how the image differs from Mesa's (it matches a
-reference of the kernel's own arithmetic); tearing (frames are flipped
-whole, at vblank; not looked at with a camera); whether dropping 3 of 4
-frames is the right use of 248 FPS on a 60 Hz panel; the long path's
+### No frame dropped: every frame flipped at once (`async.txt`, `tests/evidence-p0-6-coexist-20261117/`)
+
+Direction from the project owner, 2026-11-17: "Don't drop frames. We are
+optimizing for the Pi 4, not for the attached display." The free-running
+mode above renders 248 frames per second and shows 60 of them. Pacing 2 of
+the probe hands every frame to the display controller at once
+(`DRM_MODE_PAGE_FLIP_ASYNC`, which vc4 offers): the flip does not wait for
+the vertical blank.
+
+| 10 s on the panel, every frame flipped at once | frames rendered per second | flips per second | dropped | wait for the previous flip, median (max) |
+|---|---|---|---|---|
+| QPU compute alone (two runs) | 246.9, 250.8 | 246.9, 250.8 | 0, 0 | 0.017 ms (0.086, in a 3 s run) |
+
+- Every rendered frame is accepted and its flip completes: 2,469 of 2,469
+  and 2,508 of 2,508.
+- The 12 checked frames and the capture are as before (they are flipped
+  with the wait, so each can be compared while it is shown).
+- The flip events of immediate flips carry the time of the last vertical
+  blank, so the probe's flip-interval figure says nothing in this mode.
+- **Not measured: what the panel shows.** The controller is given four
+  buffers per refresh; whether the glass shows bands of several frames
+  (tearing) or only the last one given before each scan was not looked at.
+  It needs eyes or a camera on the panel.
+- With this mode the probe's cases are 26 (0 failures) and its mutants 13
+  of 13, one of them "pacing 2 still drops frames" (`sp_cases.txt`,
+  `sp_mutants.txt` in the coexistence evidence directory).
+
+### Beside another GPU client (`tests/redteam-p0-6/scene_coexist.sh`, `tests/evidence-p0-6-coexist-20261117/heavy.txt`, `light.txt`)
+
+The second client is `tools/p0_5_gl_probe`: an offscreen GLES renderer
+(512×512) that checks every frame it draws. Heavy: 200 loop passes per
+pixel, 26 ms a frame. Light: 64 passes, 10 ms a frame. Beside it the
+kernel's batches are really switched out at their thread switches (one
+per 16 pixels), which is what loses r0–r3 and what the second constant
+stream had not been run through.
+
+**Correct on both sides.** 200 frames across the orbit rendered beside
+each renderer: every frame passes the reference check, and every frame's
+image hash equals that of the same frame rendered alone (0 of 200 differ,
+both loads). On the panel the 12 checked frames beside the renderer have
+the hashes of the 12 alone. The renderer drew 323–912 frames per run
+beside the kernel: none wrong, none in error, none reporting a reset.
+GPU resets 261 before and after.
+
+**What each costs the other** (panel, every frame flipped at once, 10 s):
+
+| | compute alone | renderer alone | compute beside | renderer beside | compute job, median (max) beside |
+|---|---|---|---|---|---|
+| heavy renderer (26 ms frames) | 246.9 FPS | 37.5 FPS | 57.7 FPS (23 %) | 32.2 FPS (86 %) | 17.2 ms (28.9) |
+| light renderer (10 ms frames) | 250.8 FPS | 91.4 FPS | 118.9 FPS (47 %) | 65.2 FPS (71 %) | 8.4 ms (12.1) |
+
+- The two shares add up to 109 % and 119 %: the GPU is divided, with a
+  little gained from running together.
+- The renderer keeps the larger share; a compute job that takes 3.9 ms
+  alone takes up to one renderer frame beside it (28.9 ms, 12.1 ms).
+- No frame of either was lost, and no job came near the 1 s at which the
+  kernel resets the GPU.
+- Offscreen, the job's time beside the renderer is the same (median 15.9
+  and 8.4 ms). The script's "renderer inside an offscreen scene loop"
+  figure (38.2 and 91.1 FPS) is not a cost: that loop spends most of its
+  time in the CPU reference, with the GPU free. Only the frames' validity
+  is taken from it.
+
+**Not measured:** how the GPU's time is divided and why the renderer gets
+the larger share (no trace was taken); three or more clients; the compute
+path beside another display client; how the image differs from Mesa's (it matches a
+reference of the kernel's own arithmetic); what the panel shows under
+immediate flips (above); the long path's
 sphere lists (plan step 5, item 3: 612 regions still test six spheres
 three times, 745 instructions, over the 512 mark); `exp`, `log` and
 `rsqrt2` (their encodings are not in Mesa's output for this shader, and

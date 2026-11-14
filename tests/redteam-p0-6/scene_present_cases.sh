@@ -16,12 +16,14 @@ run() { # name expected_exit cmd...
   same=yes; cmp -s build/p06_before.txt build/p06_after.txt || same=NO
   sed 's/^/    /' build/p06_out.txt | cut -c1-1500
   shown=yes; if [ -n "$MUST" ] && ! grep -Eq "$MUST" build/p06_out.txt; then shown=NO; fi
-  if [ $got = $want ] && [ $same = yes ] && [ $shown = yes ]; then echo "CASE ok: $name (exit $got, display state unchanged${MUST:+, the named check failed})"
+  if [ $got = $want ] && [ $same = yes ] && [ $shown = yes ]; then echo "CASE ok: $name (exit $got, display state unchanged${MUST:+, the output shows what the case names})"
   elif [ $shown = NO ]; then echo "CASE FAIL: $name (exit $got; the output does not show: $MUST)"; fails=$((fails+1))
   else echo "CASE FAIL: $name (exit $got, wanted $want; display state unchanged: $same)"; diff build/p06_before.txt build/p06_after.txt | head -10; fails=$((fails+1)); fi
 }
 run "3 s free-running, 8 batches, 6 frames checked" 0 $P 3 8 0 6
 run "3 s with every flip waited for" 0 $P 3 8 1 6
+MUST='"frames_dropped":0,.*"driver_offers_async_flips":true' run "3 s with every frame flipped at once: none dropped" 0 $P 3 8 2 6
+run "bad arguments: pacing 3" 2 $P 1 8 3 6
 run "1, 2 and 4 batches" 0 sh -c "$P 1 1 0 3 && $P 1 2 0 3 && $P 1 4 0 3"
 run "checked frames only, 9 of them" 0 $P 0 8 0 9
 run "no cuts" 0 env P06_CULL=0 $P 1 8 0 3
@@ -39,7 +41,6 @@ run "SIGTERM during the checked frames" 0 sh -c "$P 0 8 0 200 & p=\$!; sleep 2; 
 run "a second copy while the first holds the display: refused (exit 3: the run, not a check)" 3 sh -c "$P 3 8 0 3 > build/p06_first.txt & p=\$!; sleep 1; $P 1 8 0 3; r=\$?; wait \$p; cat build/p06_first.txt; exit \$r"
 run "bad arguments: seconds" 2 $P -1 8 0 6
 run "bad arguments: batches 3" 2 $P 1 3 0 6
-run "bad arguments: pacing 2" 2 $P 1 8 2 6
 run "bad arguments: nothing to do" 2 $P 0 8 0 0
 run "bad arguments: cuts 9" 2 env P06_CULL=9 $P 1 8 0 6
 run "SIGKILL after 1.5 s: the kernel must give the console back" 137 sh -c "$P 5 8 0 6 & p=\$!; sleep 1.5; kill -KILL \$p; wait \$p"

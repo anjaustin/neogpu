@@ -14,8 +14,14 @@
  *            rendered back to back; a finished frame is flipped if no flip
  *            is pending and dropped otherwise (what hs_graphics_present does
  *            for frames this fast). pacing 1: every frame is flipped and its
- *            flip waited for. No pixel is checked in this phase: the
- *            reference takes far longer than a frame.
+ *            flip waited for. pacing 2: no frame is dropped and none waits
+ *            for the panel: every frame is flipped at once
+ *            (DRM_MODE_PAGE_FLIP_ASYNC: the display controller is given the
+ *            new buffer without waiting for the vertical blank, so the
+ *            panel can show parts of several frames in one refresh). The
+ *            loop waits only for the previous flip's event. No pixel is
+ *            checked in this phase: the reference takes far longer than a
+ *            frame.
  *   checked  `checked` frames at t = 10 * n / checked, each flipped and then
  *            compared pixel by pixel with the CPU reference (same allowance
  *            as the offscreen probe: 0.01 % of a frame), in all three
@@ -120,9 +126,9 @@ int main(int argc, char** argv) {
         opt_margin = strtod(e, &end);
         bad |= end == e || *end || !(opt_margin > -1.0 && opt_margin < 1.0);
     }
-    if (bad || !(seconds >= 0 && seconds <= 3600) || (batches != 1 && batches != 2 && batches != 4 && batches != 8) || pacing > 1 || fault > 3 ||
+    if (bad || !(seconds >= 0 && seconds <= 3600) || (batches != 1 && batches != 2 && batches != 4 && batches != 8) || pacing > 2 || fault > 3 ||
         (seconds == 0 && checked == 0))
-        return fprintf(stderr, "usage: %s [seconds 0..3600] [batches 1|2|4|8] [pacing 0 free|1 every flip waited for] [checked frames 0..1000] [fault 0..3]\n",
+        return fprintf(stderr, "usage: %s [seconds 0..3600] [batches 1|2|4|8] [pacing 0 free, drop when a flip is pending|1 every flip waited for|2 every frame flipped at once, none dropped] [checked frames 0..1000] [fault 0..3]\n",
                        argv[0]), 2;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -142,10 +148,12 @@ int main(int argc, char** argv) {
     static uint64_t code_buf[4096];
     uint32_t* img = malloc((size_t)W * H * 4), *cap_px = malloc((size_t)W * H * 4);
     uint8_t* kind = malloc((size_t)W * H);
-    series job = {0}, cpu = {0}, loop = {0}, interval = {0};
-    job.cap = cpu.cap = loop.cap = interval.cap = (int)(seconds * 1000) + 64;
+    series job = {0}, cpu = {0}, loop = {0}, interval = {0}, fwait = {0};
+    uint64_t async_cap = 0;
+    job.cap = cpu.cap = loop.cap = interval.cap = fwait.cap = (int)(seconds * 1000) + 64;
     job.v = malloc(sizeof(double) * (size_t)job.cap), cpu.v = malloc(sizeof(double) * (size_t)job.cap);
     loop.v = malloc(sizeof(double) * (size_t)job.cap), interval.v = malloc(sizeof(double) * (size_t)job.cap);
+    fwait.v = malloc(sizeof(double) * (size_t)job.cap);
     long rendered = 0, flips_queued = 0, dropped = 0, late = 0, long_min = 0, long_max = 0;
     int checked_buf[NBUF] = {0}, frames_checked = 0, frames_failed = 0, scan_rc = 1;
     long wrong_total = 0, wrong_max = 0, unwritten = 0;
@@ -154,8 +162,10 @@ int main(int argc, char** argv) {
     char hashes[1024] = "";
 
     if (scene_fp_contracted()) { rc = -EINVAL; fail = "built without -ffp-contract=off: the reference would not match the kernel"; goto out; }
-    if (!img || !cap_px || !kind || !job.v || !cpu.v || !loop.v || !interval.v) { rc = -ENOMEM; fail = "malloc"; goto out; }
+    if (!img || !cap_px || !kind || !job.v || !cpu.v || !loop.v || !interval.v || !fwait.v) { rc = -ENOMEM; fail = "malloc"; goto out; }
     if ((fail = kms_open(&k, &rc))) goto out;
+    drmGetCap(k.card, DRM_CAP_ASYNC_PAGE_FLIP, &async_cap);
+    if (pacing == 2 && !async_cap) { rc = -ENOTSUP; fail = "the driver does not offer immediate (async) page flips"; goto out; }
     if (k.w != W || k.h != H) { rc = -EINVAL; fail = "the mode is not 800x480: the kernel is built for that size"; goto out; }
     if ((rc = hs_v3d_open(&dev, NULL))) { fail = "no v3d render node"; goto out; }
     for (int i = 0; i < NBUF; i++)
@@ -217,10 +227,17 @@ int main(int argc, char** argv) {
             if (!rendered || ncls[0] > long_max) long_max = ncls[0];
             rendered++;
         }
-        int wait = in_checked || pacing == 1;
-        if ((rc = flip_events(k.card, wait ? 1000 : 0))) { fail = "no flip event within 1 s"; break; }
+        int wait = in_checked || pacing == 1, now_flip = !in_checked && pacing == 2;
+        /* pacing 2: the previous flip's event is owed before the next flip is accepted; that wait is timed */
+        uint64_t tw = now_ns();
+        if ((rc = flip_events(k.card, wait || now_flip ? 1000 : 0))) { fail = "no flip event within 1 s"; break; }
+        if (now_flip) put(&fwait, (now_ns() - tw) / 1e6);
         if (flip_pending < 0) {
-            if (drmModePageFlip(k.card, k.crtc_id, back->fb, DRM_MODE_PAGE_FLIP_EVENT, NULL)) { rc = -errno; fail = "page flip"; break; }
+            if (drmModePageFlip(k.card, k.crtc_id, back->fb, DRM_MODE_PAGE_FLIP_EVENT | (now_flip ? DRM_MODE_PAGE_FLIP_ASYNC : 0), NULL)) {
+                rc = -errno;
+                fail = now_flip ? "immediate (async) page flip" : "page flip";
+                break;
+            }
             flip_pending = bi;
             if (!in_checked) flips_queued++;
         } else {
@@ -269,27 +286,28 @@ out:
     if (unif.handle) hs_v3d_bo_free(&dev, &unif);
     if (code.handle) hs_v3d_bo_free(&dev, &code);
     if (dev.fd >= 0) hs_v3d_close(&dev);
-    series* all[4] = {&job, &cpu, &loop, &interval};
+    series* all[5] = {&job, &cpu, &loop, &interval, &fwait};
     double refresh_ms = 1000.0 / (k.mode.vrefresh ? k.mode.vrefresh : 60);
     for (int i = 0; i < interval.n; i++) late += interval.v[i] > 1.5 * refresh_ms;
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 5; i++)
         if (all[i]->v) qsort(all[i]->v, (size_t)all[i]->n, sizeof(double), cmpd);
     printf("{\"present\":\"test_08 scene by QPU compute to KMS, no Mesa\",\"mode\":\"%ux%u@%u\",\"batches\":%u,\"pacing\":\"%s\",\"cull\":%d,"
            "\"fault\":%d,\"kernel_fault\":%d,\"rc\":%d,\"failed_at\":\"%s\",\"stopped_by_signal\":%s,"
            "\"timed\":{\"seconds\":%.3f,\"frames_rendered\":%ld,\"frames_rendered_per_second\":%.2f,\"flips\":%ld,\"flips_per_second\":%.2f,"
            "\"frames_dropped\":%ld,\"job_ms\":{\"p50\":%.3f,\"p99\":%.3f,\"max\":%.3f},\"cpu_setup_ms\":{\"p50\":%.3f,\"max\":%.3f},"
            "\"frame_to_frame_ms\":{\"p50\":%.3f,\"p99\":%.3f,\"max\":%.3f},\"flip_interval_ms\":{\"p50\":%.3f,\"p99\":%.3f,\"max\":%.3f},"
-           "\"flip_intervals_over_1.5_refreshes\":%ld,\"long_path_regions\":{\"min\":%ld,\"max\":%ld}},"
+           "\"wait_for_previous_flip_ms\":{\"p50\":%.3f,\"p99\":%.3f,\"max\":%.3f},\"driver_offers_async_flips\":%s,\"flip_intervals_over_1.5_refreshes\":%ld,\"long_path_regions\":{\"min\":%ld,\"max\":%ld}},"
            "\"checked\":{\"frames\":%d,\"frames_failed\":%d,\"in_buffer\":[%d,%d,%d],\"pixels_different_from_reference\":%ld,\"most_in_a_frame\":%ld,"
            "\"unwritten\":%ld,\"image_hashes\":[%s]},\"guard_words_overwritten\":%llu,\"scanout_capture\":{\"rc\":%d,\"pixels_different_from_memory\":%llu},"
            "\"process_start_to_first_frame_on_crtc_ms\":%.2f,\"plane_changes_at_takeover\":%d,\"display_restored_rc\":%d}\n",
-           k.w, k.h, k.mode.vrefresh, batches, pacing ? "every flip waited for" : "free: flip when none is pending, else drop", opt_cull, fault, opt_fault,
+           k.w, k.h, k.mode.vrefresh, batches, pacing == 2 ? "every frame flipped at once (async), none dropped" : pacing ? "every flip waited for" : "free: flip when none is pending, else drop", opt_cull, fault, opt_fault,
            rc, fail ? fail : "", stop_requested ? "true" : "false", el, rendered, el > 0 ? rendered / el : 0, flips_queued, el > 0 ? flips_queued / el : 0,
            dropped, at(&job, 1, 2), at(&job, 99, 100), at(&job, 1, 1), at(&cpu, 1, 2), at(&cpu, 1, 1), at(&loop, 1, 2), at(&loop, 99, 100), at(&loop, 1, 1),
-           at(&interval, 1, 2), at(&interval, 99, 100), at(&interval, 1, 1), late, long_min, long_max, frames_checked, frames_failed, checked_buf[0],
+           at(&interval, 1, 2), at(&interval, 99, 100), at(&interval, 1, 1), at(&fwait, 1, 2), at(&fwait, 99, 100), at(&fwait, 1, 1),
+           async_cap ? "true" : "false", late, long_min, long_max, frames_checked, frames_failed, checked_buf[0],
            checked_buf[1], checked_buf[2], wrong_total, wrong_max, unwritten, hashes, (unsigned long long)guard_hit, scan_rc,
            (unsigned long long)scan_wrong, first_frame_ms, k.plane_changes, restore);
-    free(img), free(cap_px), free(kind), free(job.v), free(cpu.v), free(loop.v), free(interval.v), free(regions);
+    free(img), free(cap_px), free(kind), free(job.v), free(cpu.v), free(loop.v), free(interval.v), free(fwait.v), free(regions);
     /* a complete run checked every frame it was asked to, in every buffer when there were at least three */
     int complete = !rc && !stop_requested;
     int unchecked = complete && (frames_checked != checked || (checked >= NBUF && (!checked_buf[0] || !checked_buf[1] || !checked_buf[2])));
