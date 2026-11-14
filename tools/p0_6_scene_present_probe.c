@@ -6,7 +6,9 @@
  *
  * Three vc4 dumb buffers are imported into v3d; one compute job per frame
  * writes the image straight into the one that is neither on the panel nor
- * waiting for its flip.
+ * waiting for its flip. The timed phase is a pipeline: while a job renders,
+ * the CPU prepares the next frame (region sort, sphere lists, constants) in
+ * a second set of buffers.
  *
  * Two phases:
  *   timed    for `seconds`, the scene at t = elapsed time, as
@@ -119,8 +121,9 @@ int main(int argc, char** argv) {
     int pacing = (int)v[1], checked = (int)v[2], fault = (int)v[3];
     long ev = 0;
     const char* e;
-    if ((e = getenv("P06_CULL"))) bad |= number(e, 0, 7, &ev), opt_cull = (int)ev;
-    if ((e = getenv("P06_FAULT"))) bad |= number(e, 0, 13, &ev), opt_fault = (int)ev;
+    if ((e = getenv("P06_CULL"))) bad |= number(e, 0, 15, &ev), opt_cull = (int)ev, bad |= (opt_cull & 12) == 8;
+    if ((e = getenv("P06_CELLS"))) bad |= number(e, 1, 8, &ev), opt_cells = (int)ev;
+    if ((e = getenv("P06_FAULT"))) bad |= number(e, 0, 16, &ev), opt_fault = (int)ev;
     if ((e = getenv("P06_MARGIN"))) {
         char* end;
         opt_margin = strtod(e, &end);
@@ -142,7 +145,7 @@ int main(int argc, char** argv) {
     memset(&k, 0, sizeof k);
     k.card = -1;
     hs_v3d dev = {.fd = -1};
-    hs_v3d_bo code = {0}, unif = {0}, pool = {0};
+    hs_v3d_bo code = {0}, unif[2] = {{0}, {0}}, pool[2] = {{0}, {0}}; /* two sets: the next frame's is filled while a job reads the other */
     kms_buf b[NBUF];
     memset(b, 0, sizeof b);
     static uint64_t code_buf[4096];
@@ -174,8 +177,9 @@ int main(int argc, char** argv) {
     hs_qpu_prog_init(&p, code_buf, 4096);
     len = build(&p);
     if (len <= 0) { rc = len ? len : -EINVAL; fail = "program build"; goto out; }
-    size_t unif_bytes = (19 + (size_t)(H / batches + 1) * VECS) * 4;
-    if ((rc = hs_v3d_bo_new(&dev, &code, 65536)) || (rc = hs_v3d_bo_new(&dev, &unif, unif_bytes + 4096)) || (rc = hs_v3d_bo_new(&dev, &pool, 16384))) {
+    size_t unif_bytes = scene_unif_bytes(batches);
+    if ((rc = hs_v3d_bo_new(&dev, &code, 65536)) || (rc = hs_v3d_bo_new(&dev, &unif[0], unif_bytes + 4096)) || (rc = hs_v3d_bo_new(&dev, &pool[0], scene_pool_bytes())) ||
+        (rc = hs_v3d_bo_new(&dev, &unif[1], unif_bytes + 4096)) || (rc = hs_v3d_bo_new(&dev, &pool[1], scene_pool_bytes()))) {
         fail = "code buffers";
         goto out;
     }
@@ -183,7 +187,8 @@ int main(int argc, char** argv) {
     if (!prog) { rc = -EINVAL; fail = "program load"; goto out; }
 
     /* ---- timed phase, then the checked frames ---- */
-    int n_checked_done = 0, in_checked = seconds == 0;
+    int n_checked_done = 0, in_checked = seconds == 0, cur = 0, have_next = 0;
+    long ncls_next[3] = {0, 0, 0};
     uint64_t t_prev = 0;
     while (!rc && !stop_requested) {
         uint64_t ta = now_ns();
@@ -193,7 +198,7 @@ int main(int argc, char** argv) {
             el = tsec;
             if ((rc = flip_events(k.card, 1000))) { fail = "no flip event within 1 s"; break; }
             for (int i = 0; i < NBUF; i++) guard_hit += kms_buf_guard_hits(&k, &b[i]);
-            in_checked = 1;
+            in_checked = 1, have_next = 0; /* the frame prepared ahead is not used */
             continue;
         }
         if (in_checked && n_checked_done >= checked) break;
@@ -204,11 +209,28 @@ int main(int argc, char** argv) {
         long ncls[3];
         double classify_ms;
         if (in_checked) memset(back->map, 0xEE, (size_t)W * H * 4); /* not on the panel: the back buffer */
-        if ((rc = frame_setup(t, in_checked && n_checked_done > 0, batches, &unif, &pool, back->gpu, ncls, &classify_ms))) { fail = "region sort"; break; }
-        uint32_t hh[4] = {code.handle, unif.handle, pool.handle, back->v3d_handle};
-        hs_v3d_dispatch_desc d = {prog, unif.gpu, batches, hh, 4, 0};
+        /* The timed phase is a pipeline: while a job renders, the CPU prepares the next
+         * frame (scene time: now) in the other set of buffers. The first frame and the
+         * checked frames are prepared here, before their job. */
+        double setup_ms = 0;
+        if (have_next) {
+            memcpy(ncls, ncls_next, sizeof ncls);
+        } else {
+            uint64_t ts = now_ns();
+            if ((rc = frame_setup(t, in_checked && n_checked_done > 0, batches, &unif[cur], &pool[cur], back->gpu, ncls, &classify_ms))) { fail = "region sort"; break; }
+            setup_ms = (now_ns() - ts) / 1e6;
+        }
+        ((uint32_t*)unif[cur].map)[0] = back->gpu; /* the buffer is chosen when the job starts */
+        uint32_t hh[4] = {code.handle, unif[cur].handle, pool[cur].handle, back->v3d_handle};
+        hs_v3d_dispatch_desc d = {prog, unif[cur].gpu, batches, hh, 4, 0};
         uint64_t tb = now_ns();
         rc = hs_v3d_dispatch(&dev, &d);
+        have_next = 0;
+        if (!rc && !in_checked && t0) {
+            uint64_t ts = now_ns();
+            if ((rc = frame_setup((float)((ts - t0) / 1e9), 0, batches, &unif[cur ^ 1], &pool[cur ^ 1], 0, ncls_next, &classify_ms))) { fail = "region sort"; break; }
+            setup_ms = (now_ns() - ts) / 1e6, have_next = 1, cur ^= 1;
+        }
         if (!rc) rc = hs_v3d_bo_wait(&dev, &code, 2000000000ull);
         if (rc) { fail = "compute job"; break; }
         uint64_t tc = now_ns();
@@ -220,7 +242,7 @@ int main(int argc, char** argv) {
             continue; /* the clock starts with the first frame on the panel; that frame is not counted */
         }
         if (!in_checked) {
-            put(&cpu, (tb - ta) / 1e6), put(&job, (tc - tb) / 1e6);
+            put(&cpu, setup_ms), put(&job, (tc - tb) / 1e6);
             if (t_prev) put(&loop, (ta - t_prev) / 1e6);
             t_prev = ta;
             if (!rendered || ncls[0] < long_min) long_min = ncls[0];
@@ -282,8 +304,10 @@ out:
     restore = kms_restore(&k);
     for (int i = 0; i < NBUF; i++) kms_buf_free(&k, &dev, &b[i]);
     kms_close(&k);
-    if (pool.handle) hs_v3d_bo_free(&dev, &pool);
-    if (unif.handle) hs_v3d_bo_free(&dev, &unif);
+    for (int i = 0; i < 2; i++) {
+        if (pool[i].handle) hs_v3d_bo_free(&dev, &pool[i]);
+        if (unif[i].handle) hs_v3d_bo_free(&dev, &unif[i]);
+    }
     if (code.handle) hs_v3d_bo_free(&dev, &code);
     if (dev.fd >= 0) hs_v3d_close(&dev);
     series* all[5] = {&job, &cpu, &loop, &interval, &fwait};
@@ -294,7 +318,7 @@ out:
     printf("{\"present\":\"test_08 scene by QPU compute to KMS, no Mesa\",\"mode\":\"%ux%u@%u\",\"batches\":%u,\"pacing\":\"%s\",\"cull\":%d,"
            "\"fault\":%d,\"kernel_fault\":%d,\"rc\":%d,\"failed_at\":\"%s\",\"stopped_by_signal\":%s,"
            "\"timed\":{\"seconds\":%.3f,\"frames_rendered\":%ld,\"frames_rendered_per_second\":%.2f,\"flips\":%ld,\"flips_per_second\":%.2f,"
-           "\"frames_dropped\":%ld,\"job_ms\":{\"p50\":%.3f,\"p99\":%.3f,\"max\":%.3f},\"cpu_setup_ms\":{\"p50\":%.3f,\"max\":%.3f},"
+           "\"frames_dropped\":%ld,\"job_submit_to_done_ms\":{\"p50\":%.3f,\"p99\":%.3f,\"max\":%.3f},\"cpu_setup_ms_during_the_previous_job\":{\"p50\":%.3f,\"max\":%.3f},"
            "\"frame_to_frame_ms\":{\"p50\":%.3f,\"p99\":%.3f,\"max\":%.3f},\"flip_interval_ms\":{\"p50\":%.3f,\"p99\":%.3f,\"max\":%.3f},"
            "\"wait_for_previous_flip_ms\":{\"p50\":%.3f,\"p99\":%.3f,\"max\":%.3f},\"driver_offers_async_flips\":%s,\"flip_intervals_over_1.5_refreshes\":%ld,\"long_path_regions\":{\"min\":%ld,\"max\":%ld}},"
            "\"checked\":{\"frames\":%d,\"frames_failed\":%d,\"in_buffer\":[%d,%d,%d],\"pixels_different_from_reference\":%ld,\"most_in_a_frame\":%ld,"

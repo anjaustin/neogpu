@@ -42,7 +42,9 @@ run "a second copy while the first holds the display: refused (exit 3: the run, 
 run "bad arguments: seconds" 2 $P -1 8 0 6
 run "bad arguments: batches 3" 2 $P 1 3 0 6
 run "bad arguments: nothing to do" 2 $P 0 8 0 0
-run "bad arguments: cuts 9" 2 env P06_CULL=9 $P 1 8 0 6
+run "bad arguments: cuts 16" 2 env P06_CULL=16 $P 1 8 0 6
+run "without lists (cuts 7)" 0 env P06_CULL=7 $P 1 8 2 3
+MUST='"rc":0,.*"frames_failed":[1-9]' run "kernel fault 14, the primary list lacks its first sphere" 1 env P06_FAULT=14 $P 1 8 0 6
 run "SIGKILL after 1.5 s: the kernel must give the console back" 137 sh -c "$P 5 8 0 6 & p=\$!; sleep 1.5; kill -KILL \$p; wait \$p"
 # the panel's frames are the offscreen probe's frames: same scene times, same image hashes
 S=tools/p0_6_shade_probe

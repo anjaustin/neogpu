@@ -10,12 +10,18 @@
  * mix and the 8-bit pack. Within a path every lane runs everything and the
  * results are selected at the end.
  *
- * Work that is skipped (plan step 5; P06_CULL, a bit mask, default 7):
+ * Work that is skipped (plan step 5; P06_CULL, a bit mask, default 15):
  *   1  a row above the horizon is filled with its sky colour, no rays;
  *   2  the second shade is skipped when all 16 reflected rays hit nothing;
  *   4  the CPU sorts the 16-pixel regions below the horizon each frame
  *      (classify()); ground that no sphere covers or is reflected in takes
  *      a short path.
+ *   8  (needs 4) each region on the long path tests only the spheres on
+ *      its four lists (primary ray, shadow of its hit, reflected ray,
+ *      shadow of that hit) and ground that may be shadowed only those that
+ *      can shadow it: loops over records the CPU puts in the region's own
+ *      block of the constant stream (tools/p0_6_scene.h; the lists are
+ *      checked against the truth per pixel by tools/p0_6_lists_stats).
  * Rows are dealt to the batches in turn (batch b renders rows b,
  * b + batches, ...), or the cuts would not shorten the frame.
  *
@@ -52,7 +58,7 @@
  *   4 one row too many per batch (the guard rows must show it)
  *   5 6 7 the region sort ignores reflections / covering spheres / shadows
  *   8 rows just below the horizon are treated as sky
- *   9 the short path reads the long path's constants
+ *   9 the short path reads the long path's constants (without cut 8)
  *   10 the batches start two rows apart, not one
  *   11 the reflection bound of the region sort ignores the 0.02 by which
  *      the reflected ray starts above the ground (a few pixels in a few
@@ -62,6 +68,11 @@
  *   13 from the second frame on, sky rows are not stored (the sky does not
  *      change: without the clearing of the image between frames the stale
  *      rows would pass)
+ *   14 15 16 a list is short: the primary list lacks its first sphere / the
+ *      reflected ray's list is empty / the list for shadows of the
+ *      reflected hit is empty
+ *   Also P06_CELLS (1..8, cells per side of a sphere patch in the list
+ *   bounds), P06_SITES (which of the five list loops are used: a bit each).
  * Output: JSON lines. Exit 1 if a frame fails its check, 2 on bad
  * arguments, 3 when the run itself failed (build, setup, a job).
  */
@@ -116,8 +127,10 @@ int main(int argc, char** argv) {
     int bad = v[0] < 0 || (batches != 1 && batches != 2 && batches != 4 && batches != 8) || frames < 1 || opt_shadows > 1 || opt_reflect > 1;
     if ((e = getenv("P06_PAD"))) bad |= number(e, 0, 2000, &ev), opt_pad = (int)ev;
     if ((e = getenv("P06_PAD_KIND"))) bad |= number(e, 0, 6, &ev), opt_pad_kind = (int)ev;
-    if ((e = getenv("P06_CULL"))) bad |= number(e, 0, 7, &ev), opt_cull = (int)ev;
-    if ((e = getenv("P06_FAULT"))) bad |= number(e, 0, 13, &ev), opt_fault = (int)ev;
+    if ((e = getenv("P06_CULL"))) bad |= number(e, 0, 15, &ev), opt_cull = (int)ev, bad |= (opt_cull & 12) == 8;
+    if ((e = getenv("P06_SITES"))) bad |= number(e, 0, 31, &ev), opt_sites = (int)ev;
+    if ((e = getenv("P06_CELLS"))) bad |= number(e, 1, 8, &ev), opt_cells = (int)ev;
+    if ((e = getenv("P06_FAULT"))) bad |= number(e, 0, 16, &ev), opt_fault = (int)ev;
     if ((e = getenv("P06_MARGIN"))) {
         char* end;
         opt_margin = strtod(e, &end);
@@ -125,7 +138,7 @@ int main(int argc, char** argv) {
     }
     if (bad)
         return fprintf(stderr, "usage: %s [batches 1|2|4|8] [frames 1..100000] [shadows 0|1] [reflect 0|1] [ppm_dir]\n"
-                               "  environment: P06_CULL 0..7, P06_MARGIN (-1, 1), P06_FAULT 0..13, P06_PAD 0..2000, P06_PAD_KIND 0..6\n", argv[0]), 2;
+                               "  environment: P06_CULL 0..15 (8 needs 4), P06_MARGIN (-1, 1), P06_FAULT 0..16, P06_PAD 0..2000, P06_PAD_KIND 0..6\n", argv[0]), 2;
     static uint64_t buf[4096];
     hs_qpu_prog p;
     hs_qpu_prog_init(&p, buf, 4096);
@@ -136,11 +149,11 @@ int main(int argc, char** argv) {
         return printf("{\"build_only\":true,\"instructions\":%d,\"per_16_pixels\":%d,\"plain_ground_path_instructions\":%d,\"constants\":%d,"
                       "\"row_constants\":%d}\n", len, n_instr_vec, n_instr_ground, kn, k_vec), 0;
     /* class words: one per region, at most one row of regions per row of a batch */
-    size_t unif_bytes = (19 + (size_t)(H / batches + 1) * VECS) * 4;
+    size_t unif_bytes = scene_unif_bytes(batches);
     hs_v3d dev;
     hs_v3d_bo code, unif, pool, out;
     if (hs_v3d_open(&dev, NULL) || hs_v3d_bo_new(&dev, &code, 65536) || hs_v3d_bo_new(&dev, &unif, unif_bytes + 4096) ||
-        hs_v3d_bo_new(&dev, &pool, 16384) || hs_v3d_bo_new(&dev, &out, ((size_t)W * H + 2 * GUARD_WORDS) * 4))
+        hs_v3d_bo_new(&dev, &pool, scene_pool_bytes()) || hs_v3d_bo_new(&dev, &out, ((size_t)W * H + 2 * GUARD_WORDS) * 4))
         return fprintf(stderr, "setup failed\n"), 3;
     uint32_t prog = hs_v3d_load(&code, 0, buf, (uint32_t)len);
     if (!prog) return fprintf(stderr, "load failed\n"), 3;
