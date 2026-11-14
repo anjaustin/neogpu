@@ -294,7 +294,7 @@ tools/p0_5_inline_probe: tools/p0_5_inline_probe.c src/hs_qpu.o src/hs_v3d.o
 	$(CC) -O3 -mcpu=cortex-a72 -ffp-contract=off -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_v3d.o -o $@
 tools/p0_6_scanout_probe: tools/p0_6_scanout_probe.c src/hs_qpu.o src/hs_v3d.o
 	$(CC) -O2 -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_v3d.o -o $@
-tools/p0_6_present_probe: tools/p0_6_present_probe.c src/hs_qpu.o src/hs_v3d.o
+tools/p0_6_present_probe: tools/p0_6_present_probe.c tools/p0_6_kms.h src/hs_qpu.o src/hs_v3d.o
 	$(CC) -O2 -Wall -Wextra -Iinclude -I/usr/include/libdrm $< src/hs_qpu.o src/hs_v3d.o -ldrm -o $@
 tools/p0_6_sfu_probe: tools/p0_6_sfu_probe.c src/hs_qpu.o src/hs_v3d.o
 	$(CC) -O2 -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_v3d.o -lm -o $@
@@ -302,8 +302,10 @@ tools/p0_6_scene_probe: tools/p0_6_scene_probe.c src/hs_qpu.o src/hs_v3d.o
 	$(CC) -O2 -ffp-contract=off -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_v3d.o -lm -o $@
 tools/p0_6_unifa_probe: tools/p0_6_unifa_probe.c src/hs_qpu.o src/hs_v3d.o
 	$(CC) -O2 -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_v3d.o -o $@
-tools/p0_6_shade_probe: tools/p0_6_shade_probe.c src/hs_qpu.o src/hs_v3d.o
+tools/p0_6_shade_probe: tools/p0_6_shade_probe.c tools/p0_6_scene.h src/hs_qpu.o src/hs_v3d.o
 	$(CC) -O2 -ffp-contract=off -Wall -Wextra -Iinclude $< src/hs_qpu.o src/hs_v3d.o -lm -o $@
+tools/p0_6_scene_present_probe: tools/p0_6_scene_present_probe.c tools/p0_6_scene.h tools/p0_6_kms.h src/hs_qpu.o src/hs_v3d.o
+	$(CC) -O2 -ffp-contract=off -Wall -Wextra -Iinclude -I/usr/include/libdrm $< src/hs_qpu.o src/hs_v3d.o -ldrm -lm -o $@
 tools/p0_5_gl_probe: tools/p0_5_gl_probe.c
 	$(CC) -O2 -Wall -Wextra tools/p0_5_gl_probe.c -lEGL -lGLESv2 -lgbm -o $@
 # the fastest CPU chain found, to compare hs_mailbox against
@@ -441,7 +443,7 @@ clean:
 	rm -f tests/test_evdev
 	rm -f tests/scanout_probe tests/test_present_flip tests/test_present_pacing tests/test_present_scaled tests/p0_3_plane_inventory tests/p0_3_hvs_probe tests/p0_3_writeback_check tests/redteam-p0-3/fail_atomic.so tests/redteam-p0-3/memstress tests/redteam-p0-3/rt_scaled tests/redteam-p0-3/rt_wb_edge tests/panel_mode_probe tests/test_text_render
 	rm -f tests/pacing_trace.so tests/pacing_sweep tests/flip_deadline_probe tests/present_cost_probe tests/p0_1_redteam_probe tests/p0_1_redteam2_newest tests/redteam-hold-cutoff/probe tests/redteam-hold-cutoff/gate_mut tests/redteam-hold-cutoff/gate_mut2 tests/redteam-hold-cutoff/gate_mut2.c tests/redteam-hold-cutoff/gate_orig neogpu_kworker_rt
-	rm -f $(HWPROBES) tools/gather_anom tools/tmuop_probe tools/p0_5_mailbox_probe tools/p0_5_mailbox_work tools/p0_5_chain_cpu tools/p0_5_batch_id_probe tools/p0_5_batch_cache_probe tools/p0_5_spin_probe tools/p0_5_gl_probe tools/p0_5_inline_probe tools/p0_6_scanout_probe tools/p0_6_present_probe tools/p0_6_sfu_probe tools/p0_6_scene_probe tools/p0_6_unifa_probe tools/p0_6_shade_probe tests/test_mailbox tests/redteam-p0-5/rt_mailbox src/hs_mailbox.o tools/bench_vs_mesa tests/test_qpu_encode tests/test_v3d_compute tests/test_v3d_runtime
+	rm -f $(HWPROBES) tools/gather_anom tools/tmuop_probe tools/p0_5_mailbox_probe tools/p0_5_mailbox_work tools/p0_5_chain_cpu tools/p0_5_batch_id_probe tools/p0_5_batch_cache_probe tools/p0_5_spin_probe tools/p0_5_gl_probe tools/p0_5_inline_probe tools/p0_6_scanout_probe tools/p0_6_present_probe tools/p0_6_sfu_probe tools/p0_6_scene_probe tools/p0_6_unifa_probe tools/p0_6_shade_probe tools/p0_6_scene_present_probe tests/test_mailbox tests/redteam-p0-5/rt_mailbox src/hs_mailbox.o tools/bench_vs_mesa tests/test_qpu_encode tests/test_v3d_compute tests/test_v3d_runtime
 	rm -rf build/qpu tests/redteam-p0-5/mutants
 	rm -f bench_legacy tests/test_headless_scalar
 	rm -f tests/test_tool_sanitize tests/test_tool_tsan

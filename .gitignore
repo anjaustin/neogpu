@@ -112,3 +112,4 @@ neogpu_kworker_rt
 /tools/p0_6_scene_probe
 /tools/p0_6_unifa_probe
 /tools/p0_6_shade_probe
+/tools/p0_6_scene_present_probe

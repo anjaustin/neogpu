@@ -9,7 +9,7 @@ mk() { # name sed-expression description
   if [ -n "$only" ] && [ "$only" != "$1" ]; then return; fi
   sed -E "$2" tools/p0_6_present_probe.c > $d/$1.c
   if cmp -s $d/$1.c tools/p0_6_present_probe.c && [ "$1" != m0_control ]; then echo "$1: EDIT DID NOT APPLY" | tee -a $out; missed=$((missed+1)); return; fi
-  gcc -O2 -Wall -Wextra -Iinclude -I/usr/include/libdrm $d/$1.c src/hs_qpu.o src/hs_v3d.o -ldrm -o $d/$1 || { echo "$1: BUILD FAILED" | tee -a $out; missed=$((missed+1)); return; }
+  gcc -O2 -Wall -Wextra -Iinclude -Itools -I/usr/include/libdrm $d/$1.c src/hs_qpu.o src/hs_v3d.o -ldrm -o $d/$1 || { echo "$1: BUILD FAILED" | tee -a $out; missed=$((missed+1)); return; }
   tests/redteam-p0-5/wrap.sh $d/$1.txt tests/redteam-p0-6/present_cases.sh $d/$1 > $d/$1.out 2>&1
   n=$(grep -c "CASE FAIL" $d/$1.out)
   if [ "$1" = m0_control ]; then

@@ -17,7 +17,9 @@ Measured (see the P0-6 section of the hand-off document):
   110 FPS with a fragment shader of 959 instructions and no loops:
   23.7 ns of QPU time per pixel.
 
-Not yet: any scene. The probes are tools, not a library.
+The scene now runs on the panel (step 5). The probes are tools, not a
+library: `tools/p0_6_scene.h` (kernel, reference, region sort) and
+`tools/p0_6_kms.h` (display) are what step 7 would promote.
 
 ## Success condition
 
@@ -138,15 +140,22 @@ three sub-steps, each checked against the reference and timed.
   change course. A straight port is not expected to beat Mesa: both run the
   same arithmetic on the same QPUs.
 
-### 5. Do less work per pixel — first three cuts done 2026-11-17
+### 5. Do less work per pixel — first three cuts done and red-teamed, on the panel 2026-11-17
 
-Result: 15.66 ms → 3.85 ms of GPU time per frame (plus 0.16 ms of CPU to
-sort 1,500 regions), the image unchanged: 2.3 times faster than Mesa's
-9.1 ms, offscreen. Cuts 1, 2 and a class-based form of 3 below (plain
-ground takes a 190-instruction path). Not done: sphere lists for the 609
-regions that still take the long path (745 instructions, over the
-512-instruction mark). Rows are dealt to the batches in turn, or the cuts
-do not shorten the frame. Plan as written before the work:
+Result: 15.73 ms → 3.87 ms of GPU time per frame (median over the orbit),
+plus 0.16 ms of CPU to sort 1,500 regions; the image is bit for bit the
+one without cuts. On the panel: 247.9 frames rendered per second against
+Mesa's 110.0, 2.25×, 60 flips per second, none late: **the success
+condition above is met**, with the caveat that the image is compared with
+a reference of the kernel's arithmetic, not with Mesa's output. Cuts 1, 2
+and a class-based form of 3 below (plain ground takes a 190-instruction
+path). Not done: sphere lists for the 612 regions that still take the long
+path (745 instructions, over the 512-instruction mark). Rows are dealt to
+the batches in turn, or the cuts do not shorten the frame. The red team
+found a region bound that was wrong in 4 of 200 frames and a check that
+passed it; cut and uncut images are now compared exactly. A new rule from
+it: a cut is verified by exact comparison with the uncut image, not by the
+reference's allowance. Plan as written before the work:
 
 Measured starting point: 15.6 ms per frame, 725 instructions for every 16
 pixels; Mesa 9.1 ms. Pixels at t = 1: sky 50 %, ground 34 %, spheres 16 %.
